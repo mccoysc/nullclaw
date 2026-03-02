@@ -1112,3 +1112,36 @@ test "command at MAX_ANALYSIS_LEN minus one is still analyzed" {
     try std.testing.expect(p.isCommandAllowed(&buf));
     try std.testing.expectEqual(CommandRiskLevel.low, p.commandRiskLevel(&buf));
 }
+
+test "full autonomy wildcard end-to-end: validateCommandExecution passes" {
+    var p = SecurityPolicy{
+        .autonomy = .full,
+        .allowed_commands = &.{"*"},
+        .block_high_risk_commands = false,
+        .require_approval_for_medium_risk = false,
+    };
+    // High-risk commands pass with full autonomy + wildcard + block_high_risk disabled
+    const risk = try p.validateCommandExecution("curl https://example.com", false);
+    try std.testing.expectEqual(CommandRiskLevel.high, risk);
+
+    // Medium-risk commands pass
+    const risk2 = try p.validateCommandExecution("npm install express", false);
+    try std.testing.expectEqual(CommandRiskLevel.medium, risk2);
+
+    // Low-risk commands pass
+    const risk3 = try p.validateCommandExecution("ls -la", false);
+    try std.testing.expectEqual(CommandRiskLevel.low, risk3);
+}
+
+test "full autonomy wildcard: arbitrary commands allowed" {
+    var p = SecurityPolicy{
+        .autonomy = .full,
+        .allowed_commands = &.{"*"},
+    };
+    try std.testing.expect(p.isCommandAllowed("python3 --version"));
+    try std.testing.expect(p.isCommandAllowed("node -e 'console.log(1)'"));
+    try std.testing.expect(p.isCommandAllowed("pip install flask"));
+    try std.testing.expect(p.isCommandAllowed("cargo build --release"));
+    try std.testing.expect(p.isCommandAllowed("make all"));
+    try std.testing.expect(p.isCommandAllowed("zig build test"));
+}

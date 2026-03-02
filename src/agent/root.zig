@@ -376,6 +376,15 @@ pub const Agent = struct {
             .compaction_keep_recent = cfg.agent.compaction_keep_recent,
             .compaction_max_summary_chars = cfg.agent.compaction_max_summary_chars,
             .compaction_max_source_chars = cfg.agent.compaction_max_source_chars,
+            .exec_security = switch (cfg.autonomy.level) {
+                .full => .full,
+                .read_only => .deny,
+                .supervised => .allowlist,
+            },
+            .exec_ask = switch (cfg.autonomy.level) {
+                .full, .read_only => .off,
+                .supervised => .on_miss,
+            },
             .history = .empty,
             .total_tokens = 0,
             .has_system_prompt = false,
@@ -4106,4 +4115,167 @@ test "Agent shouldForceActionFollowThrough detects russian deferred promise" {
 test "Agent shouldForceActionFollowThrough ignores normal final answer" {
     try std.testing.expect(!Agent.shouldForceActionFollowThrough("Вот результат: файл успешно отправлен."));
     try std.testing.expect(!Agent.shouldForceActionFollowThrough("I cannot do that in this environment."));
+}
+
+test "Agent.fromConfig sets exec_security=full for full autonomy" {
+    const allocator = std.testing.allocator;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "openai/gpt-4.1-mini",
+        .allocator = allocator,
+    };
+    cfg.autonomy.level = .full;
+
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfig(allocator, &cfg, undefined, &.{}, null, noop.observer());
+    defer agent.deinit();
+
+    try std.testing.expect(agent.exec_security == .full);
+    try std.testing.expect(agent.exec_ask == .off);
+}
+
+test "Agent.fromConfig sets exec_security=deny for read_only autonomy" {
+    const allocator = std.testing.allocator;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "openai/gpt-4.1-mini",
+        .allocator = allocator,
+    };
+    cfg.autonomy.level = .read_only;
+
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfig(allocator, &cfg, undefined, &.{}, null, noop.observer());
+    defer agent.deinit();
+
+    try std.testing.expect(agent.exec_security == .deny);
+    try std.testing.expect(agent.exec_ask == .off);
+}
+
+test "Agent.fromConfig sets exec_security=allowlist for supervised autonomy" {
+    const allocator = std.testing.allocator;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "openai/gpt-4.1-mini",
+        .allocator = allocator,
+    };
+    cfg.autonomy.level = .supervised;
+
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfig(allocator, &cfg, undefined, &.{}, null, noop.observer());
+    defer agent.deinit();
+
+    try std.testing.expect(agent.exec_security == .allowlist);
+    try std.testing.expect(agent.exec_ask == .on_miss);
+}
+
+test "execBlockMessage allows all commands when exec_security=full" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.exec_security = .full;
+    agent.exec_ask = .off;
+
+    // Even high-risk commands should not be blocked by execBlockMessage
+    var args1 = std.json.ObjectMap.init(allocator);
+    defer args1.deinit();
+    try args1.put("command", .{ .string = "rm -rf /tmp/test" });
+    try std.testing.expect(agent.execBlockMessage(args1) == null);
+
+    var args2 = std.json.ObjectMap.init(allocator);
+    defer args2.deinit();
+    try args2.put("command", .{ .string = "curl https://example.com" });
+    try std.testing.expect(agent.execBlockMessage(args2) == null);
+
+    var args3 = std.json.ObjectMap.init(allocator);
+    defer args3.deinit();
+    try args3.put("command", .{ .string = "ls -la" });
+    try std.testing.expect(agent.execBlockMessage(args3) == null);
+}
+
+test "execBlockMessage checks allowlist when exec_security=allowlist" {
+    const allocator = std.testing.allocator;
+    const policy_mod = @import("../security/policy.zig");
+    var tracker = policy_mod.RateTracker.init(allocator, 100);
+    defer tracker.deinit();
+
+    const allowed = [_][]const u8{ "ls", "cat" };
+    var policy = policy_mod.SecurityPolicy{
+        .autonomy = .supervised,
+        .workspace_dir = "/tmp",
+        .tracker = &tracker,
+        .allowed_commands = &allowed,
+    };
+
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.exec_security = .allowlist;
+    agent.exec_ask = .on_miss;
+    agent.policy = &policy;
+
+    // Allowed command passes
+    var args1 = std.json.ObjectMap.init(allocator);
+    defer args1.deinit();
+    try args1.put("command", .{ .string = "ls -la" });
+    try std.testing.expect(agent.execBlockMessage(args1) == null);
+
+    // Disallowed command is blocked
+    var args2 = std.json.ObjectMap.init(allocator);
+    defer args2.deinit();
+    try args2.put("command", .{ .string = "curl https://example.com" });
+    try std.testing.expect(agent.execBlockMessage(args2) != null);
+}
+
+test "full autonomy with wildcard allowed_commands passes execBlockMessage" {
+    const allocator = std.testing.allocator;
+    const policy_mod = @import("../security/policy.zig");
+    var tracker = policy_mod.RateTracker.init(allocator, 10000);
+    defer tracker.deinit();
+
+    var policy = policy_mod.SecurityPolicy{
+        .autonomy = .full,
+        .workspace_dir = "/tmp",
+        .allowed_commands = &.{"*"},
+        .block_high_risk_commands = false,
+        .require_approval_for_medium_risk = false,
+        .tracker = &tracker,
+    };
+
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "openai/gpt-4.1-mini",
+        .allocator = allocator,
+    };
+    cfg.autonomy.level = .full;
+    cfg.autonomy.allowed_commands = &.{"*"};
+    cfg.autonomy.block_high_risk_commands = false;
+    cfg.autonomy.require_approval_for_medium_risk = false;
+
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfig(allocator, &cfg, undefined, &.{}, null, noop.observer());
+    defer agent.deinit();
+    agent.policy = &policy;
+
+    // exec_security should be .full from config
+    try std.testing.expect(agent.exec_security == .full);
+    try std.testing.expect(agent.exec_ask == .off);
+
+    // All commands should pass execBlockMessage
+    var args1 = std.json.ObjectMap.init(allocator);
+    defer args1.deinit();
+    try args1.put("command", .{ .string = "curl https://example.com" });
+    try std.testing.expect(agent.execBlockMessage(args1) == null);
+
+    var args2 = std.json.ObjectMap.init(allocator);
+    defer args2.deinit();
+    try args2.put("command", .{ .string = "rm -rf /tmp/test" });
+    try std.testing.expect(agent.execBlockMessage(args2) == null);
+
+    var args3 = std.json.ObjectMap.init(allocator);
+    defer args3.deinit();
+    try args3.put("command", .{ .string = "python3 script.py" });
+    try std.testing.expect(agent.execBlockMessage(args3) == null);
 }
