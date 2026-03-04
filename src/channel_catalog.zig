@@ -62,8 +62,8 @@ pub const known_channels = [_]ChannelMeta{
     .{ .id = .qq, .key = "qq", .label = "QQ", .configured_message = "QQ configured", .listener_mode = .gateway_loop },
     .{ .id = .onebot, .key = "onebot", .label = "OneBot", .configured_message = "OneBot configured", .listener_mode = .gateway_loop },
     .{ .id = .maixcam, .key = "maixcam", .label = "MaixCam", .configured_message = "MaixCam configured", .listener_mode = .send_only },
-    .{ .id = .mqtt, .key = "mqtt", .label = "MQTT", .configured_message = "MQTT configured", .listener_mode = .send_only },
-    .{ .id = .redis_stream, .key = "redis_stream", .label = "Redis Stream", .configured_message = "Redis Stream configured", .listener_mode = .send_only },
+    .{ .id = .mqtt, .key = "mqtt", .label = "MQTT", .configured_message = "MQTT configured", .listener_mode = .gateway_loop },
+    .{ .id = .redis_stream, .key = "redis_stream", .label = "Redis Stream", .configured_message = "Redis Stream configured", .listener_mode = .gateway_loop },
     .{ .id = .nostr, .key = "nostr", .label = "Nostr", .configured_message = "Nostr configured", .listener_mode = .gateway_loop },
     .{ .id = .web, .key = "web", .label = "Web", .configured_message = "Web configured", .listener_mode = .gateway_loop },
 };
