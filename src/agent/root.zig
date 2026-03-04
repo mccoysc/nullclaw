@@ -794,23 +794,38 @@ pub const Agent = struct {
             .content = enriched,
         });
 
+        // Load skills once for hook evaluation across the entire turn.
+        // Must be loaded before cache check so on_llm_request hooks can
+        // fire even when a cached response would otherwise be returned.
+        const hook_skills = self.loadSkillsForHooks();
+        defer if (hook_skills) |hs| skills_mod.freeSkills(self.allocator, hs);
+
         // ── Response cache check ──
-        if (self.response_cache) |rc| {
-            var key_buf: [16]u8 = undefined;
-            const system_prompt = if (self.history.items.len > 0 and self.history.items[0].role == .system)
-                self.history.items[0].content
-            else
-                null;
-            const key_hex = cache.ResponseCache.cacheKeyHex(&key_buf, self.model_name, system_prompt, effective_user_message);
-            if (rc.get(self.allocator, key_hex) catch null) |cached_response| {
-                errdefer self.allocator.free(cached_response);
-                const history_copy = try self.allocator.dupe(u8, cached_response);
-                errdefer self.allocator.free(history_copy);
-                try self.history.append(self.allocator, .{
-                    .role = .assistant,
-                    .content = history_copy,
-                });
-                return cached_response;
+        // Skip cache when on_llm_request hooks are present, since those hooks
+        // may intercept, modify, or compress content before the LLM call.
+        const has_llm_request_hooks = if (hook_skills) |hs|
+            skills_mod.hasSkillsForTrigger(hs, .on_llm_request)
+        else
+            false;
+
+        if (!has_llm_request_hooks) {
+            if (self.response_cache) |rc| {
+                var key_buf: [16]u8 = undefined;
+                const system_prompt = if (self.history.items.len > 0 and self.history.items[0].role == .system)
+                    self.history.items[0].content
+                else
+                    null;
+                const key_hex = cache.ResponseCache.cacheKeyHex(&key_buf, self.model_name, system_prompt, effective_user_message);
+                if (rc.get(self.allocator, key_hex) catch null) |cached_response| {
+                    errdefer self.allocator.free(cached_response);
+                    const history_copy = try self.allocator.dupe(u8, cached_response);
+                    errdefer self.allocator.free(history_copy);
+                    try self.history.append(self.allocator, .{
+                        .role = .assistant,
+                        .content = history_copy,
+                    });
+                    return cached_response;
+                }
             }
         }
 
@@ -821,10 +836,6 @@ pub const Agent = struct {
             .messages_count = self.history.items.len,
         } };
         self.observer.recordEvent(&start_event);
-
-        // Load skills once for hook evaluation across the entire turn
-        const hook_skills = self.loadSkillsForHooks();
-        defer if (hook_skills) |hs| skills_mod.freeSkills(self.allocator, hs);
 
         // Tool call loop — reuse a single arena across iterations (retains pages)
         var iter_arena = std.heap.ArenaAllocator.init(self.allocator);
@@ -1428,7 +1439,7 @@ pub const Agent = struct {
                                 tool_intercepted = true;
                                 tool_before_result_override = ToolExecutionResult{
                                     .name = call.name,
-                                    .output = if (hook_result.content.len > 0) hook_result.content else "[skill hook agent error]",
+                                    .output = if (hook_result.content.len > 0) (arena.dupe(u8, hook_result.content) catch hook_result.content) else "[skill hook agent error]",
                                     .success = false,
                                     .tool_call_id = call.tool_call_id,
                                 };
@@ -1437,7 +1448,7 @@ pub const Agent = struct {
                                 tool_intercepted = true;
                                 tool_before_result_override = ToolExecutionResult{
                                     .name = call.name,
-                                    .output = if (hook_result.content.len > 0) hook_result.content else "[intercepted by on_tool_call_before hook]",
+                                    .output = if (hook_result.content.len > 0) (arena.dupe(u8, hook_result.content) catch hook_result.content) else "[intercepted by on_tool_call_before hook]",
                                     .success = true,
                                     .tool_call_id = call.tool_call_id,
                                 };
@@ -1484,7 +1495,7 @@ pub const Agent = struct {
                                     if (hook_result.content.len > 0) {
                                         final_result = ToolExecutionResult{
                                             .name = result.name,
-                                            .output = hook_result.content,
+                                            .output = arena.dupe(u8, hook_result.content) catch hook_result.content,
                                             .success = result.success,
                                             .tool_call_id = result.tool_call_id,
                                         };

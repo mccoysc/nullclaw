@@ -570,16 +570,18 @@ pub const SessionManager = struct {
 
                 switch (hook_result.action) {
                     .agent_error => {
+                        // Free both allocations: response (from agent.turn) and
+                        // post_receive_response (if owned, from on_channel_receive_after continue_with)
+                        self.allocator.free(response);
                         if (post_receive_owned) self.allocator.free(post_receive_response);
-                        if (!post_receive_owned) self.allocator.free(response);
                         return if (hook_result.content.len > 0)
                             try self.allocator.dupe(u8, hook_result.content)
                         else
                             try self.allocator.dupe(u8, "[skill hook agent error]");
                     },
                     .intercept => {
+                        self.allocator.free(response);
                         if (post_receive_owned) self.allocator.free(post_receive_response);
-                        if (!post_receive_owned) self.allocator.free(response);
                         return if (hook_result.content.len > 0)
                             try self.allocator.dupe(u8, hook_result.content)
                         else
