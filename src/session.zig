@@ -600,8 +600,10 @@ pub const SessionManager = struct {
 
         // Determine the final response to return
         const final_response = if (send_owned) blk: {
+            // Always free the original response from agent.turn(), then
+            // conditionally free post_receive_response if it was a separate allocation.
+            self.allocator.free(response);
             if (post_receive_owned) self.allocator.free(post_receive_response);
-            if (!post_receive_owned) self.allocator.free(response);
             break :blk send_response;
         } else if (post_receive_owned) blk: {
             self.allocator.free(response);
