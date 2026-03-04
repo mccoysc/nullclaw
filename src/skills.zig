@@ -1,6 +1,7 @@
 const std = @import("std");
 const zig_builtin = @import("builtin");
 const platform = @import("platform.zig");
+const log = std.log.scoped(.skills);
 
 // Skills — user-defined capabilities loaded from disk.
 //
@@ -536,6 +537,13 @@ pub fn parseHookAction(instructions: []const u8) ?SkillHookResult {
         const content = std.mem.trimLeft(u8, rest, " \t\r\n");
         return .{ .action = .agent, .content = content };
     }
+    // Warn on unrecognized [action:xxx] directives so skill authors notice typos
+    // or removed action types (e.g. [action:replace], [action:compact]).
+    if (std.mem.startsWith(u8, trimmed, "[action:")) {
+        if (std.mem.indexOf(u8, trimmed[0..@min(trimmed.len, 40)], "]")) |end| {
+            log.warn("unrecognized skill action directive: {s} — treating as plain skill instructions", .{trimmed[0 .. end + 1]});
+        }
+    }
     // No recognized directive — return null so caller uses default behavior
     return null;
 }
@@ -669,55 +677,91 @@ pub const sub_agent_system_prompt =
 pub const SUB_AGENT_MAX_ITERATIONS: u32 = 10;
 
 /// Parse the output of a sub-agent LLM call into a SkillHookResult.
+/// When multiple behavior tags are present, the LAST one wins — the agent may
+/// output reasoning with intermediate tags before settling on a final decision.
 pub fn parseSubAgentResponse(allocator: std.mem.Allocator, response: []const u8) !SkillHookResult {
     const trimmed = std.mem.trimLeft(u8, response, " \t\r\n");
     if (trimmed.len == 0) return .{ .action = .passthrough };
 
-    // Search for the behavior tag anywhere in the response (not just at the start),
-    // since the agent may output some reasoning before the tag.
-    if (findBehaviorTag(trimmed, "[behavior:passthrough]")) |_| {
-        return .{ .action = .passthrough };
-    }
-    if (findBehaviorTag(trimmed, "[behavior:intercept]")) |tag_end| {
-        const content = std.mem.trimLeft(u8, trimmed[tag_end..], " \t\r\n");
-        if (content.len > 0) {
-            return .{
-                .action = .intercept,
-                .content = try allocator.dupe(u8, content),
-                .content_owned = true,
-            };
+    // Find the last occurrence of each behavior tag and use the one with the
+    // highest position (i.e. the final tag in the response).
+    const tags = [_]struct { tag: []const u8, action: SkillHookAction }{
+        .{ .tag = "[behavior:passthrough]", .action = .passthrough },
+        .{ .tag = "[behavior:intercept]", .action = .intercept },
+        .{ .tag = "[behavior:continue]", .action = .continue_with },
+        .{ .tag = "[behavior:error]", .action = .agent_error },
+    };
+
+    var best_pos: ?usize = null;
+    var best_action: SkillHookAction = .passthrough;
+    var best_tag_len: usize = 0;
+
+    for (tags) |entry| {
+        // Find the LAST occurrence of this tag
+        var search_from: usize = 0;
+        var last_pos: ?usize = null;
+        while (search_from < trimmed.len) {
+            if (std.mem.indexOfPos(u8, trimmed, search_from, entry.tag)) |pos| {
+                last_pos = pos;
+                search_from = pos + entry.tag.len;
+            } else break;
         }
-        return .{ .action = .intercept };
-    }
-    if (findBehaviorTag(trimmed, "[behavior:continue]")) |tag_end| {
-        const content = std.mem.trimLeft(u8, trimmed[tag_end..], " \t\r\n");
-        if (content.len > 0) {
-            return .{
-                .action = .continue_with,
-                .content = try allocator.dupe(u8, content),
-                .content_owned = true,
-            };
+        if (last_pos) |pos| {
+            if (best_pos == null or pos > best_pos.?) {
+                best_pos = pos;
+                best_action = entry.action;
+                best_tag_len = entry.tag.len;
+            }
         }
-        return .{ .action = .passthrough }; // continue with no content = passthrough
-    }
-    if (findBehaviorTag(trimmed, "[behavior:error]")) |tag_end| {
-        const content = std.mem.trimLeft(u8, trimmed[tag_end..], " \t\r\n");
-        if (content.len > 0) {
-            return .{
-                .action = .agent_error,
-                .content = try allocator.dupe(u8, content),
-                .content_owned = true,
-            };
-        }
-        return .{
-            .action = .agent_error,
-            .content = try allocator.dupe(u8, "sub-agent reported an error without details"),
-            .content_owned = true,
-        };
     }
 
-    // No recognized behavior tag found — return null-like sentinel so caller can retry
-    return .{ .action = .agent }; // sentinel: caller should retry or fall back
+    if (best_pos) |pos| {
+        const tag_end = pos + best_tag_len;
+        switch (best_action) {
+            .passthrough => return .{ .action = .passthrough },
+            .intercept => {
+                const content = std.mem.trimLeft(u8, trimmed[tag_end..], " \t\r\n");
+                if (content.len > 0) {
+                    return .{
+                        .action = .intercept,
+                        .content = try allocator.dupe(u8, content),
+                        .content_owned = true,
+                    };
+                }
+                return .{ .action = .intercept };
+            },
+            .continue_with => {
+                const content = std.mem.trimLeft(u8, trimmed[tag_end..], " \t\r\n");
+                if (content.len > 0) {
+                    return .{
+                        .action = .continue_with,
+                        .content = try allocator.dupe(u8, content),
+                        .content_owned = true,
+                    };
+                }
+                return .{ .action = .passthrough }; // continue with no content = passthrough
+            },
+            .agent_error => {
+                const content = std.mem.trimLeft(u8, trimmed[tag_end..], " \t\r\n");
+                if (content.len > 0) {
+                    return .{
+                        .action = .agent_error,
+                        .content = try allocator.dupe(u8, content),
+                        .content_owned = true,
+                    };
+                }
+                return .{
+                    .action = .agent_error,
+                    .content = try allocator.dupe(u8, "sub-agent reported an error without details"),
+                    .content_owned = true,
+                };
+            },
+            .agent => {},
+        }
+    }
+
+    // No recognized behavior tag found — return sentinel so caller treats as error
+    return .{ .action = .agent }; // sentinel: caller should treat as format error
 }
 
 /// Returns true if the response contains a valid behavior tag.
