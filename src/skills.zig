@@ -742,7 +742,7 @@ fn findBehaviorTag(text: []const u8, tag: []const u8) ?usize {
 
 /// Free a SkillHookResult's owned content if applicable.
 pub fn freeHookResult(allocator: std.mem.Allocator, result: *const SkillHookResult) void {
-    if (result.content_owned and result.content.len > 0) {
+    if (result.content_owned) {
         allocator.free(result.content);
     }
 }
