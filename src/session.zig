@@ -142,9 +142,18 @@ pub const SessionManager = struct {
     /// Session keys for MQTT/Redis follow the pattern: "mqtt:<account_id>:<topic>"
     /// or "redis_stream:<account_id>:<topic>".
     fn lookupChannelModelOverride(config: *const Config, session_key: []const u8) config_types.ChannelModelOverride {
-        // Try MQTT prefix
+        // Try MQTT prefix — supports both "mqtt:<endpoint_id>" and legacy "mqtt:<account_id>:<topic>"
         if (std.mem.startsWith(u8, session_key, "mqtt:")) {
             const rest = session_key["mqtt:".len..];
+            // First try endpoint_id match (no colon in rest means it's an endpoint_id)
+            for (config.channels.mqtt) |mqtt_cfg| {
+                for (mqtt_cfg.endpoints) |ep| {
+                    if (ep.endpoint_id.len > 0 and std.mem.eql(u8, ep.endpoint_id, rest)) {
+                        return ep.model_override;
+                    }
+                }
+            }
+            // Fall back to legacy account_id:topic match
             const sep = std.mem.indexOfScalar(u8, rest, ':');
             if (sep) |s| {
                 const account_id = rest[0..s];
@@ -160,9 +169,18 @@ pub const SessionManager = struct {
                 }
             }
         }
-        // Try Redis Stream prefix
+        // Try Redis Stream prefix — supports both "redis_stream:<endpoint_id>" and legacy format
         if (std.mem.startsWith(u8, session_key, "redis_stream:")) {
             const rest = session_key["redis_stream:".len..];
+            // First try endpoint_id match
+            for (config.channels.redis_stream) |rs_cfg| {
+                for (rs_cfg.endpoints) |ep| {
+                    if (ep.endpoint_id.len > 0 and std.mem.eql(u8, ep.endpoint_id, rest)) {
+                        return ep.model_override;
+                    }
+                }
+            }
+            // Fall back to legacy account_id:topic match
             const sep = std.mem.indexOfScalar(u8, rest, ':');
             if (sep) |s| {
                 const account_id = rest[0..s];
@@ -232,6 +250,34 @@ pub const SessionManager = struct {
             }
         }
         return to_remove.items.len;
+    }
+
+    /// Hot-update model parameters on an existing session without destroying it.
+    /// The session keeps its conversation history and state; only model-related
+    /// agent fields are patched in place.  Returns true if a matching session was
+    /// found and updated.
+    pub fn updateSessionModelParams(self: *SessionManager, session_key: []const u8, mo: config_types.ChannelModelOverride) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const sess = self.sessions.get(session_key) orelse return false;
+        applyModelOverride(&sess.agent, mo);
+        return true;
+    }
+
+    /// Hot-update model parameters on all sessions whose key starts with the
+    /// given prefix.  Returns the number of sessions updated.
+    pub fn updateModelParamsByPrefix(self: *SessionManager, prefix: []const u8, mo: config_types.ChannelModelOverride) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var count: usize = 0;
+        var it = self.sessions.iterator();
+        while (it.next()) |entry| {
+            if (std.mem.startsWith(u8, entry.key_ptr.*, prefix)) {
+                applyModelOverride(&entry.value_ptr.*.agent, mo);
+                count += 1;
+            }
+        }
+        return count;
     }
 
     /// Update the config pointer for all future session creations.

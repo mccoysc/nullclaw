@@ -375,7 +375,12 @@ pub const RedisStreamChannel = struct {
         defer self.allocator.free(body);
 
         // Build session key
-        const session_key = std.fmt.allocPrint(self.allocator, "redis_stream:{s}:{s}", .{ self.config.account_id, ep.listen_topic }) catch return;
+        // Use endpoint_id when available for stable session correlation across hot-reloads.
+        // Fall back to account_id:topic for backward compatibility.
+        const session_key = if (ep.endpoint_id.len > 0)
+            std.fmt.allocPrint(self.allocator, "redis_stream:{s}", .{ep.endpoint_id}) catch return
+        else
+            std.fmt.allocPrint(self.allocator, "redis_stream:{s}:{s}", .{ self.config.account_id, ep.listen_topic }) catch return;
         defer self.allocator.free(session_key);
 
         // Build metadata with account_id and per-channel model overrides

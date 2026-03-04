@@ -1294,8 +1294,14 @@ fn configureMqttChannel(cfg: *Config, out: *std.Io.Writer, _: []u8, prefix: []co
     const privkey_hex = std.fmt.bytesToHex(key_pair.secret_key.toBytes(), .lower);
     const pubkey_hex = std.fmt.bytesToHex(key_pair.public_key.toUncompressedSec1(), .lower);
 
+    // Generate a random endpoint_id (16 hex chars = 8 random bytes)
+    var eid_bytes: [8]u8 = undefined;
+    std.crypto.random.bytes(&eid_bytes);
+    const eid_hex = std.fmt.bytesToHex(eid_bytes, .lower);
+
     const endpoints = try cfg.allocator.alloc(config_mod.MqttEndpointConfig, 1);
     endpoints[0] = .{
+        .endpoint_id = try cfg.allocator.dupe(u8, &eid_hex),
         .host = try cfg.allocator.dupe(u8, host),
         .port = port,
         .username = if (username.len > 0) try cfg.allocator.dupe(u8, username) else null,
@@ -1362,8 +1368,14 @@ fn configureRedisStreamChannel(cfg: *Config, out: *std.Io.Writer, _: []u8, prefi
     const privkey_hex = std.fmt.bytesToHex(key_pair.secret_key.toBytes(), .lower);
     const pubkey_hex = std.fmt.bytesToHex(key_pair.public_key.toUncompressedSec1(), .lower);
 
+    // Generate a random endpoint_id (16 hex chars = 8 random bytes)
+    var eid_bytes: [8]u8 = undefined;
+    std.crypto.random.bytes(&eid_bytes);
+    const eid_hex = std.fmt.bytesToHex(eid_bytes, .lower);
+
     const endpoints = try cfg.allocator.alloc(config_mod.RedisStreamEndpointConfig, 1);
     endpoints[0] = .{
+        .endpoint_id = try cfg.allocator.dupe(u8, &eid_hex),
         .host = try cfg.allocator.dupe(u8, host),
         .port = port,
         .username = if (username.len > 0) try cfg.allocator.dupe(u8, username) else null,

@@ -577,6 +577,10 @@ pub const ChannelModelOverride = struct {
 };
 
 pub const MqttEndpointConfig = struct {
+    /// Unique identifier for this endpoint.  Used to correlate running sessions
+    /// with config entries across hot-reloads.  Auto-generated during onboarding
+    /// if not provided.
+    endpoint_id: []const u8 = "",
     /// Broker host (e.g. "broker.example.com").
     host: []const u8,
     /// Broker port (default 1883 for TCP, 8883 for TLS).
@@ -615,6 +619,10 @@ pub const MqttConfig = struct {
 
 /// A single Redis Stream endpoint configuration.
 pub const RedisStreamEndpointConfig = struct {
+    /// Unique identifier for this endpoint.  Used to correlate running sessions
+    /// with config entries across hot-reloads.  Auto-generated during onboarding
+    /// if not provided.
+    endpoint_id: []const u8 = "",
     /// Redis host (e.g. "localhost").
     host: []const u8 = "localhost",
     /// Redis port.
