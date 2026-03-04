@@ -93,6 +93,7 @@ pub const AudioMediaConfig = config_types.AudioMediaConfig;
 pub const DmScope = config_types.DmScope;
 pub const IdentityLink = config_types.IdentityLink;
 pub const SessionConfig = config_types.SessionConfig;
+pub const ChannelModelOverride = config_types.ChannelModelOverride;
 pub const MqttEndpointConfig = config_types.MqttEndpointConfig;
 pub const MqttConfig = config_types.MqttConfig;
 pub const RedisStreamEndpointConfig = config_types.RedisStreamEndpointConfig;

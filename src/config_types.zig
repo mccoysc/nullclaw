@@ -149,6 +149,10 @@ pub const AgentConfig = struct {
     /// Internal parse marker: true only when token_limit is explicitly set in config.
     /// Not serialized; used to distinguish override vs default fallback chain.
     token_limit_explicit: bool = false,
+    /// Hard cap on LLM context tokens. When the estimated token count reaches
+    /// this limit, auto-compaction is triggered immediately. 0 = use default
+    /// token_limit logic (model-based resolution).
+    max_context_tokens: u64 = 0,
     session_idle_timeout_secs: u64 = 1800, // evict idle sessions after 30 min
     compaction_keep_recent: u32 = 20,
     compaction_max_summary_chars: u32 = 2_000,
@@ -557,6 +561,21 @@ pub const WebConfig = struct {
 
 /// A single MQTT endpoint configuration.
 /// Multiple instances are allowed (same channel, different brokers/topics).
+/// Per-channel model override configuration.
+/// When set on an endpoint, these values override the global defaults
+/// for sessions created from this endpoint.
+pub const ChannelModelOverride = struct {
+    /// Override the LLM provider (e.g. "openrouter", "anthropic").
+    provider: ?[]const u8 = null,
+    /// Override the model name (e.g. "openrouter/minimax/minimax-m2.5").
+    model: ?[]const u8 = null,
+    /// Override the maximum context tokens for this channel.
+    /// When reached, auto-compaction is triggered.
+    max_context_tokens: u64 = 0,
+    /// Override the temperature for this channel.
+    temperature: ?f64 = null,
+};
+
 pub const MqttEndpointConfig = struct {
     /// Broker host (e.g. "broker.example.com").
     host: []const u8,
@@ -584,6 +603,9 @@ pub const MqttEndpointConfig = struct {
     /// the channel uses the same topic for both directions and filters
     /// out messages signed by our own key.
     reply_topic: ?[]const u8 = null,
+    /// Per-channel model configuration overrides.
+    /// When set, these override the global model/provider/temperature/max_context_tokens.
+    model_override: ChannelModelOverride = .{},
 };
 
 pub const MqttConfig = struct {
@@ -621,6 +643,9 @@ pub const RedisStreamEndpointConfig = struct {
     consumer_group: []const u8 = "nullclaw",
     /// Consumer name within the group.
     consumer_name: []const u8 = "default",
+    /// Per-channel model configuration overrides.
+    /// When set, these override the global model/provider/temperature/max_context_tokens.
+    model_override: ChannelModelOverride = .{},
 };
 
 pub const RedisStreamConfig = struct {

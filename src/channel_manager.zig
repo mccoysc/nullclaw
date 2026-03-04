@@ -61,6 +61,15 @@ pub const ChannelManager = struct {
     event_bus: ?*bus_mod.Bus = null,
     entries: std.ArrayListUnmanaged(Entry) = .empty,
 
+    // Config hot-reload state
+    config_watch_enabled: bool = false,
+    config_watch_path: []const u8 = "",
+    last_config_mtime: i128 = 0,
+    backing_allocator: Allocator = undefined,
+    // Previous configs kept alive to avoid dangling pointers in running channels.
+    // Freed on deinit.
+    prev_configs: std.ArrayListUnmanaged(*Config) = .empty,
+
     pub fn init(allocator: Allocator, config: *const Config, registry: *dispatch.ChannelRegistry) !*ChannelManager {
         const self = try allocator.create(ChannelManager);
         self.* = .{
@@ -74,6 +83,14 @@ pub const ChannelManager = struct {
     pub fn deinit(self: *ChannelManager) void {
         // Stop all threads
         self.stopAll();
+
+        // Free previous configs from hot-reloads
+        for (self.prev_configs.items) |cfg| {
+            var mutable_cfg = cfg;
+            mutable_cfg.deinit();
+            self.backing_allocator.destroy(cfg);
+        }
+        self.prev_configs.deinit(self.allocator);
 
         self.entries.deinit(self.allocator);
         self.allocator.destroy(self);
@@ -357,7 +374,335 @@ pub const ChannelManager = struct {
         }
     }
 
+    /// Enable config file hot-reload watching.
+    /// Call before supervisionLoop to enable automatic config reloading.
+    pub fn enableConfigWatch(self: *ChannelManager, config_path: []const u8, backing_alloc: Allocator) void {
+        self.config_watch_enabled = true;
+        self.config_watch_path = config_path;
+        self.backing_allocator = backing_alloc;
+        self.last_config_mtime = getConfigFileMtime(config_path) catch 0;
+        log.info("Config hot-reload enabled, watching: {s}", .{config_path});
+    }
+
+    /// Check if config file has changed and apply updates if so.
+    /// Called from supervisionLoop on each iteration.
+    fn checkConfigReload(self: *ChannelManager, state: *daemon.DaemonState) void {
+        if (!self.config_watch_enabled) return;
+
+        const current_mtime = getConfigFileMtime(self.config_watch_path) catch return;
+        if (current_mtime == self.last_config_mtime) return;
+        self.last_config_mtime = current_mtime;
+
+        log.info("Config file changed, reloading...", .{});
+
+        // Load the new config
+        var new_config_val = Config.load(self.backing_allocator) catch |err| {
+            log.err("Failed to reload config: {s}", .{@errorName(err)});
+            return;
+        };
+
+        // Heap-allocate so we have a stable pointer
+        const new_config = self.backing_allocator.create(Config) catch {
+            new_config_val.deinit();
+            log.err("Failed to allocate config", .{});
+            return;
+        };
+        new_config.* = new_config_val;
+
+        // Diff and apply changes
+        self.applyConfigReload(new_config, state);
+
+        // Store the old config (don't free — running channels may still reference it)
+        self.prev_configs.append(self.allocator, @constCast(self.config)) catch {};
+
+        // Update config pointer
+        self.config = new_config;
+
+        // Update session manager config so new sessions use the new config
+        if (self.runtime) |rt| {
+            rt.session_mgr.updateConfig(new_config);
+            rt.config = new_config;
+        }
+
+        log.info("Config reload complete", .{});
+    }
+
+    /// Apply config changes: stop removed channels, start added ones, evict ONLY
+    /// sessions whose config actually changed.  Unchanged sessions keep their state.
+    fn applyConfigReload(self: *ChannelManager, new_config: *const Config, state: *daemon.DaemonState) void {
+        _ = state;
+        const old = self.config;
+        const global_model_changed = globalModelConfigChanged(old, new_config);
+
+        var entries_to_remove: std.ArrayListUnmanaged(usize) = .empty;
+        defer entries_to_remove.deinit(self.allocator);
+
+        // ── MQTT channels ──────────────────────────────────────────────
+
+        // 1a. Removed MQTT accounts
+        for (old.channels.mqtt) |old_mqtt| {
+            const found = for (new_config.channels.mqtt) |new_mqtt| {
+                if (std.mem.eql(u8, old_mqtt.account_id, new_mqtt.account_id)) break true;
+            } else false;
+            if (!found) {
+                log.info("MQTT account '{s}' removed", .{old_mqtt.account_id});
+                self.stopAndRemoveByNameAccount("mqtt", old_mqtt.account_id, &entries_to_remove);
+                self.evictSessionsForChannel("mqtt", old_mqtt.account_id);
+            }
+        }
+
+        // 1b. Existing MQTT accounts — per-endpoint granular diff
+        for (old.channels.mqtt) |old_mqtt| {
+            for (new_config.channels.mqtt) |new_mqtt| {
+                if (!std.mem.eql(u8, old_mqtt.account_id, new_mqtt.account_id)) continue;
+
+                var topology_changed = false;
+                // Check each old endpoint: topology change or model_override change
+                for (old_mqtt.endpoints) |old_ep| {
+                    const matching_new = findMqttEndpointByTopic(new_mqtt.endpoints, old_ep.listen_topic);
+                    if (matching_new) |new_ep| {
+                        // Endpoint still exists — check if topology (host/port) changed
+                        if (!std.mem.eql(u8, old_ep.host, new_ep.host) or old_ep.port != new_ep.port) {
+                            topology_changed = true;
+                        }
+                        // Check if model_override changed for this endpoint
+                        if (!modelOverrideEqual(old_ep.model_override, new_ep.model_override)) {
+                            log.info("MQTT '{s}' endpoint '{s}' model config changed, evicting session", .{ old_mqtt.account_id, old_ep.listen_topic });
+                            self.evictSessionForEndpoint("mqtt", old_mqtt.account_id, old_ep.listen_topic);
+                        }
+                    } else {
+                        // Endpoint removed
+                        topology_changed = true;
+                        self.evictSessionForEndpoint("mqtt", old_mqtt.account_id, old_ep.listen_topic);
+                    }
+                }
+                // Check for added endpoints
+                for (new_mqtt.endpoints) |new_ep| {
+                    const found_old = findMqttEndpointByTopic(old_mqtt.endpoints, new_ep.listen_topic);
+                    if (found_old == null) topology_changed = true;
+                }
+
+                if (topology_changed) {
+                    log.info("MQTT account '{s}' endpoint topology changed, restarting channel", .{old_mqtt.account_id});
+                    self.stopAndRemoveByNameAccount("mqtt", old_mqtt.account_id, &entries_to_remove);
+                    self.addMqttChannelFromConfig(new_mqtt);
+                }
+
+                // Global model change: only evict sessions on endpoints WITHOUT
+                // their own model override (they inherit global config).
+                if (global_model_changed and !topology_changed) {
+                    for (new_mqtt.endpoints) |ep| {
+                        if (!hasModelOverride(ep.model_override)) {
+                            log.info("Global model changed, evicting MQTT '{s}' endpoint '{s}' (uses global)", .{ new_mqtt.account_id, ep.listen_topic });
+                            self.evictSessionForEndpoint("mqtt", new_mqtt.account_id, ep.listen_topic);
+                        }
+                    }
+                }
+                break;
+            }
+        }
+
+        // 1c. Added MQTT accounts
+        for (new_config.channels.mqtt) |new_mqtt| {
+            const found = for (old.channels.mqtt) |old_mqtt| {
+                if (std.mem.eql(u8, old_mqtt.account_id, new_mqtt.account_id)) break true;
+            } else false;
+            if (!found) {
+                log.info("MQTT account '{s}' added, starting channel", .{new_mqtt.account_id});
+                self.addMqttChannelFromConfig(new_mqtt);
+            }
+        }
+
+        // ── Redis Stream channels ──────────────────────────────────────
+
+        // 2a. Removed Redis Stream accounts
+        for (old.channels.redis_stream) |old_rs| {
+            const found = for (new_config.channels.redis_stream) |new_rs| {
+                if (std.mem.eql(u8, old_rs.account_id, new_rs.account_id)) break true;
+            } else false;
+            if (!found) {
+                log.info("Redis Stream account '{s}' removed", .{old_rs.account_id});
+                self.stopAndRemoveByNameAccount("redis_stream", old_rs.account_id, &entries_to_remove);
+                self.evictSessionsForChannel("redis_stream", old_rs.account_id);
+            }
+        }
+
+        // 2b. Existing Redis Stream accounts — per-endpoint granular diff
+        for (old.channels.redis_stream) |old_rs| {
+            for (new_config.channels.redis_stream) |new_rs| {
+                if (!std.mem.eql(u8, old_rs.account_id, new_rs.account_id)) continue;
+
+                var topology_changed = false;
+                for (old_rs.endpoints) |old_ep| {
+                    const matching_new = findRsEndpointByTopic(new_rs.endpoints, old_ep.listen_topic);
+                    if (matching_new) |new_ep| {
+                        if (!std.mem.eql(u8, old_ep.host, new_ep.host) or old_ep.port != new_ep.port) {
+                            topology_changed = true;
+                        }
+                        if (!modelOverrideEqual(old_ep.model_override, new_ep.model_override)) {
+                            log.info("Redis Stream '{s}' endpoint '{s}' model config changed, evicting session", .{ old_rs.account_id, old_ep.listen_topic });
+                            self.evictSessionForEndpoint("redis_stream", old_rs.account_id, old_ep.listen_topic);
+                        }
+                    } else {
+                        topology_changed = true;
+                        self.evictSessionForEndpoint("redis_stream", old_rs.account_id, old_ep.listen_topic);
+                    }
+                }
+                for (new_rs.endpoints) |new_ep| {
+                    const found_old = findRsEndpointByTopic(old_rs.endpoints, new_ep.listen_topic);
+                    if (found_old == null) topology_changed = true;
+                }
+
+                if (topology_changed) {
+                    log.info("Redis Stream account '{s}' endpoint topology changed, restarting channel", .{old_rs.account_id});
+                    self.stopAndRemoveByNameAccount("redis_stream", old_rs.account_id, &entries_to_remove);
+                    self.addRedisStreamChannelFromConfig(new_rs);
+                }
+
+                if (global_model_changed and !topology_changed) {
+                    for (new_rs.endpoints) |ep| {
+                        if (!hasModelOverride(ep.model_override)) {
+                            log.info("Global model changed, evicting Redis Stream '{s}' endpoint '{s}' (uses global)", .{ new_rs.account_id, ep.listen_topic });
+                            self.evictSessionForEndpoint("redis_stream", new_rs.account_id, ep.listen_topic);
+                        }
+                    }
+                }
+                break;
+            }
+        }
+
+        // 2c. Added Redis Stream accounts
+        for (new_config.channels.redis_stream) |new_rs| {
+            const found = for (old.channels.redis_stream) |old_rs| {
+                if (std.mem.eql(u8, old_rs.account_id, new_rs.account_id)) break true;
+            } else false;
+            if (!found) {
+                log.info("Redis Stream account '{s}' added, starting channel", .{new_rs.account_id});
+                self.addRedisStreamChannelFromConfig(new_rs);
+            }
+        }
+
+        // ── Cleanup removed entries ────────────────────────────────────
+        std.mem.sort(usize, entries_to_remove.items, {}, std.sort.desc(usize));
+        for (entries_to_remove.items) |idx| {
+            if (idx < self.entries.items.len) {
+                _ = self.entries.orderedRemove(idx);
+            }
+        }
+    }
+
+    /// Stop a channel entry matching name and account_id, and mark its index for removal.
+    fn stopAndRemoveByNameAccount(self: *ChannelManager, name: []const u8, account_id: []const u8, to_remove: *std.ArrayListUnmanaged(usize)) void {
+        for (self.entries.items, 0..) |*entry, i| {
+            if (std.mem.eql(u8, entry.name, name) and std.mem.eql(u8, entry.account_id, account_id)) {
+                switch (entry.listener_type) {
+                    .polling => self.stopPollingThread(entry),
+                    .gateway_loop, .webhook_only, .send_only => entry.channel.stop(),
+                    .not_implemented => {},
+                }
+                to_remove.append(self.allocator, i) catch {};
+            }
+        }
+    }
+
+    /// Evict all sessions for a given channel type and account_id.
+    fn evictSessionsForChannel(self: *ChannelManager, channel_type: []const u8, account_id: []const u8) void {
+        if (self.runtime) |rt| {
+            // Build prefix: "mqtt:account_id:" or "redis_stream:account_id:"
+            var prefix_buf: [256]u8 = undefined;
+            const prefix = std.fmt.bufPrint(&prefix_buf, "{s}:{s}:", .{ channel_type, account_id }) catch return;
+            const evicted = rt.session_mgr.evictByPrefix(prefix);
+            if (evicted > 0) {
+                log.info("Evicted {d} session(s) for {s}:{s}", .{ evicted, channel_type, account_id });
+            }
+        }
+    }
+
+    /// Evict a single session for a specific endpoint (channel_type:account_id:topic).
+    /// This is more granular than evictSessionsForChannel — only the exact session
+    /// for that endpoint is evicted, leaving other sessions on the same account untouched.
+    fn evictSessionForEndpoint(self: *ChannelManager, channel_type: []const u8, account_id: []const u8, topic: []const u8) void {
+        if (self.runtime) |rt| {
+            // Session key format: "mqtt:account_id:topic" or "redis_stream:account_id:topic"
+            var key_buf: [512]u8 = undefined;
+            const key = std.fmt.bufPrint(&key_buf, "{s}:{s}:{s}", .{ channel_type, account_id, topic }) catch return;
+            const evicted = rt.session_mgr.evictByPrefix(key);
+            if (evicted > 0) {
+                log.info("Evicted {d} session(s) for endpoint {s}", .{ evicted, key });
+            }
+        }
+    }
+
+    /// Create and start a new MQTT channel from config at runtime.
+    fn addMqttChannelFromConfig(self: *ChannelManager, cfg: config_types.MqttConfig) void {
+        const mqtt_mod = channels_mod.mqtt;
+        const ch_ptr = self.allocator.create(mqtt_mod.MqttChannel) catch {
+            log.err("Failed to allocate MQTT channel for '{s}'", .{cfg.account_id});
+            return;
+        };
+        ch_ptr.* = mqtt_mod.MqttChannel.initFromConfig(self.allocator, cfg);
+        if (self.event_bus) |eb| ch_ptr.setBus(eb);
+
+        const ch = ch_ptr.channel();
+        self.registry.registerWithAccount(ch, cfg.account_id) catch {
+            log.err("Failed to register MQTT channel '{s}'", .{cfg.account_id});
+            return;
+        };
+
+        self.entries.append(self.allocator, .{
+            .name = "mqtt",
+            .account_id = cfg.account_id,
+            .channel = ch,
+            .listener_type = .gateway_loop,
+            .supervised = dispatch.spawnSupervisedChannel(ch, 5),
+        }) catch {
+            log.err("Failed to append MQTT entry for '{s}'", .{cfg.account_id});
+            return;
+        };
+
+        ch.start() catch |err| {
+            log.err("Failed to start MQTT channel '{s}': {}", .{ cfg.account_id, err });
+            return;
+        };
+        log.info("MQTT channel '{s}' started via hot-reload", .{cfg.account_id});
+    }
+
+    /// Create and start a new Redis Stream channel from config at runtime.
+    fn addRedisStreamChannelFromConfig(self: *ChannelManager, cfg: config_types.RedisStreamConfig) void {
+        const rs_mod = channels_mod.redis_stream;
+        const ch_ptr = self.allocator.create(rs_mod.RedisStreamChannel) catch {
+            log.err("Failed to allocate Redis Stream channel for '{s}'", .{cfg.account_id});
+            return;
+        };
+        ch_ptr.* = rs_mod.RedisStreamChannel.initFromConfig(self.allocator, cfg);
+        if (self.event_bus) |eb| ch_ptr.setBus(eb);
+
+        const ch = ch_ptr.channel();
+        self.registry.registerWithAccount(ch, cfg.account_id) catch {
+            log.err("Failed to register Redis Stream channel '{s}'", .{cfg.account_id});
+            return;
+        };
+
+        self.entries.append(self.allocator, .{
+            .name = "redis_stream",
+            .account_id = cfg.account_id,
+            .channel = ch,
+            .listener_type = .gateway_loop,
+            .supervised = dispatch.spawnSupervisedChannel(ch, 5),
+        }) catch {
+            log.err("Failed to append Redis Stream entry for '{s}'", .{cfg.account_id});
+            return;
+        };
+
+        ch.start() catch |err| {
+            log.err("Failed to start Redis Stream channel '{s}': {}", .{ cfg.account_id, err });
+            return;
+        };
+        log.info("Redis Stream channel '{s}' started via hot-reload", .{cfg.account_id});
+    }
+
     /// Monitoring loop: check health, restart failed channels with backoff.
+    /// Also checks for config file changes and applies hot-reload.
     /// Blocks until shutdown.
     pub fn supervisionLoop(self: *ChannelManager, state: *daemon.DaemonState) void {
         const STALE_THRESHOLD_SECS: i64 = 600;
@@ -366,6 +711,9 @@ pub const ChannelManager = struct {
         while (!daemon.isShutdownRequested()) {
             std.Thread.sleep(WATCH_INTERVAL_SECS * std.time.ns_per_s);
             if (daemon.isShutdownRequested()) break;
+
+            // Check for config file changes and apply hot-reload
+            self.checkConfigReload(state);
 
             for (self.entries.items) |*entry| {
                 // Gateway-loop channels: health check + restart on failure
@@ -466,6 +814,71 @@ pub const ChannelManager = struct {
         return self.entries.items.len;
     }
 };
+
+// ════════════════════════════════════════════════════════════════════════════
+// Config hot-reload helpers (free functions)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Get the modification time of a config file.
+fn getConfigFileMtime(path: []const u8) !i128 {
+    const file = try std.fs.openFileAbsolute(path, .{});
+    defer file.close();
+    const stat = try file.stat();
+    return stat.mtime;
+}
+
+/// Find an MQTT endpoint by listen_topic.
+fn findMqttEndpointByTopic(endpoints: []const config_types.MqttEndpointConfig, topic: []const u8) ?config_types.MqttEndpointConfig {
+    for (endpoints) |ep| {
+        if (std.mem.eql(u8, ep.listen_topic, topic)) return ep;
+    }
+    return null;
+}
+
+/// Find a Redis Stream endpoint by listen_topic.
+fn findRsEndpointByTopic(endpoints: []const config_types.RedisStreamEndpointConfig, topic: []const u8) ?config_types.RedisStreamEndpointConfig {
+    for (endpoints) |ep| {
+        if (std.mem.eql(u8, ep.listen_topic, topic)) return ep;
+    }
+    return null;
+}
+
+/// Check if a ChannelModelOverride has any explicit overrides set.
+fn hasModelOverride(mo: config_types.ChannelModelOverride) bool {
+    return mo.provider != null or mo.model != null or mo.max_context_tokens != 0 or mo.temperature != null;
+}
+
+/// Compare two ChannelModelOverride structs for equality.
+fn modelOverrideEqual(a: config_types.ChannelModelOverride, b: config_types.ChannelModelOverride) bool {
+    if (a.max_context_tokens != b.max_context_tokens) return false;
+    if (!optionalStrEql(a.provider, b.provider)) return false;
+    if (!optionalStrEql(a.model, b.model)) return false;
+    // Compare temperature with tolerance
+    if (a.temperature == null and b.temperature == null) {
+        // both null, equal
+    } else if (a.temperature != null and b.temperature != null) {
+        if (@abs(a.temperature.? - b.temperature.?) > 0.001) return false;
+    } else {
+        return false; // one null, one not
+    }
+    return true;
+}
+
+fn optionalStrEql(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null and b == null) return true;
+    if (a == null or b == null) return false;
+    return std.mem.eql(u8, a.?, b.?);
+}
+
+/// Check if global model config changed between old and new configs.
+fn globalModelConfigChanged(old: *const Config, new: *const Config) bool {
+    // Check default_model
+    if (!optionalStrEql(old.default_model, new.default_model)) return true;
+    // Check agent config fields that affect model behavior
+    if (old.agent.max_context_tokens != new.agent.max_context_tokens) return true;
+    if (old.agent.token_limit != new.agent.token_limit) return true;
+    return false;
+}
 
 // ════════════════════════════════════════════════════════════════════════════
 // Tests

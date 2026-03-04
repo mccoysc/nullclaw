@@ -321,6 +321,54 @@ pub const RedisStreamChannel = struct {
         }
     }
 
+    /// Build metadata JSON containing account_id and per-channel model overrides.
+    fn buildMetadataJson(self: *RedisStreamChannel, ep: config_types.RedisStreamEndpointConfig) ?[]u8 {
+        const mo = ep.model_override;
+        const has_override = mo.provider != null or mo.model != null or mo.max_context_tokens != 0 or mo.temperature != null;
+
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        const w = buf.writer(self.allocator);
+        w.writeAll("{\"account_id\":\"") catch {
+            buf.deinit(self.allocator);
+            return null;
+        };
+        w.writeAll(self.config.account_id) catch {
+            buf.deinit(self.allocator);
+            return null;
+        };
+        w.writeByte('"') catch {
+            buf.deinit(self.allocator);
+            return null;
+        };
+
+        if (has_override) {
+            if (mo.provider) |prov| {
+                w.writeAll(",\"model_override_provider\":\"") catch {};
+                w.writeAll(prov) catch {};
+                w.writeByte('"') catch {};
+            }
+            if (mo.model) |model| {
+                w.writeAll(",\"model_override_model\":\"") catch {};
+                w.writeAll(model) catch {};
+                w.writeByte('"') catch {};
+            }
+            if (mo.max_context_tokens != 0) {
+                std.fmt.format(w, ",\"model_override_max_context_tokens\":{d}", .{mo.max_context_tokens}) catch {};
+            }
+            if (mo.temperature) |temp| {
+                std.fmt.format(w, ",\"model_override_temperature\":{d}", .{temp}) catch {};
+            }
+        }
+        w.writeByte('}') catch {
+            buf.deinit(self.allocator);
+            return null;
+        };
+        return buf.toOwnedSlice(self.allocator) catch {
+            buf.deinit(self.allocator);
+            return null;
+        };
+    }
+
     fn handleStreamEntry(self: *RedisStreamChannel, pubkey_hex: []const u8, sig_hex_str: []const u8, b64_body: []const u8, ep: config_types.RedisStreamEndpointConfig) void {
         // Verify and decode
         const body = self.verifyAndDecode(pubkey_hex, sig_hex_str, b64_body, ep) orelse return;
@@ -330,14 +378,20 @@ pub const RedisStreamChannel = struct {
         const session_key = std.fmt.allocPrint(self.allocator, "redis_stream:{s}:{s}", .{ self.config.account_id, ep.listen_topic }) catch return;
         defer self.allocator.free(session_key);
 
-        // Publish to bus
-        const msg = bus_mod.makeInbound(
+        // Build metadata with account_id and per-channel model overrides
+        const metadata = self.buildMetadataJson(ep);
+        defer if (metadata) |md| self.allocator.free(md);
+
+        // Publish to bus (with metadata for per-channel model overrides)
+        const msg = bus_mod.makeInboundFull(
             self.allocator,
             "redis_stream",
             "peer",
             ep.listen_topic,
             body,
             session_key,
+            &.{},
+            metadata,
         ) catch |err| {
             log.warn("Redis Stream: failed to create inbound message: {}", .{err});
             return;

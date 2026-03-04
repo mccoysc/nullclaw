@@ -420,6 +420,9 @@ fn channelSupervisorThread(
     if (channel_rt) |rt| mgr.setRuntime(rt);
     mgr.setEventBus(event_bus);
 
+    // Enable config hot-reload watching
+    mgr.enableConfigWatch(config.config_path, allocator);
+
     mgr.collectConfiguredChannels() catch |err| {
         state.markError("channels", @errorName(err));
         health.markComponentError("channels", @errorName(err));
@@ -432,7 +435,9 @@ fn channelSupervisorThread(
         return;
     };
 
-    if (started > 0) {
+    // Always run supervision loop when config watching is enabled
+    // (even with 0 channels, so we can detect newly added channels via hot-reload)
+    if (started > 0 or mgr.config_watch_enabled) {
         state.markRunning("channels");
         health.markComponentOk("channels");
         mgr.supervisionLoop(state); // blocks until shutdown

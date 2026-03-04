@@ -239,6 +239,55 @@ pub const MqttChannel = struct {
         }
     }
 
+    /// Build metadata JSON containing account_id and per-channel model overrides.
+    fn buildMetadataJson(self: *MqttChannel, ep: config_types.MqttEndpointConfig) ?[]u8 {
+        const mo = ep.model_override;
+        const has_override = mo.provider != null or mo.model != null or mo.max_context_tokens != 0 or mo.temperature != null;
+
+        // Always include account_id; include model_override fields when set
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        const w = buf.writer(self.allocator);
+        w.writeAll("{\"account_id\":\"") catch {
+            buf.deinit(self.allocator);
+            return null;
+        };
+        w.writeAll(self.config.account_id) catch {
+            buf.deinit(self.allocator);
+            return null;
+        };
+        w.writeByte('"') catch {
+            buf.deinit(self.allocator);
+            return null;
+        };
+
+        if (has_override) {
+            if (mo.provider) |prov| {
+                w.writeAll(",\"model_override_provider\":\"") catch {};
+                w.writeAll(prov) catch {};
+                w.writeByte('"') catch {};
+            }
+            if (mo.model) |model| {
+                w.writeAll(",\"model_override_model\":\"") catch {};
+                w.writeAll(model) catch {};
+                w.writeByte('"') catch {};
+            }
+            if (mo.max_context_tokens != 0) {
+                std.fmt.format(w, ",\"model_override_max_context_tokens\":{d}", .{mo.max_context_tokens}) catch {};
+            }
+            if (mo.temperature) |temp| {
+                std.fmt.format(w, ",\"model_override_temperature\":{d}", .{temp}) catch {};
+            }
+        }
+        w.writeByte('}') catch {
+            buf.deinit(self.allocator);
+            return null;
+        };
+        return buf.toOwnedSlice(self.allocator) catch {
+            buf.deinit(self.allocator);
+            return null;
+        };
+    }
+
     fn handleInboundLine(self: *MqttChannel, line: []const u8, ep: config_types.MqttEndpointConfig) void {
         // mosquitto_sub (without -v): each line is just the payload
         // With -v: "topic payload"
@@ -254,14 +303,20 @@ pub const MqttChannel = struct {
         const session_key = std.fmt.allocPrint(self.allocator, "mqtt:{s}:{s}", .{ self.config.account_id, ep.listen_topic }) catch return;
         defer self.allocator.free(session_key);
 
-        // Publish to bus
-        const msg = bus_mod.makeInbound(
+        // Build metadata with account_id and per-channel model overrides
+        const metadata = self.buildMetadataJson(ep);
+        defer if (metadata) |md| self.allocator.free(md);
+
+        // Publish to bus (with metadata for per-channel model overrides)
+        const msg = bus_mod.makeInboundFull(
             self.allocator,
             "mqtt",
             "peer",
             ep.listen_topic,
             body,
             session_key,
+            &.{},
+            metadata,
         ) catch |err| {
             log.warn("MQTT: failed to create inbound message: {}", .{err});
             return;
