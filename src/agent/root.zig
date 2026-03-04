@@ -1690,9 +1690,9 @@ pub const Agent = struct {
     /// Implements a mini turn loop that:
     /// 1. Sends skill instructions (system prompt) + hook content (user message) to the LLM.
     /// 2. Supports multi-turn tool calls within a single invocation.
-    /// 3. Enforces that the agent outputs a valid behavior tag ([behavior:xxx]).
-    /// 4. Retries if the agent fails to produce a valid tag.
-    /// 5. Returns agent_error if all retries are exhausted.
+    /// 3. Requires that the final text response contains a valid behavior tag ([behavior:xxx]).
+    /// 4. On any error (LLM failure, invalid output, iterations exhausted), returns agent_error
+    ///    immediately with no retries, and logs detailed error info.
     ///
     /// The sub-agent is stateless between invocations — no history is preserved.
     /// The sub-agent's execution does NOT trigger any skill hooks (isolated).
@@ -1702,6 +1702,13 @@ pub const Agent = struct {
         skill_instructions: []const u8,
         hook_content: []const u8,
     ) skills_mod.SkillHookResult {
+        // Helper to truncate long strings for log output
+        const LogPreview = struct {
+            fn preview(s: []const u8) []const u8 {
+                return if (s.len > 500) s[0..500] else s;
+            }
+        };
+
         // Use an arena for all intermediate allocations within this sub-agent invocation.
         var sub_arena = std.heap.ArenaAllocator.init(self.allocator);
         defer sub_arena.deinit();
@@ -1712,30 +1719,46 @@ pub const Agent = struct {
             arena,
             "{s}{s}",
             .{ skills_mod.sub_agent_system_prompt, skill_instructions },
-        ) catch return .{
-            .action = .agent_error,
-            .content = result_allocator.dupe(u8, "sub-agent failed: could not build system prompt") catch "",
-            .content_owned = true,
+        ) catch {
+            log.warn(
+                "sub-agent error: could not build system prompt | instructions={s} hook_content={s}",
+                .{ LogPreview.preview(skill_instructions), LogPreview.preview(hook_content) },
+            );
+            return .{
+                .action = .agent_error,
+                .content = result_allocator.dupe(u8, "sub-agent failed: could not build system prompt") catch "",
+                .content_owned = true,
+            };
         };
 
         // Build initial messages list (system + user)
         var messages = std.ArrayListUnmanaged(ChatMessage).empty;
-        messages.append(arena, ChatMessage.system(system_prompt)) catch return .{
-            .action = .agent_error,
-            .content = result_allocator.dupe(u8, "sub-agent failed: out of memory") catch "",
-            .content_owned = true,
+        messages.append(arena, ChatMessage.system(system_prompt)) catch {
+            log.warn(
+                "sub-agent error: out of memory building messages | instructions={s}",
+                .{LogPreview.preview(skill_instructions)},
+            );
+            return .{
+                .action = .agent_error,
+                .content = result_allocator.dupe(u8, "sub-agent failed: out of memory") catch "",
+                .content_owned = true,
+            };
         };
         messages.append(arena, ChatMessage.user(
             if (hook_content.len > 0) hook_content else "(empty content)",
-        )) catch return .{
-            .action = .agent_error,
-            .content = result_allocator.dupe(u8, "sub-agent failed: out of memory") catch "",
-            .content_owned = true,
+        )) catch {
+            log.warn(
+                "sub-agent error: out of memory building messages | instructions={s}",
+                .{LogPreview.preview(skill_instructions)},
+            );
+            return .{
+                .action = .agent_error,
+                .content = result_allocator.dupe(u8, "sub-agent failed: out of memory") catch "",
+                .content_owned = true,
+            };
         };
 
         const native_tools_enabled = self.provider.supportsNativeTools();
-
-        var format_retries: u32 = 0;
         var total_iterations: u32 = 0;
 
         while (total_iterations < skills_mod.SUB_AGENT_MAX_ITERATIONS) : (total_iterations += 1) {
@@ -1753,6 +1776,16 @@ pub const Agent = struct {
                 self.model_name,
                 0.3,
             ) catch |err| {
+                log.warn(
+                    "sub-agent error: LLM call failed | error={s} model={s} instructions={s} hook_content={s} iteration={d}",
+                    .{
+                        @errorName(err),
+                        self.model_name,
+                        LogPreview.preview(skill_instructions),
+                        LogPreview.preview(hook_content),
+                        total_iterations + 1,
+                    },
+                );
                 const err_msg = std.fmt.allocPrint(
                     result_allocator,
                     "sub-agent LLM call failed: {s}",
@@ -1820,49 +1853,71 @@ pub const Agent = struct {
             if (skills_mod.hasValidBehaviorTag(response_text)) {
                 // Parse and return the result
                 const parsed = skills_mod.parseSubAgentResponse(result_allocator, response_text) catch {
-                    return .{ .action = .passthrough };
+                    log.warn(
+                        "sub-agent error: failed to parse valid response | output={s} instructions={s} hook_content={s}",
+                        .{
+                            LogPreview.preview(response_text),
+                            LogPreview.preview(skill_instructions),
+                            LogPreview.preview(hook_content),
+                        },
+                    );
+                    return .{
+                        .action = .agent_error,
+                        .content = result_allocator.dupe(u8, "sub-agent error: failed to parse response") catch "",
+                        .content_owned = true,
+                    };
                 };
                 // parseSubAgentResponse returns .agent as sentinel when no tag found
                 // (shouldn't happen since we checked hasValidBehaviorTag, but be safe)
                 if (parsed.action == .agent) {
-                    return .{ .action = .passthrough };
+                    log.warn(
+                        "sub-agent error: behavior tag detected but parse returned sentinel | output={s} instructions={s} hook_content={s}",
+                        .{
+                            LogPreview.preview(response_text),
+                            LogPreview.preview(skill_instructions),
+                            LogPreview.preview(hook_content),
+                        },
+                    );
+                    return .{
+                        .action = .agent_error,
+                        .content = result_allocator.dupe(u8, "sub-agent error: could not parse behavior tag") catch "",
+                        .content_owned = true,
+                    };
                 }
                 return parsed;
             }
 
-            // No valid behavior tag — retry with enforcement message
-            format_retries += 1;
-            if (format_retries > skills_mod.SUB_AGENT_MAX_FORMAT_RETRIES) {
-                // Max retries exhausted — return error
-                const err_msg = std.fmt.allocPrint(
-                    result_allocator,
-                    "sub-agent failed to produce valid output after {d} retries. Last response: {s}",
-                    .{
-                        skills_mod.SUB_AGENT_MAX_FORMAT_RETRIES,
-                        if (response_text.len > 200) response_text[0..200] else response_text,
-                    },
-                ) catch return .{
-                    .action = .agent_error,
-                    .content = result_allocator.dupe(u8, "sub-agent failed to produce valid behavior tag") catch "",
-                    .content_owned = true,
-                };
-                return .{ .action = .agent_error, .content = err_msg, .content_owned = true };
-            }
-
-            // Add the invalid response as assistant message, then ask for correction
-            messages.append(arena, ChatMessage.assistant(
-                arena.dupe(u8, response_text) catch response_text,
-            )) catch break;
-            messages.append(arena, ChatMessage.user(
-                "Your response MUST contain exactly one behavior tag: [behavior:passthrough], " ++
-                    "[behavior:intercept], [behavior:continue], or [behavior:error]. " ++
-                    "Please output your final decision now with the correct format.",
-            )) catch break;
-
-            // Continue the loop for retry
+            // No valid behavior tag in response — treat as error immediately (no retries)
+            log.warn(
+                "sub-agent error: invalid output format (no behavior tag) | output={s} instructions={s} hook_content={s} iteration={d}",
+                .{
+                    LogPreview.preview(response_text),
+                    LogPreview.preview(skill_instructions),
+                    LogPreview.preview(hook_content),
+                    total_iterations + 1,
+                },
+            );
+            const err_msg = std.fmt.allocPrint(
+                result_allocator,
+                "sub-agent produced invalid output (no behavior tag): {s}",
+                .{if (response_text.len > 200) response_text[0..200] else response_text},
+            ) catch return .{
+                .action = .agent_error,
+                .content = result_allocator.dupe(u8, "sub-agent produced invalid output format") catch "",
+                .content_owned = true,
+            };
+            return .{ .action = .agent_error, .content = err_msg, .content_owned = true };
         }
 
-        // Total iterations exhausted
+        // Total iterations exhausted (only reachable via tool call loops)
+        log.warn(
+            "sub-agent error: max iterations exhausted ({d}) | instructions={s} hook_content={s}",
+            .{
+                skills_mod.SUB_AGENT_MAX_ITERATIONS,
+                LogPreview.preview(skill_instructions),
+                LogPreview.preview(hook_content),
+            },
+        );
         return .{
             .action = .agent_error,
             .content = result_allocator.dupe(u8, "sub-agent exceeded maximum iterations without producing a result") catch "",

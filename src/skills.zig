@@ -665,11 +665,8 @@ pub const sub_agent_system_prompt =
     \\
 ;
 
-/// Maximum iterations for the sub-agent turn loop (tool calls + retries).
+/// Maximum iterations for the sub-agent turn loop (tool calls only; no format retries).
 pub const SUB_AGENT_MAX_ITERATIONS: u32 = 10;
-
-/// Maximum retries when sub-agent fails to output a valid behavior tag.
-pub const SUB_AGENT_MAX_FORMAT_RETRIES: u32 = 2;
 
 /// Parse the output of a sub-agent LLM call into a SkillHookResult.
 pub fn parseSubAgentResponse(allocator: std.mem.Allocator, response: []const u8) !SkillHookResult {
