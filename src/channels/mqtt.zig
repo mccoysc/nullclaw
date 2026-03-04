@@ -434,14 +434,20 @@ pub const MqttChannel = struct {
         const self: *MqttChannel = @ptrCast(@alignCast(ptr));
         self.running.store(false, .release);
 
-        // Kill subscriber processes to unblock reader threads
+        // Send SIGTERM to subscriber processes to unblock reader threads.
+        // IMPORTANT: use posix.kill() directly — do NOT call proc.kill() here
+        // because Child.kill() internally calls waitpid() which would reap
+        // the child.  The reader thread's defer block also calls child.kill()
+        // + child.wait() on its *local* copy of the Child struct; if we reap
+        // first via the array copy, that second waitpid() hits ECHILD →
+        // "reached unreachable code" panic inside std.process.Child.
         for (&self.sub_processes) |*proc_slot| {
-            if (proc_slot.*) |*proc| {
-                _ = proc.kill() catch {};
+            if (proc_slot.*) |proc| {
+                std.posix.kill(proc.id, std.posix.SIG.TERM) catch {};
             }
         }
 
-        // Join all reader threads
+        // Join all reader threads (their defer blocks handle kill+wait+cleanup)
         for (&self.reader_threads) |*thread_slot| {
             if (thread_slot.*) |t| {
                 t.join();
