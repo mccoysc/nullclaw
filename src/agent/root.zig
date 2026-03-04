@@ -18,6 +18,7 @@ const tools_mod = @import("../tools/root.zig");
 const Tool = tools_mod.Tool;
 const memory_mod = @import("../memory/root.zig");
 const Memory = memory_mod.Memory;
+const bootstrap_mod = @import("../bootstrap/root.zig");
 const capabilities_mod = @import("../capabilities.zig");
 const multimodal = @import("../multimodal.zig");
 const platform = @import("../platform.zig");
@@ -226,6 +227,7 @@ pub const Agent = struct {
     tools: []const Tool,
     tool_specs: []const ToolSpec,
     mem: ?Memory,
+    bootstrap: ?bootstrap_mod.BootstrapProvider = null,
     session_store: ?memory_mod.SessionStore = null,
     response_cache: ?*cache.ResponseCache = null,
     /// Optional MemoryRuntime pointer for diagnostics (e.g. /doctor command).
@@ -366,12 +368,20 @@ pub const Agent = struct {
             };
         }
 
+        const bootstrap_provider: ?bootstrap_mod.BootstrapProvider = bootstrap_mod.createProvider(
+            allocator,
+            cfg.memory.backend,
+            mem,
+            cfg.workspace_dir,
+        ) catch null;
+
         return .{
             .allocator = allocator,
             .provider = provider_i,
             .tools = tools,
             .tool_specs = specs,
             .mem = mem,
+            .bootstrap = bootstrap_provider,
             .observer = observer_i,
             .model_name = default_model,
             .default_provider = cfg.default_provider,
@@ -414,6 +424,7 @@ pub const Agent = struct {
     }
 
     pub fn deinit(self: *Agent) void {
+        if (self.bootstrap) |bp| bp.deinit();
         if (self.model_name_owned) self.allocator.free(self.model_name);
         if (self.default_provider_owned) self.allocator.free(self.default_provider);
         if (self.exec_node_id_owned and self.exec_node_id != null) self.allocator.free(self.exec_node_id.?);
@@ -442,6 +453,7 @@ pub const Agent = struct {
             .token_limit = self.token_limit,
             .max_history_messages = self.max_history_messages,
             .workspace_dir = self.workspace_dir,
+            .bootstrap_provider = self.bootstrap,
         });
     }
 
@@ -706,7 +718,7 @@ pub const Agent = struct {
         };
 
         // Inject system prompt on first turn (or when tracked workspace files changed).
-        const workspace_fp: ?u64 = prompt.workspacePromptFingerprint(self.allocator, self.workspace_dir) catch null;
+        const workspace_fp: ?u64 = prompt.workspacePromptFingerprint(self.allocator, self.workspace_dir, self.bootstrap) catch null;
         if (self.has_system_prompt and workspace_fp != null and self.workspace_prompt_fingerprint != workspace_fp) {
             self.has_system_prompt = false;
         }
@@ -733,6 +745,7 @@ pub const Agent = struct {
                 .tools = self.tools,
                 .capabilities_section = capabilities_section,
                 .conversation_context = self.conversation_context,
+                .bootstrap_provider = self.bootstrap,
             });
             defer self.allocator.free(system_prompt);
 

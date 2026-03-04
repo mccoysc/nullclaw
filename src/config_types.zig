@@ -809,6 +809,8 @@ pub const ChannelsConfig = struct {
 
 /// Memory configuration profile presets.
 pub const MemoryProfile = enum {
+    /// Hybrid: SQLite backend with workspace bootstrap files.
+    hybrid_keyword,
     /// SQLite keyword-only (default).
     local_keyword,
     /// File-based markdown memory.
@@ -825,6 +827,7 @@ pub const MemoryProfile = enum {
     custom,
 
     pub fn fromString(s: []const u8) MemoryProfile {
+        if (std.mem.eql(u8, s, "hybrid_keyword")) return .hybrid_keyword;
         if (std.mem.eql(u8, s, "local_keyword")) return .local_keyword;
         if (std.mem.eql(u8, s, "markdown_only")) return .markdown_only;
         if (std.mem.eql(u8, s, "postgres_keyword")) return .postgres_keyword;
@@ -836,11 +839,12 @@ pub const MemoryProfile = enum {
 };
 
 pub const MemoryConfig = struct {
-    pub const DEFAULT_MEMORY_BACKEND: []const u8 = "markdown";
+    pub const DEFAULT_MEMORY_BACKEND: []const u8 = "hybrid";
 
     /// Profile preset — convenience shortcut for common setups.
-    profile: []const u8 = "markdown_only",
+    profile: []const u8 = "hybrid_keyword",
     backend: []const u8 = DEFAULT_MEMORY_BACKEND,
+    instance_id: []const u8 = "",
     auto_save: bool = true,
     citations: []const u8 = "auto",
     search: MemorySearchConfig = .{},
@@ -859,6 +863,9 @@ pub const MemoryConfig = struct {
     pub fn applyProfileDefaults(self: *MemoryConfig) void {
         const p = MemoryProfile.fromString(self.profile);
         switch (p) {
+            .hybrid_keyword => {
+                // Base default is already hybrid.
+            },
             .local_keyword => {
                 if (std.mem.eql(u8, self.backend, DEFAULT_MEMORY_BACKEND)) self.backend = "sqlite";
             },
