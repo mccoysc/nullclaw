@@ -462,24 +462,33 @@ pub const SessionManager = struct {
 
         if (hook_skills) |hs| {
             if (skills_mod.hasSkillsForTrigger(hs, .on_channel_receive_before)) {
-                const hook_result = skills_mod.evaluateSkillHook(self.allocator, hs, .on_channel_receive_before, content) catch skills_mod.SkillHookResult{};
+                var hook_result = skills_mod.evaluateSkillHook(self.allocator, hs, .on_channel_receive_before, content) catch skills_mod.SkillHookResult{};
                 defer skills_mod.freeHookResult(self.allocator, &hook_result);
+
+                if (hook_result.action == .agent) {
+                    const agent_result = skills_mod.executeSkillAgent(
+                        self.allocator, session.agent.provider, session.agent.model_name,
+                        hook_result.content, content,
+                    ) catch skills_mod.SkillHookResult{};
+                    skills_mod.freeHookResult(self.allocator, &hook_result);
+                    hook_result = agent_result;
+                }
+
                 switch (hook_result.action) {
                     .intercept => {
-                        // Intercept: don't process message, return hook's content
                         const intercept_response = if (hook_result.content.len > 0)
                             try self.allocator.dupe(u8, hook_result.content)
                         else
                             try self.allocator.dupe(u8, "[intercepted by on_channel_receive_before hook]");
                         return intercept_response;
                     },
-                    .replace => {
+                    .continue_with => {
                         if (hook_result.content.len > 0) {
                             effective_content = try self.allocator.dupe(u8, hook_result.content);
                             effective_content_owned = true;
                         }
                     },
-                    .passthrough, .compact => {},
+                    .passthrough, .agent => {},
                 }
             }
         }
@@ -494,10 +503,20 @@ pub const SessionManager = struct {
         var post_receive_owned = false;
         if (hook_skills) |hs| {
             if (skills_mod.hasSkillsForTrigger(hs, .on_channel_receive_after)) {
-                const hook_result = skills_mod.evaluateSkillHook(self.allocator, hs, .on_channel_receive_after, response) catch skills_mod.SkillHookResult{};
+                var hook_result = skills_mod.evaluateSkillHook(self.allocator, hs, .on_channel_receive_after, response) catch skills_mod.SkillHookResult{};
                 defer skills_mod.freeHookResult(self.allocator, &hook_result);
+
+                if (hook_result.action == .agent) {
+                    const agent_result = skills_mod.executeSkillAgent(
+                        self.allocator, session.agent.provider, session.agent.model_name,
+                        hook_result.content, response,
+                    ) catch skills_mod.SkillHookResult{};
+                    skills_mod.freeHookResult(self.allocator, &hook_result);
+                    hook_result = agent_result;
+                }
+
                 switch (hook_result.action) {
-                    .replace => {
+                    .continue_with => {
                         if (hook_result.content.len > 0) {
                             post_receive_response = try self.allocator.dupe(u8, hook_result.content);
                             post_receive_owned = true;
@@ -509,7 +528,7 @@ pub const SessionManager = struct {
                             return try self.allocator.dupe(u8, hook_result.content);
                         }
                     },
-                    .passthrough, .compact => {},
+                    .passthrough, .agent => {},
                 }
             }
         }
@@ -519,8 +538,18 @@ pub const SessionManager = struct {
         var send_owned = false;
         if (hook_skills) |hs| {
             if (skills_mod.hasSkillsForTrigger(hs, .on_channel_send_before)) {
-                const hook_result = skills_mod.evaluateSkillHook(self.allocator, hs, .on_channel_send_before, post_receive_response) catch skills_mod.SkillHookResult{};
+                var hook_result = skills_mod.evaluateSkillHook(self.allocator, hs, .on_channel_send_before, post_receive_response) catch skills_mod.SkillHookResult{};
                 defer skills_mod.freeHookResult(self.allocator, &hook_result);
+
+                if (hook_result.action == .agent) {
+                    const agent_result = skills_mod.executeSkillAgent(
+                        self.allocator, session.agent.provider, session.agent.model_name,
+                        hook_result.content, post_receive_response,
+                    ) catch skills_mod.SkillHookResult{};
+                    skills_mod.freeHookResult(self.allocator, &hook_result);
+                    hook_result = agent_result;
+                }
+
                 switch (hook_result.action) {
                     .intercept => {
                         if (post_receive_owned) self.allocator.free(post_receive_response);
@@ -530,22 +559,20 @@ pub const SessionManager = struct {
                         else
                             try self.allocator.dupe(u8, "[intercepted by on_channel_send_before hook]");
                     },
-                    .replace => {
+                    .continue_with => {
                         if (hook_result.content.len > 0) {
                             send_response = try self.allocator.dupe(u8, hook_result.content);
                             send_owned = true;
                         }
                     },
-                    .passthrough, .compact => {},
+                    .passthrough, .agent => {},
                 }
             }
         }
 
         // Determine the final response to return
         const final_response = if (send_owned) blk: {
-            // Free intermediate allocations
             if (post_receive_owned) self.allocator.free(post_receive_response);
-            if (post_receive_owned or send_owned) {} // response freed below if needed
             if (!post_receive_owned) self.allocator.free(response);
             break :blk send_response;
         } else if (post_receive_owned) blk: {
@@ -562,12 +589,9 @@ pub const SessionManager = struct {
         if (self.session_store) |store| {
             const trimmed = std.mem.trim(u8, content, " \t\r\n");
             if (slashClearsSession(trimmed)) {
-                // Clear persisted messages on session reset
                 store.clearMessages(session_key) catch {};
-                // Clear stale auto-saved memories
                 store.clearAutoSaved(session_key) catch {};
             } else if (!std.mem.startsWith(u8, trimmed, "/")) {
-                // Persist user + assistant messages (skip slash commands)
                 store.saveMessage(session_key, "user", content) catch {};
                 store.saveMessage(session_key, "assistant", final_response) catch {};
             }
@@ -590,7 +614,15 @@ pub const SessionManager = struct {
         // ── on_channel_send_after hook (fire-and-forget, does not modify return) ──
         if (hook_skills) |hs| {
             if (skills_mod.hasSkillsForTrigger(hs, .on_channel_send_after)) {
-                const hook_result = skills_mod.evaluateSkillHook(self.allocator, hs, .on_channel_send_after, final_response) catch skills_mod.SkillHookResult{};
+                var hook_result = skills_mod.evaluateSkillHook(self.allocator, hs, .on_channel_send_after, final_response) catch skills_mod.SkillHookResult{};
+                if (hook_result.action == .agent) {
+                    const agent_result = skills_mod.executeSkillAgent(
+                        self.allocator, session.agent.provider, session.agent.model_name,
+                        hook_result.content, final_response,
+                    ) catch skills_mod.SkillHookResult{};
+                    skills_mod.freeHookResult(self.allocator, &hook_result);
+                    hook_result = agent_result;
+                }
                 skills_mod.freeHookResult(self.allocator, &hook_result);
                 // on_channel_send_after is observational — response already committed
             }

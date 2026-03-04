@@ -839,18 +839,29 @@ pub const Agent = struct {
             // ── on_llm_request hook: evaluate before building messages ──
             if (hook_skills) |hs| {
                 if (skills_mod.hasSkillsForTrigger(hs, .on_llm_request)) {
-                    const hook_result = skills_mod.evaluateSkillHook(self.allocator, hs, .on_llm_request, "") catch skills_mod.SkillHookResult{};
+                    var hook_result = skills_mod.evaluateSkillHook(self.allocator, hs, .on_llm_request, "") catch skills_mod.SkillHookResult{};
                     defer skills_mod.freeHookResult(self.allocator, &hook_result);
+
+                    // If agent action, invoke sub-agent LLM call
+                    if (hook_result.action == .agent) {
+                        const agent_result = skills_mod.executeSkillAgent(
+                            self.allocator,
+                            self.provider,
+                            self.model_name,
+                            hook_result.content,
+                            "",
+                        ) catch skills_mod.SkillHookResult{};
+                        skills_mod.freeHookResult(self.allocator, &hook_result);
+                        hook_result = agent_result;
+                    }
 
                     switch (hook_result.action) {
                         .intercept => {
-                            // Skip LLM call entirely, return the hook's content as response
                             const intercept_response = if (hook_result.content.len > 0)
                                 try self.allocator.dupe(u8, hook_result.content)
                             else
                                 try self.allocator.dupe(u8, "[intercepted by skill hook]");
                             errdefer self.allocator.free(intercept_response);
-
                             try self.history.append(self.allocator, .{
                                 .role = .assistant,
                                 .content = try self.allocator.dupe(u8, intercept_response),
@@ -859,14 +870,7 @@ pub const Agent = struct {
                             self.observer.recordEvent(&complete_event);
                             return intercept_response;
                         },
-                        .compact => {
-                            // Force history compaction, then continue with LLM call
-                            if (self.forceCompressHistory()) {
-                                self.context_was_compacted = true;
-                            }
-                        },
-                        .replace => {
-                            // Replace the last user message in history
+                        .continue_with => {
                             if (hook_result.content.len > 0 and self.history.items.len > 0) {
                                 const last_idx = self.history.items.len - 1;
                                 if (self.history.items[last_idx].role == .user) {
@@ -878,7 +882,7 @@ pub const Agent = struct {
                                 }
                             }
                         },
-                        .passthrough => {},
+                        .passthrough, .agent => {},
                     }
                 }
             }
@@ -889,12 +893,21 @@ pub const Agent = struct {
             // ── on_llm_before hook: modify messages content before LLM call ──
             if (hook_skills) |hs| {
                 if (skills_mod.hasSkillsForTrigger(hs, .on_llm_before)) {
-                    // Apply hook to the last user message in the messages slice
                     for (0..messages.len) |i| {
                         const idx = messages.len - 1 - i;
                         if (messages[idx].role == .user) {
-                            const hook_result = skills_mod.evaluateSkillHook(arena, hs, .on_llm_before, messages[idx].content) catch break;
+                            var hook_result = skills_mod.evaluateSkillHook(arena, hs, .on_llm_before, messages[idx].content) catch break;
                             defer skills_mod.freeHookResult(arena, &hook_result);
+
+                            if (hook_result.action == .agent) {
+                                const agent_result = skills_mod.executeSkillAgent(
+                                    arena, self.provider, self.model_name,
+                                    hook_result.content, messages[idx].content,
+                                ) catch break;
+                                skills_mod.freeHookResult(arena, &hook_result);
+                                hook_result = agent_result;
+                            }
+
                             switch (hook_result.action) {
                                 .intercept => {
                                     const intercept_response = if (hook_result.content.len > 0)
@@ -910,13 +923,12 @@ pub const Agent = struct {
                                     self.observer.recordEvent(&complete_event);
                                     return intercept_response;
                                 },
-                                .replace => {
+                                .continue_with => {
                                     if (hook_result.content.len > 0) {
-                                        const new_content = try arena.dupe(u8, hook_result.content);
-                                        messages[idx].content = new_content;
+                                        messages[idx].content = try arena.dupe(u8, hook_result.content);
                                     }
                                 },
-                                .passthrough, .compact => {},
+                                .passthrough, .agent => {},
                             }
                             break;
                         }
@@ -1094,11 +1106,20 @@ pub const Agent = struct {
             if (hook_skills) |hs| {
                 if (skills_mod.hasSkillsForTrigger(hs, .on_llm_after)) {
                     const raw_resp = response.contentOrEmpty();
-                    const hook_result = skills_mod.evaluateSkillHook(arena, hs, .on_llm_after, raw_resp) catch skills_mod.SkillHookResult{};
+                    var hook_result = skills_mod.evaluateSkillHook(arena, hs, .on_llm_after, raw_resp) catch skills_mod.SkillHookResult{};
                     defer skills_mod.freeHookResult(arena, &hook_result);
+
+                    if (hook_result.action == .agent) {
+                        const agent_result = skills_mod.executeSkillAgent(
+                            arena, self.provider, self.model_name,
+                            hook_result.content, raw_resp,
+                        ) catch skills_mod.SkillHookResult{};
+                        skills_mod.freeHookResult(arena, &hook_result);
+                        hook_result = agent_result;
+                    }
+
                     switch (hook_result.action) {
                         .intercept => {
-                            // Intercept the LLM response: return the hook's content instead
                             const intercept_response = if (hook_result.content.len > 0)
                                 try self.allocator.dupe(u8, hook_result.content)
                             else
@@ -1113,12 +1134,12 @@ pub const Agent = struct {
                             self.observer.recordEvent(&complete_event);
                             return intercept_response;
                         },
-                        .replace => {
+                        .continue_with => {
                             if (hook_result.content.len > 0) {
                                 llm_after_replacement = try arena.dupe(u8, hook_result.content);
                             }
                         },
-                        .passthrough, .compact => {},
+                        .passthrough, .agent => {},
                     }
                 }
             }
@@ -1346,8 +1367,18 @@ pub const Agent = struct {
                 if (hook_skills) |hs| {
                     if (skills_mod.hasSkillsForTrigger(hs, .on_tool_call_before)) {
                         const tool_ctx = std.fmt.allocPrint(arena, "tool:{s} args:{s}", .{ call.name, call.arguments_json }) catch "";
-                        const hook_result = skills_mod.evaluateSkillHook(arena, hs, .on_tool_call_before, tool_ctx) catch skills_mod.SkillHookResult{};
+                        var hook_result = skills_mod.evaluateSkillHook(arena, hs, .on_tool_call_before, tool_ctx) catch skills_mod.SkillHookResult{};
                         defer skills_mod.freeHookResult(arena, &hook_result);
+
+                        if (hook_result.action == .agent) {
+                            const agent_result = skills_mod.executeSkillAgent(
+                                arena, self.provider, self.model_name,
+                                hook_result.content, tool_ctx,
+                            ) catch skills_mod.SkillHookResult{};
+                            skills_mod.freeHookResult(arena, &hook_result);
+                            hook_result = agent_result;
+                        }
+
                         switch (hook_result.action) {
                             .intercept => {
                                 tool_intercepted = true;
@@ -1358,7 +1389,7 @@ pub const Agent = struct {
                                     .tool_call_id = call.tool_call_id,
                                 };
                             },
-                            .replace, .passthrough, .compact => {},
+                            .continue_with, .passthrough, .agent => {},
                         }
                     }
                 }
@@ -1382,10 +1413,20 @@ pub const Agent = struct {
                 if (!tool_intercepted) {
                     if (hook_skills) |hs| {
                         if (skills_mod.hasSkillsForTrigger(hs, .on_tool_call_after)) {
-                            const hook_result = skills_mod.evaluateSkillHook(arena, hs, .on_tool_call_after, result.output) catch skills_mod.SkillHookResult{};
+                            var hook_result = skills_mod.evaluateSkillHook(arena, hs, .on_tool_call_after, result.output) catch skills_mod.SkillHookResult{};
                             defer skills_mod.freeHookResult(arena, &hook_result);
+
+                            if (hook_result.action == .agent) {
+                                const agent_result = skills_mod.executeSkillAgent(
+                                    arena, self.provider, self.model_name,
+                                    hook_result.content, result.output,
+                                ) catch skills_mod.SkillHookResult{};
+                                skills_mod.freeHookResult(arena, &hook_result);
+                                hook_result = agent_result;
+                            }
+
                             switch (hook_result.action) {
-                                .replace => {
+                                .continue_with => {
                                     if (hook_result.content.len > 0) {
                                         final_result = ToolExecutionResult{
                                             .name = result.name,
@@ -1395,7 +1436,7 @@ pub const Agent = struct {
                                         };
                                     }
                                 },
-                                .intercept, .passthrough, .compact => {},
+                                .intercept, .passthrough, .agent => {},
                             }
                         }
                     }
