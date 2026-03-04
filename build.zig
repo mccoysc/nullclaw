@@ -84,6 +84,8 @@ const ChannelSelection = struct {
     enable_channel_qq: bool = false,
     enable_channel_maixcam: bool = false,
     enable_channel_signal: bool = false,
+    enable_channel_mqtt: bool = false,
+    enable_channel_redis_stream: bool = false,
     enable_channel_nostr: bool = false,
     enable_channel_web: bool = false,
 
@@ -105,6 +107,8 @@ const ChannelSelection = struct {
         self.enable_channel_qq = true;
         self.enable_channel_maixcam = true;
         self.enable_channel_signal = true;
+        self.enable_channel_mqtt = true;
+        self.enable_channel_redis_stream = true;
         self.enable_channel_nostr = true;
         self.enable_channel_web = true;
     }
@@ -174,6 +178,10 @@ fn parseChannelsOption(raw: []const u8) !ChannelSelection {
             selection.enable_channel_maixcam = true;
         } else if (std.mem.eql(u8, token, "signal")) {
             selection.enable_channel_signal = true;
+        } else if (std.mem.eql(u8, token, "mqtt")) {
+            selection.enable_channel_mqtt = true;
+        } else if (std.mem.eql(u8, token, "redis_stream") or std.mem.eql(u8, token, "redis-stream")) {
+            selection.enable_channel_redis_stream = true;
         } else if (std.mem.eql(u8, token, "nostr")) {
             selection.enable_channel_nostr = true;
         } else if (std.mem.eql(u8, token, "web")) {
@@ -320,7 +328,7 @@ pub fn build(b: *std.Build) void {
     const channels_raw = b.option(
         []const u8,
         "channels",
-        "Channels list. Tokens: all|none|cli|telegram|discord|slack|whatsapp|matrix|mattermost|irc|imessage|email|lark|dingtalk|line|onebot|qq|maixcam|signal|nostr|web (default: all)",
+        "Channels list. Tokens: all|none|cli|telegram|discord|slack|whatsapp|matrix|mattermost|irc|imessage|email|lark|dingtalk|line|onebot|qq|maixcam|signal|mqtt|redis_stream|nostr|web (default: all)",
     );
     const channels = if (channels_raw) |raw| blk: {
         const parsed = parseChannelsOption(raw) catch {
@@ -368,6 +376,8 @@ pub fn build(b: *std.Build) void {
     const enable_channel_qq = channels.enable_channel_qq;
     const enable_channel_maixcam = channels.enable_channel_maixcam;
     const enable_channel_signal = channels.enable_channel_signal;
+    const enable_channel_mqtt = channels.enable_channel_mqtt;
+    const enable_channel_redis_stream = channels.enable_channel_redis_stream;
     const enable_channel_nostr = channels.enable_channel_nostr;
     const enable_channel_web = channels.enable_channel_web;
 
@@ -421,6 +431,8 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "enable_channel_qq", enable_channel_qq);
     build_options.addOption(bool, "enable_channel_maixcam", enable_channel_maixcam);
     build_options.addOption(bool, "enable_channel_signal", enable_channel_signal);
+    build_options.addOption(bool, "enable_channel_mqtt", enable_channel_mqtt);
+    build_options.addOption(bool, "enable_channel_redis_stream", enable_channel_redis_stream);
     build_options.addOption(bool, "enable_channel_nostr", enable_channel_nostr);
     build_options.addOption(bool, "enable_channel_web", enable_channel_web);
     const build_options_module = build_options.createModule();

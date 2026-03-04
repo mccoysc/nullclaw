@@ -21,6 +21,8 @@ pub const ChannelId = enum {
     qq,
     onebot,
     maixcam,
+    mqtt,
+    redis_stream,
     nostr,
     web,
 };
@@ -60,6 +62,8 @@ pub const known_channels = [_]ChannelMeta{
     .{ .id = .qq, .key = "qq", .label = "QQ", .configured_message = "QQ configured", .listener_mode = .gateway_loop },
     .{ .id = .onebot, .key = "onebot", .label = "OneBot", .configured_message = "OneBot configured", .listener_mode = .gateway_loop },
     .{ .id = .maixcam, .key = "maixcam", .label = "MaixCam", .configured_message = "MaixCam configured", .listener_mode = .send_only },
+    .{ .id = .mqtt, .key = "mqtt", .label = "MQTT", .configured_message = "MQTT configured", .listener_mode = .send_only },
+    .{ .id = .redis_stream, .key = "redis_stream", .label = "Redis Stream", .configured_message = "Redis Stream configured", .listener_mode = .send_only },
     .{ .id = .nostr, .key = "nostr", .label = "Nostr", .configured_message = "Nostr configured", .listener_mode = .gateway_loop },
     .{ .id = .web, .key = "web", .label = "Web", .configured_message = "Web configured", .listener_mode = .gateway_loop },
 };
@@ -84,6 +88,8 @@ pub fn isBuildEnabled(channel_id: ChannelId) bool {
         .qq => build_options.enable_channel_qq,
         .onebot => build_options.enable_channel_onebot,
         .maixcam => build_options.enable_channel_maixcam,
+        .mqtt => build_options.enable_channel_mqtt,
+        .redis_stream => build_options.enable_channel_redis_stream,
         .nostr => build_options.enable_channel_nostr,
         .web => build_options.enable_channel_web,
     };
@@ -108,6 +114,8 @@ pub fn isBuildEnabledByKey(comptime key: []const u8) bool {
     if (comptime std.mem.eql(u8, key, "qq")) return build_options.enable_channel_qq;
     if (comptime std.mem.eql(u8, key, "onebot")) return build_options.enable_channel_onebot;
     if (comptime std.mem.eql(u8, key, "maixcam")) return build_options.enable_channel_maixcam;
+    if (comptime std.mem.eql(u8, key, "mqtt")) return build_options.enable_channel_mqtt;
+    if (comptime std.mem.eql(u8, key, "redis_stream")) return build_options.enable_channel_redis_stream;
     if (comptime std.mem.eql(u8, key, "nostr")) return build_options.enable_channel_nostr;
     if (comptime std.mem.eql(u8, key, "web")) return build_options.enable_channel_web;
     return true;
@@ -133,6 +141,8 @@ pub fn configuredCount(cfg: *const Config, channel_id: ChannelId) usize {
         .qq => cfg.channels.qq.len,
         .onebot => cfg.channels.onebot.len,
         .maixcam => cfg.channels.maixcam.len,
+        .mqtt => cfg.channels.mqtt.len,
+        .redis_stream => cfg.channels.redis_stream.len,
         .nostr => if (cfg.channels.nostr != null) 1 else 0,
         .web => cfg.channels.web.len,
     };

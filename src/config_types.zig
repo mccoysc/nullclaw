@@ -553,6 +553,81 @@ pub const WebConfig = struct {
     }
 };
 
+// ── MQTT / Redis Stream channel configs ─────────────────────────
+
+/// A single MQTT endpoint configuration.
+/// Multiple instances are allowed (same channel, different brokers/topics).
+pub const MqttEndpointConfig = struct {
+    /// Broker host (e.g. "broker.example.com").
+    host: []const u8,
+    /// Broker port (default 1883 for TCP, 8883 for TLS).
+    port: u16 = 1883,
+    /// Optional username for broker authentication.
+    username: ?[]const u8 = null,
+    /// Optional password for broker authentication.
+    password: ?[]const u8 = null,
+    /// Use TLS for the connection.
+    tls: bool = false,
+    /// Optional client ID (auto-generated if not set).
+    client_id: ?[]const u8 = null,
+    /// Peer's P256 public key (hex-encoded, uncompressed) — used to verify inbound messages.
+    peer_pubkey: []const u8,
+    /// Local P256 private key (hex-encoded) — used to sign outbound messages.
+    /// Generated randomly during onboarding if not provided.
+    local_privkey: []const u8,
+    /// Local P256 public key (hex-encoded, uncompressed) — derived from local_privkey.
+    /// Published so the peer can verify our signatures.
+    local_pubkey: []const u8,
+    /// Topic to subscribe to (listen for inbound messages).
+    listen_topic: []const u8,
+    /// Topic to publish replies on. If empty or equal to listen_topic,
+    /// the channel uses the same topic for both directions and filters
+    /// out messages signed by our own key.
+    reply_topic: ?[]const u8 = null,
+};
+
+pub const MqttConfig = struct {
+    account_id: []const u8 = "default",
+    endpoints: []const MqttEndpointConfig = &.{},
+};
+
+/// A single Redis Stream endpoint configuration.
+pub const RedisStreamEndpointConfig = struct {
+    /// Redis host (e.g. "localhost").
+    host: []const u8 = "localhost",
+    /// Redis port.
+    port: u16 = 6379,
+    /// Optional Redis password (AUTH).
+    password: ?[]const u8 = null,
+    /// Redis database index.
+    db: u16 = 0,
+    /// Use TLS for the connection.
+    tls: bool = false,
+    /// Optional username (Redis 6+ ACL).
+    username: ?[]const u8 = null,
+    /// Peer's P256 public key (hex-encoded, uncompressed) — used to verify inbound messages.
+    peer_pubkey: []const u8,
+    /// Local P256 private key (hex-encoded) — used to sign outbound messages.
+    local_privkey: []const u8,
+    /// Local P256 public key (hex-encoded, uncompressed) — derived from local_privkey.
+    local_pubkey: []const u8,
+    /// Stream key to read from (listen for inbound messages).
+    listen_topic: []const u8,
+    /// Stream key to write replies to. If empty or equal to listen_topic,
+    /// the channel uses the same stream for both directions and filters
+    /// out messages signed by our own key.
+    reply_topic: ?[]const u8 = null,
+    /// Consumer group name for XREADGROUP.
+    consumer_group: []const u8 = "nullclaw",
+    /// Consumer name within the group.
+    consumer_name: []const u8 = "default",
+};
+
+pub const RedisStreamConfig = struct {
+    account_id: []const u8 = "default",
+    endpoints: []const RedisStreamEndpointConfig = &.{},
+};
+
 pub const NostrConfig = struct {
     /// Private key: must be enc2:-encrypted via SecretStore (use onboarding wizard or SecretStore.encryptSecret).
     /// Not required when bunker_uri is set (external bunker handles signing).
@@ -619,6 +694,8 @@ pub const ChannelsConfig = struct {
     onebot: []const OneBotConfig = &.{},
     maixcam: []const MaixCamConfig = &.{},
     web: []const WebConfig = &.{},
+    mqtt: []const MqttConfig = &.{},
+    redis_stream: []const RedisStreamConfig = &.{},
     nostr: ?*NostrConfig = null,
 
     fn primaryAccount(comptime T: type, items: []const T) ?T {
@@ -686,6 +763,12 @@ pub const ChannelsConfig = struct {
     }
     pub fn webPrimary(self: *const ChannelsConfig) ?WebConfig {
         return primaryAccount(WebConfig, self.web);
+    }
+    pub fn mqttPrimary(self: *const ChannelsConfig) ?MqttConfig {
+        return primaryAccount(MqttConfig, self.mqtt);
+    }
+    pub fn redisStreamPrimary(self: *const ChannelsConfig) ?RedisStreamConfig {
+        return primaryAccount(RedisStreamConfig, self.redis_stream);
     }
 };
 

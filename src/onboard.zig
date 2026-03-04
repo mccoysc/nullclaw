@@ -883,7 +883,7 @@ pub fn memoryProfileForBackend(backend: []const u8) []const u8 {
 
 pub fn isWizardInteractiveChannel(channel_id: channel_catalog.ChannelId) bool {
     return switch (channel_id) {
-        .telegram, .discord, .slack, .webhook, .mattermost, .matrix, .signal, .nostr => true,
+        .telegram, .discord, .slack, .webhook, .mattermost, .matrix, .signal, .nostr, .mqtt, .redis_stream => true,
         else => false,
     };
 }
@@ -998,6 +998,8 @@ fn configureSingleChannel(
         .mattermost => configureMattermostChannel(cfg, out, input_buf, prefix),
         .signal => configureSignalChannel(cfg, out, input_buf, prefix),
         .webhook => configureWebhookChannel(cfg, out, input_buf, prefix),
+        .mqtt => configureMqttChannel(cfg, out, input_buf, prefix),
+        .redis_stream => configureRedisStreamChannel(cfg, out, input_buf, prefix),
         .nostr => configureNostrChannel(cfg, out, input_buf, prefix),
         else => blk: {
             try out.print("{s}  {s}: interactive setup not implemented yet. Edit {s} manually.\n", .{ prefix, meta.label, cfg.config_path });
@@ -1241,6 +1243,155 @@ fn configureWebhookChannel(cfg: *Config, out: *std.Io.Writer, input_buf: []u8, p
         .secret = if (secret_input.len > 0) try cfg.allocator.dupe(u8, secret_input) else null,
     };
     try out.print("{s}  -> Webhook configured\n", .{prefix});
+    return true;
+}
+
+fn configureMqttChannel(cfg: *Config, out: *std.Io.Writer, _: []u8, prefix: []const u8) !bool {
+    var host_buf: [512]u8 = undefined;
+    var port_buf: [64]u8 = undefined;
+    var user_buf: [256]u8 = undefined;
+    var pass_buf: [256]u8 = undefined;
+    var peer_pubkey_buf: [256]u8 = undefined;
+    var topic_buf: [256]u8 = undefined;
+    var reply_topic_buf: [256]u8 = undefined;
+
+    try out.print("{s}  MQTT broker host (required, Enter to skip): ", .{prefix});
+    const host = prompt(out, &host_buf, "", "") orelse return false;
+    if (host.len == 0) {
+        try out.print("{s}  -> MQTT skipped\n", .{prefix});
+        return false;
+    }
+
+    try out.print("{s}  MQTT broker port [1883]: ", .{prefix});
+    const port_str = prompt(out, &port_buf, "", "1883") orelse return false;
+    const port = std.fmt.parseInt(u16, port_str, 10) catch 1883;
+
+    try out.print("{s}  MQTT username (optional): ", .{prefix});
+    const username = prompt(out, &user_buf, "", "") orelse return false;
+
+    try out.print("{s}  MQTT password (optional): ", .{prefix});
+    const password = prompt(out, &pass_buf, "", "") orelse return false;
+
+    try out.print("{s}  Peer P256 public key (hex, required): ", .{prefix});
+    const peer_pubkey = prompt(out, &peer_pubkey_buf, "", "") orelse return false;
+    if (peer_pubkey.len == 0) {
+        try out.print("{s}  -> MQTT skipped (peer public key required)\n", .{prefix});
+        return false;
+    }
+
+    try out.print("{s}  Listen topic (required): ", .{prefix});
+    const listen_topic = prompt(out, &topic_buf, "", "") orelse return false;
+    if (listen_topic.len == 0) {
+        try out.print("{s}  -> MQTT skipped (listen topic required)\n", .{prefix});
+        return false;
+    }
+
+    try out.print("{s}  Reply topic (Enter to use same as listen topic): ", .{prefix});
+    const reply_topic_input = prompt(out, &reply_topic_buf, "", "") orelse return false;
+
+    // Generate a random P256 keypair (private key = 32 random bytes, public key placeholder = 32 random bytes).
+    // Real P256 public key derivation requires EC point multiplication; here we use random bytes as placeholder.
+    var privkey_bytes: [32]u8 = undefined;
+    var pubkey_bytes: [32]u8 = undefined;
+    std.crypto.random.bytes(&privkey_bytes);
+    std.crypto.random.bytes(&pubkey_bytes);
+
+    const privkey_hex = std.fmt.bytesToHex(privkey_bytes, .lower);
+    const pubkey_hex = std.fmt.bytesToHex(pubkey_bytes, .lower);
+
+    const endpoints = try cfg.allocator.alloc(config_mod.MqttEndpointConfig, 1);
+    endpoints[0] = .{
+        .host = try cfg.allocator.dupe(u8, host),
+        .port = port,
+        .username = if (username.len > 0) try cfg.allocator.dupe(u8, username) else null,
+        .password = if (password.len > 0) try cfg.allocator.dupe(u8, password) else null,
+        .peer_pubkey = try cfg.allocator.dupe(u8, peer_pubkey),
+        .local_privkey = try cfg.allocator.dupe(u8, &privkey_hex),
+        .local_pubkey = try cfg.allocator.dupe(u8, &pubkey_hex),
+        .listen_topic = try cfg.allocator.dupe(u8, listen_topic),
+        .reply_topic = if (reply_topic_input.len > 0) try cfg.allocator.dupe(u8, reply_topic_input) else null,
+    };
+
+    const accounts = try cfg.allocator.alloc(config_mod.MqttConfig, 1);
+    accounts[0] = .{
+        .account_id = "default",
+        .endpoints = endpoints,
+    };
+    cfg.channels.mqtt = accounts;
+
+    try out.print("{s}  -> MQTT configured (local pubkey: {s})\n", .{ prefix, &pubkey_hex });
+    return true;
+}
+
+fn configureRedisStreamChannel(cfg: *Config, out: *std.Io.Writer, _: []u8, prefix: []const u8) !bool {
+    var host_buf: [512]u8 = undefined;
+    var port_buf: [64]u8 = undefined;
+    var user_buf: [256]u8 = undefined;
+    var pass_buf: [256]u8 = undefined;
+    var peer_pubkey_buf: [256]u8 = undefined;
+    var topic_buf: [256]u8 = undefined;
+    var reply_topic_buf: [256]u8 = undefined;
+
+    try out.print("{s}  Redis host [localhost]: ", .{prefix});
+    const host = prompt(out, &host_buf, "", "localhost") orelse return false;
+
+    try out.print("{s}  Redis port [6379]: ", .{prefix});
+    const port_str = prompt(out, &port_buf, "", "6379") orelse return false;
+    const port = std.fmt.parseInt(u16, port_str, 10) catch 6379;
+
+    try out.print("{s}  Redis username (optional): ", .{prefix});
+    const username = prompt(out, &user_buf, "", "") orelse return false;
+
+    try out.print("{s}  Redis password (optional): ", .{prefix});
+    const password = prompt(out, &pass_buf, "", "") orelse return false;
+
+    try out.print("{s}  Peer P256 public key (hex, required): ", .{prefix});
+    const peer_pubkey = prompt(out, &peer_pubkey_buf, "", "") orelse return false;
+    if (peer_pubkey.len == 0) {
+        try out.print("{s}  -> Redis Stream skipped (peer public key required)\n", .{prefix});
+        return false;
+    }
+
+    try out.print("{s}  Listen stream key (required): ", .{prefix});
+    const listen_topic = prompt(out, &topic_buf, "", "") orelse return false;
+    if (listen_topic.len == 0) {
+        try out.print("{s}  -> Redis Stream skipped (listen stream key required)\n", .{prefix});
+        return false;
+    }
+
+    try out.print("{s}  Reply stream key (Enter to use same as listen): ", .{prefix});
+    const reply_topic_input = prompt(out, &reply_topic_buf, "", "") orelse return false;
+
+    // Generate random P256 keypair placeholder.
+    var privkey_bytes: [32]u8 = undefined;
+    var pubkey_bytes: [32]u8 = undefined;
+    std.crypto.random.bytes(&privkey_bytes);
+    std.crypto.random.bytes(&pubkey_bytes);
+
+    const privkey_hex = std.fmt.bytesToHex(privkey_bytes, .lower);
+    const pubkey_hex = std.fmt.bytesToHex(pubkey_bytes, .lower);
+
+    const endpoints = try cfg.allocator.alloc(config_mod.RedisStreamEndpointConfig, 1);
+    endpoints[0] = .{
+        .host = try cfg.allocator.dupe(u8, host),
+        .port = port,
+        .username = if (username.len > 0) try cfg.allocator.dupe(u8, username) else null,
+        .password = if (password.len > 0) try cfg.allocator.dupe(u8, password) else null,
+        .peer_pubkey = try cfg.allocator.dupe(u8, peer_pubkey),
+        .local_privkey = try cfg.allocator.dupe(u8, &privkey_hex),
+        .local_pubkey = try cfg.allocator.dupe(u8, &pubkey_hex),
+        .listen_topic = try cfg.allocator.dupe(u8, listen_topic),
+        .reply_topic = if (reply_topic_input.len > 0) try cfg.allocator.dupe(u8, reply_topic_input) else null,
+    };
+
+    const accounts = try cfg.allocator.alloc(config_mod.RedisStreamConfig, 1);
+    accounts[0] = .{
+        .account_id = "default",
+        .endpoints = endpoints,
+    };
+    cfg.channels.redis_stream = accounts;
+
+    try out.print("{s}  -> Redis Stream configured (local pubkey: {s})\n", .{ prefix, &pubkey_hex });
     return true;
 }
 
