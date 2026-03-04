@@ -1702,13 +1702,6 @@ pub const Agent = struct {
         skill_instructions: []const u8,
         hook_content: []const u8,
     ) skills_mod.SkillHookResult {
-        // Helper to truncate long strings for log output
-        const LogPreview = struct {
-            fn preview(s: []const u8) []const u8 {
-                return if (s.len > 500) s[0..500] else s;
-            }
-        };
-
         // Use an arena for all intermediate allocations within this sub-agent invocation.
         var sub_arena = std.heap.ArenaAllocator.init(self.allocator);
         defer sub_arena.deinit();
@@ -1722,7 +1715,7 @@ pub const Agent = struct {
         ) catch {
             log.warn(
                 "sub-agent error: could not build system prompt | instructions={s} hook_content={s}",
-                .{ LogPreview.preview(skill_instructions), LogPreview.preview(hook_content) },
+                .{ skill_instructions, hook_content },
             );
             return .{
                 .action = .agent_error,
@@ -1736,7 +1729,7 @@ pub const Agent = struct {
         messages.append(arena, ChatMessage.system(system_prompt)) catch {
             log.warn(
                 "sub-agent error: out of memory building messages | instructions={s}",
-                .{LogPreview.preview(skill_instructions)},
+                .{skill_instructions},
             );
             return .{
                 .action = .agent_error,
@@ -1749,7 +1742,7 @@ pub const Agent = struct {
         )) catch {
             log.warn(
                 "sub-agent error: out of memory building messages | instructions={s}",
-                .{LogPreview.preview(skill_instructions)},
+                .{skill_instructions},
             );
             return .{
                 .action = .agent_error,
@@ -1781,8 +1774,8 @@ pub const Agent = struct {
                     .{
                         @errorName(err),
                         self.model_name,
-                        LogPreview.preview(skill_instructions),
-                        LogPreview.preview(hook_content),
+                        skill_instructions,
+                        hook_content,
                         total_iterations + 1,
                     },
                 );
@@ -1856,26 +1849,26 @@ pub const Agent = struct {
                     log.warn(
                         "sub-agent error: failed to parse valid response | output={s} instructions={s} hook_content={s}",
                         .{
-                            LogPreview.preview(response_text),
-                            LogPreview.preview(skill_instructions),
-                            LogPreview.preview(hook_content),
-                        },
-                    );
-                    return .{
-                        .action = .agent_error,
-                        .content = result_allocator.dupe(u8, "sub-agent error: failed to parse response") catch "",
-                        .content_owned = true,
-                    };
-                };
-                // parseSubAgentResponse returns .agent as sentinel when no tag found
-                // (shouldn't happen since we checked hasValidBehaviorTag, but be safe)
-                if (parsed.action == .agent) {
-                    log.warn(
-                        "sub-agent error: behavior tag detected but parse returned sentinel | output={s} instructions={s} hook_content={s}",
-                        .{
-                            LogPreview.preview(response_text),
-                            LogPreview.preview(skill_instructions),
-                            LogPreview.preview(hook_content),
+                                            response_text,
+                                            skill_instructions,
+                                            hook_content,
+                                        },
+                                    );
+                                    return .{
+                                        .action = .agent_error,
+                                        .content = result_allocator.dupe(u8, "sub-agent error: failed to parse response") catch "",
+                                        .content_owned = true,
+                                    };
+                                };
+                                // parseSubAgentResponse returns .agent as sentinel when no tag found
+                                // (shouldn't happen since we checked hasValidBehaviorTag, but be safe)
+                                if (parsed.action == .agent) {
+                                    log.warn(
+                                        "sub-agent error: behavior tag detected but parse returned sentinel | output={s} instructions={s} hook_content={s}",
+                                        .{
+                                            response_text,
+                                            skill_instructions,
+                                            hook_content,
                         },
                     );
                     return .{
@@ -1891,16 +1884,16 @@ pub const Agent = struct {
             log.warn(
                 "sub-agent error: invalid output format (no behavior tag) | output={s} instructions={s} hook_content={s} iteration={d}",
                 .{
-                    LogPreview.preview(response_text),
-                    LogPreview.preview(skill_instructions),
-                    LogPreview.preview(hook_content),
+                    response_text,
+                    skill_instructions,
+                    hook_content,
                     total_iterations + 1,
                 },
             );
             const err_msg = std.fmt.allocPrint(
                 result_allocator,
                 "sub-agent produced invalid output (no behavior tag): {s}",
-                .{if (response_text.len > 200) response_text[0..200] else response_text},
+                .{response_text},
             ) catch return .{
                 .action = .agent_error,
                 .content = result_allocator.dupe(u8, "sub-agent produced invalid output format") catch "",
@@ -1914,8 +1907,8 @@ pub const Agent = struct {
             "sub-agent error: max iterations exhausted ({d}) | instructions={s} hook_content={s}",
             .{
                 skills_mod.SUB_AGENT_MAX_ITERATIONS,
-                LogPreview.preview(skill_instructions),
-                LogPreview.preview(hook_content),
+                skill_instructions,
+                hook_content,
             },
         );
         return .{
