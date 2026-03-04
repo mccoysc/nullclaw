@@ -1289,15 +1289,10 @@ fn configureMqttChannel(cfg: *Config, out: *std.Io.Writer, _: []u8, prefix: []co
     try out.print("{s}  Reply topic (Enter to use same as listen topic): ", .{prefix});
     const reply_topic_input = prompt(out, &reply_topic_buf, "", "") orelse return false;
 
-    // Generate a random P256 keypair (private key = 32 random bytes, public key placeholder = 32 random bytes).
-    // Real P256 public key derivation requires EC point multiplication; here we use random bytes as placeholder.
-    var privkey_bytes: [32]u8 = undefined;
-    var pubkey_bytes: [32]u8 = undefined;
-    std.crypto.random.bytes(&privkey_bytes);
-    std.crypto.random.bytes(&pubkey_bytes);
-
-    const privkey_hex = std.fmt.bytesToHex(privkey_bytes, .lower);
-    const pubkey_hex = std.fmt.bytesToHex(pubkey_bytes, .lower);
+    // Generate a random P256 keypair using ECDSA P256-SHA256.
+    const key_pair = std.crypto.sign.ecdsa.EcdsaP256Sha256.KeyPair.generate();
+    const privkey_hex = std.fmt.bytesToHex(key_pair.secret_key.toBytes(), .lower);
+    const pubkey_hex = std.fmt.bytesToHex(key_pair.public_key.toUncompressedSec1(), .lower);
 
     const endpoints = try cfg.allocator.alloc(config_mod.MqttEndpointConfig, 1);
     endpoints[0] = .{
@@ -1362,14 +1357,10 @@ fn configureRedisStreamChannel(cfg: *Config, out: *std.Io.Writer, _: []u8, prefi
     try out.print("{s}  Reply stream key (Enter to use same as listen): ", .{prefix});
     const reply_topic_input = prompt(out, &reply_topic_buf, "", "") orelse return false;
 
-    // Generate random P256 keypair placeholder.
-    var privkey_bytes: [32]u8 = undefined;
-    var pubkey_bytes: [32]u8 = undefined;
-    std.crypto.random.bytes(&privkey_bytes);
-    std.crypto.random.bytes(&pubkey_bytes);
-
-    const privkey_hex = std.fmt.bytesToHex(privkey_bytes, .lower);
-    const pubkey_hex = std.fmt.bytesToHex(pubkey_bytes, .lower);
+    // Generate a random P256 keypair using ECDSA P256-SHA256.
+    const key_pair = std.crypto.sign.ecdsa.EcdsaP256Sha256.KeyPair.generate();
+    const privkey_hex = std.fmt.bytesToHex(key_pair.secret_key.toBytes(), .lower);
+    const pubkey_hex = std.fmt.bytesToHex(key_pair.public_key.toUncompressedSec1(), .lower);
 
     const endpoints = try cfg.allocator.alloc(config_mod.RedisStreamEndpointConfig, 1);
     endpoints[0] = .{
