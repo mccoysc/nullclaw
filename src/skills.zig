@@ -350,7 +350,9 @@ fn parseTomlStringPrefix(raw_value: []const u8) ?TomlStringPrefix {
 }
 
 fn parseTomlSkillField(toml_bytes: []const u8, key: []const u8) ?[]const u8 {
-    var in_skill_section = false;
+    // Accept keys in the root table (before any section) OR under [skill].
+    // This allows TOML files both with and without a [skill] header.
+    var in_valid_section = true; // start true = root table is valid
     var lines = std.mem.splitScalar(u8, toml_bytes, '\n');
     while (lines.next()) |line_raw| {
         const line = std.mem.trim(u8, line_raw, " \t\r");
@@ -358,10 +360,10 @@ fn parseTomlSkillField(toml_bytes: []const u8, key: []const u8) ?[]const u8 {
 
         const section_line = std.mem.trim(u8, stripTomlInlineComment(line), " \t\r");
         if (section_line.len >= 3 and section_line[0] == '[' and section_line[section_line.len - 1] == ']') {
-            in_skill_section = std.mem.eql(u8, section_line, "[skill]");
+            in_valid_section = std.mem.eql(u8, section_line, "[skill]");
             continue;
         }
-        if (!in_skill_section) continue;
+        if (!in_valid_section) continue;
 
         const eq_idx = std.mem.indexOfScalar(u8, line, '=') orelse continue;
         const candidate_key = std.mem.trim(u8, line[0..eq_idx], " \t");
@@ -369,6 +371,40 @@ fn parseTomlSkillField(toml_bytes: []const u8, key: []const u8) ?[]const u8 {
 
         const value_part = line[eq_idx + 1 ..];
         return parseTomlStringLiteral(value_part);
+    }
+    return null;
+}
+
+/// Parse a boolean field from a TOML skill manifest.
+/// Handles both bare values (true/false) and quoted strings ("true"/"false").
+fn parseTomlBoolField(toml_bytes: []const u8, key: []const u8) ?bool {
+    var in_valid_section = true; // root table is valid
+    var lines = std.mem.splitScalar(u8, toml_bytes, '\n');
+    while (lines.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r");
+        if (line.len == 0) continue;
+
+        const section_line = std.mem.trim(u8, stripTomlInlineComment(line), " \t\r");
+        if (section_line.len >= 3 and section_line[0] == '[' and section_line[section_line.len - 1] == ']') {
+            in_valid_section = std.mem.eql(u8, section_line, "[skill]");
+            continue;
+        }
+        if (!in_valid_section) continue;
+
+        const eq_idx = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        const candidate_key = std.mem.trim(u8, line[0..eq_idx], " \t");
+        if (!std.mem.eql(u8, candidate_key, key)) continue;
+
+        const value_part = std.mem.trim(u8, stripTomlInlineComment(line[eq_idx + 1 ..]), " \t\r");
+        // Bare boolean
+        if (std.mem.eql(u8, value_part, "true")) return true;
+        if (std.mem.eql(u8, value_part, "false")) return false;
+        // Quoted boolean
+        if (parseTomlStringLiteral(line[eq_idx + 1 ..])) |s| {
+            if (std.mem.eql(u8, s, "true")) return true;
+            if (std.mem.eql(u8, s, "false")) return false;
+        }
+        return null;
     }
     return null;
 }
@@ -421,7 +457,7 @@ pub fn loadSkill(allocator: std.mem.Allocator, skill_dir_path: []const u8) !Skil
             .author = author,
             .instructions = instructions,
             .enabled = true,
-            .always = false,
+            .always = parseTomlBoolField(toml, "always") orelse false,
             .trigger = toml_trigger,
             .requires_bins = &.{},
             .requires_env = &.{},
@@ -645,29 +681,36 @@ pub fn evaluateSkillHook(
 pub const sub_agent_system_prompt =
     \\You are a content processing agent. You will receive instructions and content to process.
     \\You may use tools if needed to accomplish your task.
-    \\When you have finished processing, you MUST output your final decision as a SINGLE line
-    \\starting with one of these behavior tags, followed by content on subsequent lines if applicable.
-    \\Do NOT output anything else after the behavior tag block.
+    \\
+    \\OUTPUT FORMAT — follow this EXACTLY:
+    \\  1. Output ONLY ONE behavior tag on its own line.
+    \\  2. If the tag requires content, put it on the lines immediately after the tag.
+    \\  3. Do NOT include any reasoning, thinking, analysis, or explanation.
+    \\     The ENTIRE output must be the behavior tag + content for the user (if any).
     \\
     \\Allowed behaviors:
     \\
-    \\1. [behavior:passthrough]
-    \\   The content should pass through unchanged. No additional output.
+    \\[behavior:passthrough]
+    \\  The content should pass through unchanged. Output ONLY this tag, nothing else.
     \\
-    \\2. [behavior:intercept]
-    \\   <your response content on the following lines>
-    \\   The pipeline should stop and your content should be returned directly.
+    \\[behavior:intercept]
+    \\<message to show the user>
+    \\  The pipeline stops. The text after the tag is shown directly to the end user.
+    \\  Do NOT include your reasoning — only the final user-facing message.
     \\
-    \\3. [behavior:continue]
-    \\   <your modified content on the following lines>
-    \\   Your modified content replaces the original and the pipeline continues.
+    \\[behavior:continue]
+    \\<modified content>
+    \\  Your modified content replaces the original and the pipeline continues.
     \\
-    \\4. [behavior:error]
-    \\   <error description on the following lines>
-    \\   An error occurred. The hook aborts and the error message is returned.
+    \\[behavior:error]
+    \\<error description>
+    \\  An error occurred. The hook aborts and the error message is returned.
     \\
-    \\IMPORTANT: You MUST end your response with exactly one of the above behavior tags.
-    \\If you need to use tools first, do so, then output the behavior tag as your final response.
+    \\CRITICAL RULES:
+    \\  - Your response must start with a behavior tag. No preamble.
+    \\  - Do NOT output any thinking, reasoning, or analysis before or after the tag.
+    \\  - For [behavior:intercept], only include the message the end user should see.
+    \\  - For [behavior:passthrough], output ONLY the tag — nothing else.
     \\
     \\Your instructions:
     \\
@@ -679,6 +722,8 @@ pub const SUB_AGENT_MAX_ITERATIONS: u32 = 10;
 /// Parse the output of a sub-agent LLM call into a SkillHookResult.
 /// When multiple behavior tags are present, the LAST one wins — the agent may
 /// output reasoning with intermediate tags before settling on a final decision.
+/// Any content BEFORE the last behavior tag is treated as thinking/reasoning
+/// and is discarded — only content AFTER the tag is used.
 pub fn parseSubAgentResponse(allocator: std.mem.Allocator, response: []const u8) !SkillHookResult {
     const trimmed = std.mem.trimLeft(u8, response, " \t\r\n");
     if (trimmed.len == 0) return .{ .action = .passthrough };
@@ -716,11 +761,17 @@ pub fn parseSubAgentResponse(allocator: std.mem.Allocator, response: []const u8)
     }
 
     if (best_pos) |pos| {
+        // Everything before the last behavior tag is thinking/reasoning — discard it.
+        // Only content AFTER the tag is the actual result for the user.
         const tag_end = pos + best_tag_len;
+        const raw_content = std.mem.trimLeft(u8, trimmed[tag_end..], " \t\r\n");
+
+        // Strip any remaining behavior tags from the content (defense-in-depth).
+        const content = stripBehaviorTagsFromContent(raw_content);
+
         switch (best_action) {
             .passthrough => return .{ .action = .passthrough },
             .intercept => {
-                const content = std.mem.trimLeft(u8, trimmed[tag_end..], " \t\r\n");
                 if (content.len > 0) {
                     return .{
                         .action = .intercept,
@@ -731,7 +782,6 @@ pub fn parseSubAgentResponse(allocator: std.mem.Allocator, response: []const u8)
                 return .{ .action = .intercept };
             },
             .continue_with => {
-                const content = std.mem.trimLeft(u8, trimmed[tag_end..], " \t\r\n");
                 if (content.len > 0) {
                     return .{
                         .action = .continue_with,
@@ -742,7 +792,6 @@ pub fn parseSubAgentResponse(allocator: std.mem.Allocator, response: []const u8)
                 return .{ .action = .passthrough }; // continue with no content = passthrough
             },
             .agent_error => {
-                const content = std.mem.trimLeft(u8, trimmed[tag_end..], " \t\r\n");
                 if (content.len > 0) {
                     return .{
                         .action = .agent_error,
@@ -762,6 +811,33 @@ pub fn parseSubAgentResponse(allocator: std.mem.Allocator, response: []const u8)
 
     // No recognized behavior tag found — return sentinel so caller treats as error
     return .{ .action = .agent }; // sentinel: caller should treat as format error
+}
+
+/// Strip any behavior tags that may appear in content after parsing.
+/// This is a defense-in-depth measure — the sub-agent prompt instructs the LLM
+/// not to include extra tags, but we strip them just in case.
+fn stripBehaviorTagsFromContent(text: []const u8) []const u8 {
+    // If the text starts with a behavior tag, skip it (and any trailing whitespace)
+    const behavior_tags = [_][]const u8{
+        "[behavior:passthrough]",
+        "[behavior:intercept]",
+        "[behavior:continue]",
+        "[behavior:error]",
+    };
+    var result = text;
+    for (behavior_tags) |tag| {
+        while (std.mem.indexOf(u8, result, tag)) |idx| {
+            // Remove the tag from the content
+            if (idx == 0) {
+                result = std.mem.trimLeft(u8, result[tag.len..], " \t\r\n");
+            } else {
+                // Tag in the middle — just return content before it
+                result = std.mem.trimRight(u8, result[0..idx], " \t\r\n");
+                break;
+            }
+        }
+    }
+    return result;
 }
 
 /// Returns true if the response contains a valid behavior tag.
