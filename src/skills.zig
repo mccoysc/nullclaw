@@ -84,10 +84,12 @@ pub const SkillHookAction = enum {
     intercept,
     /// Use new content and continue the pipeline.
     continue_with,
+    /// Sub-agent encountered an error; the hook should abort and return the error message.
+    agent_error,
     /// Delegate to a sub-agent LLM call for processing.
     /// The skill's natural-language instructions become the sub-agent's system prompt;
     /// the hook's original content becomes the user message.
-    /// The sub-agent decides the final behavior (passthrough / intercept / continue).
+    /// The sub-agent decides the final behavior (passthrough / intercept / continue / error).
     agent,
 };
 
@@ -96,6 +98,7 @@ pub const SkillHookResult = struct {
     action: SkillHookAction = .passthrough,
     /// For intercept/continue_with: the content to use.
     /// For agent: the skill instructions (sub-agent system prompt).
+    /// For agent_error: the error message.
     /// Owned by caller when content_owned is true; must be freed.
     content: []const u8 = "",
     /// Whether content is heap-allocated and should be freed.
@@ -628,76 +631,58 @@ pub fn evaluateSkillHook(
 }
 
 /// Sub-agent system prompt template.
-/// The sub-agent receives skill instructions as its system prompt and the hook content
-/// as the user message. It must output exactly one of three behaviors.
-const sub_agent_system_prompt =
+/// The sub-agent receives this as prefix + skill instructions as its system prompt;
+/// the hook's original content becomes the user message.
+/// It MUST output a final response with exactly one behavior tag.
+pub const sub_agent_system_prompt =
     \\You are a content processing agent. You will receive instructions and content to process.
-    \\Based on the instructions, decide how to handle the content and output your decision.
+    \\You may use tools if needed to accomplish your task.
+    \\When you have finished processing, you MUST output your final decision as a SINGLE line
+    \\starting with one of these behavior tags, followed by content on subsequent lines if applicable.
+    \\Do NOT output anything else after the behavior tag block.
     \\
-    \\You MUST output exactly ONE of these three behaviors as the FIRST line, followed by content if applicable:
+    \\Allowed behaviors:
     \\
     \\1. [behavior:passthrough]
-    \\   Output this line alone if the content should pass through unchanged.
+    \\   The content should pass through unchanged. No additional output.
     \\
     \\2. [behavior:intercept]
-    \\   <your response content>
-    \\   Output this if the pipeline should stop and your content should be returned directly.
+    \\   <your response content on the following lines>
+    \\   The pipeline should stop and your content should be returned directly.
     \\
     \\3. [behavior:continue]
-    \\   <your modified content>
-    \\   Output this if your modified content should replace the original and continue through the pipeline.
+    \\   <your modified content on the following lines>
+    \\   Your modified content replaces the original and the pipeline continues.
+    \\
+    \\4. [behavior:error]
+    \\   <error description on the following lines>
+    \\   An error occurred. The hook aborts and the error message is returned.
+    \\
+    \\IMPORTANT: You MUST end your response with exactly one of the above behavior tags.
+    \\If you need to use tools first, do so, then output the behavior tag as your final response.
     \\
     \\Your instructions:
     \\
 ;
 
-/// Execute a sub-agent LLM call for an [action:agent] skill hook.
-/// Makes a single-shot LLM call with the skill instructions as context
-/// and the hook's original content as the user message.
-/// Parses the sub-agent's response to determine the final behavior.
-/// The sub-agent is stateless — no history, no user configuration.
-pub fn executeSkillAgent(
-    allocator: std.mem.Allocator,
-    provider: anytype,
-    model_name: []const u8,
-    skill_instructions: []const u8,
-    hook_content: []const u8,
-) !SkillHookResult {
-    // Build system prompt with skill instructions appended
-    const system_prompt = try std.fmt.allocPrint(
-        allocator,
-        "{s}{s}",
-        .{ sub_agent_system_prompt, skill_instructions },
-    );
-    defer allocator.free(system_prompt);
+/// Maximum iterations for the sub-agent turn loop (tool calls + retries).
+pub const SUB_AGENT_MAX_ITERATIONS: u32 = 10;
 
-    // Make a single-shot LLM call
-    const agent_response = provider.chatWithSystem(
-        allocator,
-        system_prompt,
-        if (hook_content.len > 0) hook_content else "(empty content)",
-        model_name,
-        0.3, // low temperature for deterministic behavior
-    ) catch {
-        return .{ .action = .passthrough };
-    };
-    defer allocator.free(agent_response);
-
-    // Parse the sub-agent's response
-    return parseSubAgentResponse(allocator, agent_response);
-}
+/// Maximum retries when sub-agent fails to output a valid behavior tag.
+pub const SUB_AGENT_MAX_FORMAT_RETRIES: u32 = 2;
 
 /// Parse the output of a sub-agent LLM call into a SkillHookResult.
-fn parseSubAgentResponse(allocator: std.mem.Allocator, response: []const u8) !SkillHookResult {
+pub fn parseSubAgentResponse(allocator: std.mem.Allocator, response: []const u8) !SkillHookResult {
     const trimmed = std.mem.trimLeft(u8, response, " \t\r\n");
     if (trimmed.len == 0) return .{ .action = .passthrough };
 
-    if (std.mem.startsWith(u8, trimmed, "[behavior:passthrough]")) {
+    // Search for the behavior tag anywhere in the response (not just at the start),
+    // since the agent may output some reasoning before the tag.
+    if (findBehaviorTag(trimmed, "[behavior:passthrough]")) |_| {
         return .{ .action = .passthrough };
     }
-    if (std.mem.startsWith(u8, trimmed, "[behavior:intercept]")) {
-        const rest = trimmed["[behavior:intercept]".len..];
-        const content = std.mem.trimLeft(u8, rest, " \t\r\n");
+    if (findBehaviorTag(trimmed, "[behavior:intercept]")) |tag_end| {
+        const content = std.mem.trimLeft(u8, trimmed[tag_end..], " \t\r\n");
         if (content.len > 0) {
             return .{
                 .action = .intercept,
@@ -707,9 +692,8 @@ fn parseSubAgentResponse(allocator: std.mem.Allocator, response: []const u8) !Sk
         }
         return .{ .action = .intercept };
     }
-    if (std.mem.startsWith(u8, trimmed, "[behavior:continue]")) {
-        const rest = trimmed["[behavior:continue]".len..];
-        const content = std.mem.trimLeft(u8, rest, " \t\r\n");
+    if (findBehaviorTag(trimmed, "[behavior:continue]")) |tag_end| {
+        const content = std.mem.trimLeft(u8, trimmed[tag_end..], " \t\r\n");
         if (content.len > 0) {
             return .{
                 .action = .continue_with,
@@ -719,9 +703,44 @@ fn parseSubAgentResponse(allocator: std.mem.Allocator, response: []const u8) !Sk
         }
         return .{ .action = .passthrough }; // continue with no content = passthrough
     }
+    if (findBehaviorTag(trimmed, "[behavior:error]")) |tag_end| {
+        const content = std.mem.trimLeft(u8, trimmed[tag_end..], " \t\r\n");
+        if (content.len > 0) {
+            return .{
+                .action = .agent_error,
+                .content = try allocator.dupe(u8, content),
+                .content_owned = true,
+            };
+        }
+        return .{
+            .action = .agent_error,
+            .content = try allocator.dupe(u8, "sub-agent reported an error without details"),
+            .content_owned = true,
+        };
+    }
 
-    // Unrecognized format — treat as passthrough
-    return .{ .action = .passthrough };
+    // No recognized behavior tag found — return null-like sentinel so caller can retry
+    return .{ .action = .agent }; // sentinel: caller should retry or fall back
+}
+
+/// Returns true if the response contains a valid behavior tag.
+pub fn hasValidBehaviorTag(response: []const u8) bool {
+    const tags = [_][]const u8{
+        "[behavior:passthrough]",
+        "[behavior:intercept]",
+        "[behavior:continue]",
+        "[behavior:error]",
+    };
+    for (tags) |tag| {
+        if (std.mem.indexOf(u8, response, tag) != null) return true;
+    }
+    return false;
+}
+
+/// Find a behavior tag in the response, returning the index just past it.
+fn findBehaviorTag(text: []const u8, tag: []const u8) ?usize {
+    const pos = std.mem.indexOf(u8, text, tag) orelse return null;
+    return pos + tag.len;
 }
 
 /// Free a SkillHookResult's owned content if applicable.

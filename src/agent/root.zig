@@ -842,20 +842,32 @@ pub const Agent = struct {
                     var hook_result = skills_mod.evaluateSkillHook(self.allocator, hs, .on_llm_request, "") catch skills_mod.SkillHookResult{};
                     defer skills_mod.freeHookResult(self.allocator, &hook_result);
 
-                    // If agent action, invoke sub-agent LLM call
+                    // If agent action, invoke sub-agent with multi-turn tool loop
                     if (hook_result.action == .agent) {
-                        const agent_result = skills_mod.executeSkillAgent(
+                        const agent_result = self.runSkillSubAgent(
                             self.allocator,
-                            self.provider,
-                            self.model_name,
                             hook_result.content,
                             "",
-                        ) catch skills_mod.SkillHookResult{};
+                        );
                         skills_mod.freeHookResult(self.allocator, &hook_result);
                         hook_result = agent_result;
                     }
 
                     switch (hook_result.action) {
+                        .agent_error => {
+                            const err_response = if (hook_result.content.len > 0)
+                                try self.allocator.dupe(u8, hook_result.content)
+                            else
+                                try self.allocator.dupe(u8, "[skill hook agent error]");
+                            errdefer self.allocator.free(err_response);
+                            try self.history.append(self.allocator, .{
+                                .role = .assistant,
+                                .content = try self.allocator.dupe(u8, err_response),
+                            });
+                            const complete_event = ObserverEvent{ .turn_complete = {} };
+                            self.observer.recordEvent(&complete_event);
+                            return err_response;
+                        },
                         .intercept => {
                             const intercept_response = if (hook_result.content.len > 0)
                                 try self.allocator.dupe(u8, hook_result.content)
@@ -900,15 +912,30 @@ pub const Agent = struct {
                             defer skills_mod.freeHookResult(arena, &hook_result);
 
                             if (hook_result.action == .agent) {
-                                const agent_result = skills_mod.executeSkillAgent(
-                                    arena, self.provider, self.model_name,
-                                    hook_result.content, messages[idx].content,
-                                ) catch break;
+                                const agent_result = self.runSkillSubAgent(
+                                    arena,
+                                    hook_result.content,
+                                    messages[idx].content,
+                                );
                                 skills_mod.freeHookResult(arena, &hook_result);
                                 hook_result = agent_result;
                             }
 
                             switch (hook_result.action) {
+                                .agent_error => {
+                                    const err_response = if (hook_result.content.len > 0)
+                                        try self.allocator.dupe(u8, hook_result.content)
+                                    else
+                                        try self.allocator.dupe(u8, "[skill hook agent error]");
+                                    errdefer self.allocator.free(err_response);
+                                    try self.history.append(self.allocator, .{
+                                        .role = .assistant,
+                                        .content = try self.allocator.dupe(u8, err_response),
+                                    });
+                                    const complete_event = ObserverEvent{ .turn_complete = {} };
+                                    self.observer.recordEvent(&complete_event);
+                                    return err_response;
+                                },
                                 .intercept => {
                                     const intercept_response = if (hook_result.content.len > 0)
                                         try self.allocator.dupe(u8, hook_result.content)
@@ -1110,15 +1137,31 @@ pub const Agent = struct {
                     defer skills_mod.freeHookResult(arena, &hook_result);
 
                     if (hook_result.action == .agent) {
-                        const agent_result = skills_mod.executeSkillAgent(
-                            arena, self.provider, self.model_name,
-                            hook_result.content, raw_resp,
-                        ) catch skills_mod.SkillHookResult{};
+                        const agent_result = self.runSkillSubAgent(
+                            arena,
+                            hook_result.content,
+                            raw_resp,
+                        );
                         skills_mod.freeHookResult(arena, &hook_result);
                         hook_result = agent_result;
                     }
 
                     switch (hook_result.action) {
+                        .agent_error => {
+                            const err_response = if (hook_result.content.len > 0)
+                                try self.allocator.dupe(u8, hook_result.content)
+                            else
+                                try self.allocator.dupe(u8, "[skill hook agent error]");
+                            errdefer self.allocator.free(err_response);
+                            try self.history.append(self.allocator, .{
+                                .role = .assistant,
+                                .content = try self.allocator.dupe(u8, err_response),
+                            });
+                            self.freeResponseFields(&response);
+                            const complete_event = ObserverEvent{ .turn_complete = {} };
+                            self.observer.recordEvent(&complete_event);
+                            return err_response;
+                        },
                         .intercept => {
                             const intercept_response = if (hook_result.content.len > 0)
                                 try self.allocator.dupe(u8, hook_result.content)
@@ -1371,15 +1414,25 @@ pub const Agent = struct {
                         defer skills_mod.freeHookResult(arena, &hook_result);
 
                         if (hook_result.action == .agent) {
-                            const agent_result = skills_mod.executeSkillAgent(
-                                arena, self.provider, self.model_name,
-                                hook_result.content, tool_ctx,
-                            ) catch skills_mod.SkillHookResult{};
+                            const agent_result = self.runSkillSubAgent(
+                                arena,
+                                hook_result.content,
+                                tool_ctx,
+                            );
                             skills_mod.freeHookResult(arena, &hook_result);
                             hook_result = agent_result;
                         }
 
                         switch (hook_result.action) {
+                            .agent_error => {
+                                tool_intercepted = true;
+                                tool_before_result_override = ToolExecutionResult{
+                                    .name = call.name,
+                                    .output = if (hook_result.content.len > 0) hook_result.content else "[skill hook agent error]",
+                                    .success = false,
+                                    .tool_call_id = call.tool_call_id,
+                                };
+                            },
                             .intercept => {
                                 tool_intercepted = true;
                                 tool_before_result_override = ToolExecutionResult{
@@ -1417,10 +1470,11 @@ pub const Agent = struct {
                             defer skills_mod.freeHookResult(arena, &hook_result);
 
                             if (hook_result.action == .agent) {
-                                const agent_result = skills_mod.executeSkillAgent(
-                                    arena, self.provider, self.model_name,
-                                    hook_result.content, result.output,
-                                ) catch skills_mod.SkillHookResult{};
+                                const agent_result = self.runSkillSubAgent(
+                                    arena,
+                                    hook_result.content,
+                                    result.output,
+                                );
                                 skills_mod.freeHookResult(arena, &hook_result);
                                 hook_result = agent_result;
                             }
@@ -1436,7 +1490,7 @@ pub const Agent = struct {
                                         };
                                     }
                                 },
-                                .intercept, .passthrough, .agent => {},
+                                .agent_error, .intercept, .passthrough, .agent => {},
                             }
                         }
                     }
@@ -1629,6 +1683,191 @@ pub const Agent = struct {
         return starts_with_ascii_ignore_case(key, "pref.tools.") or
             starts_with_ascii_ignore_case(key, "preference.tools.") or
             std.ascii.eqlIgnoreCase(key, "__bootstrap.prompt.TOOLS.md");
+    }
+
+    /// Run a sub-agent LLM call for an [action:agent] skill hook.
+    ///
+    /// Implements a mini turn loop that:
+    /// 1. Sends skill instructions (system prompt) + hook content (user message) to the LLM.
+    /// 2. Supports multi-turn tool calls within a single invocation.
+    /// 3. Enforces that the agent outputs a valid behavior tag ([behavior:xxx]).
+    /// 4. Retries if the agent fails to produce a valid tag.
+    /// 5. Returns agent_error if all retries are exhausted.
+    ///
+    /// The sub-agent is stateless between invocations — no history is preserved.
+    /// The sub-agent's execution does NOT trigger any skill hooks (isolated).
+    pub fn runSkillSubAgent(
+        self: *Agent,
+        result_allocator: std.mem.Allocator,
+        skill_instructions: []const u8,
+        hook_content: []const u8,
+    ) skills_mod.SkillHookResult {
+        // Use an arena for all intermediate allocations within this sub-agent invocation.
+        var sub_arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer sub_arena.deinit();
+        const arena = sub_arena.allocator();
+
+        // Build system prompt: sub_agent_system_prompt + skill instructions
+        const system_prompt = std.fmt.allocPrint(
+            arena,
+            "{s}{s}",
+            .{ skills_mod.sub_agent_system_prompt, skill_instructions },
+        ) catch return .{
+            .action = .agent_error,
+            .content = result_allocator.dupe(u8, "sub-agent failed: could not build system prompt") catch "",
+            .content_owned = true,
+        };
+
+        // Build initial messages list (system + user)
+        var messages = std.ArrayListUnmanaged(ChatMessage).empty;
+        messages.append(arena, ChatMessage.system(system_prompt)) catch return .{
+            .action = .agent_error,
+            .content = result_allocator.dupe(u8, "sub-agent failed: out of memory") catch "",
+            .content_owned = true,
+        };
+        messages.append(arena, ChatMessage.user(
+            if (hook_content.len > 0) hook_content else "(empty content)",
+        )) catch return .{
+            .action = .agent_error,
+            .content = result_allocator.dupe(u8, "sub-agent failed: out of memory") catch "",
+            .content_owned = true,
+        };
+
+        const native_tools_enabled = self.provider.supportsNativeTools();
+
+        var format_retries: u32 = 0;
+        var total_iterations: u32 = 0;
+
+        while (total_iterations < skills_mod.SUB_AGENT_MAX_ITERATIONS) : (total_iterations += 1) {
+            // Call provider with tools
+            const response = self.provider.chat(
+                arena,
+                .{
+                    .messages = messages.items,
+                    .model = self.model_name,
+                    .temperature = 0.3, // low temperature for deterministic behavior
+                    .max_tokens = self.max_tokens,
+                    .tools = if (native_tools_enabled) self.tool_specs else null,
+                    .timeout_secs = self.message_timeout_secs,
+                },
+                self.model_name,
+                0.3,
+            ) catch |err| {
+                const err_msg = std.fmt.allocPrint(
+                    result_allocator,
+                    "sub-agent LLM call failed: {s}",
+                    .{@errorName(err)},
+                ) catch return .{
+                    .action = .agent_error,
+                    .content = result_allocator.dupe(u8, "sub-agent LLM call failed") catch "",
+                    .content_owned = true,
+                };
+                return .{ .action = .agent_error, .content = err_msg, .content_owned = true };
+            };
+
+            const response_text = response.contentOrEmpty();
+
+            // Check for tool calls (native first, then XML fallback)
+            var has_tool_calls = false;
+            var parsed_calls: []ParsedToolCall = &.{};
+
+            if (native_tools_enabled and response.tool_calls.len > 0) {
+                parsed_calls = dispatcher.parseStructuredToolCalls(arena, response.tool_calls) catch &.{};
+                has_tool_calls = parsed_calls.len > 0;
+            }
+
+            if (!has_tool_calls and response_text.len > 0) {
+                const xml_parsed = dispatcher.parseToolCalls(arena, response_text) catch null;
+                if (xml_parsed) |xp| {
+                    parsed_calls = xp.calls;
+                    has_tool_calls = xp.calls.len > 0;
+                }
+            }
+
+            if (has_tool_calls) {
+                // Add assistant message to conversation
+                messages.append(arena, ChatMessage.assistant(
+                    arena.dupe(u8, response_text) catch response_text,
+                )) catch break;
+
+                // Execute each tool call and collect results
+                var results_buf = std.ArrayListUnmanaged([]const u8).empty;
+                for (parsed_calls) |call| {
+                    const result = self.executeTool(arena, call);
+                    const formatted = std.fmt.allocPrint(
+                        arena,
+                        "[Tool: {s}] {s}{s}",
+                        .{
+                            call.name,
+                            if (result.success) "" else "(FAILED) ",
+                            result.output,
+                        },
+                    ) catch continue;
+                    results_buf.append(arena, formatted) catch continue;
+                }
+
+                // Format all results and add as user message
+                const joined = std.mem.join(arena, "\n\n", results_buf.items) catch "";
+                messages.append(arena, ChatMessage.user(
+                    if (joined.len > 0) joined else "Tool execution completed with no output.",
+                )) catch break;
+
+                // Continue the loop for the next LLM call
+                continue;
+            }
+
+            // No tool calls — check if the response contains a valid behavior tag.
+            if (skills_mod.hasValidBehaviorTag(response_text)) {
+                // Parse and return the result
+                const parsed = skills_mod.parseSubAgentResponse(result_allocator, response_text) catch {
+                    return .{ .action = .passthrough };
+                };
+                // parseSubAgentResponse returns .agent as sentinel when no tag found
+                // (shouldn't happen since we checked hasValidBehaviorTag, but be safe)
+                if (parsed.action == .agent) {
+                    return .{ .action = .passthrough };
+                }
+                return parsed;
+            }
+
+            // No valid behavior tag — retry with enforcement message
+            format_retries += 1;
+            if (format_retries > skills_mod.SUB_AGENT_MAX_FORMAT_RETRIES) {
+                // Max retries exhausted — return error
+                const err_msg = std.fmt.allocPrint(
+                    result_allocator,
+                    "sub-agent failed to produce valid output after {d} retries. Last response: {s}",
+                    .{
+                        skills_mod.SUB_AGENT_MAX_FORMAT_RETRIES,
+                        if (response_text.len > 200) response_text[0..200] else response_text,
+                    },
+                ) catch return .{
+                    .action = .agent_error,
+                    .content = result_allocator.dupe(u8, "sub-agent failed to produce valid behavior tag") catch "",
+                    .content_owned = true,
+                };
+                return .{ .action = .agent_error, .content = err_msg, .content_owned = true };
+            }
+
+            // Add the invalid response as assistant message, then ask for correction
+            messages.append(arena, ChatMessage.assistant(
+                arena.dupe(u8, response_text) catch response_text,
+            )) catch break;
+            messages.append(arena, ChatMessage.user(
+                "Your response MUST contain exactly one behavior tag: [behavior:passthrough], " ++
+                    "[behavior:intercept], [behavior:continue], or [behavior:error]. " ++
+                    "Please output your final decision now with the correct format.",
+            )) catch break;
+
+            // Continue the loop for retry
+        }
+
+        // Total iterations exhausted
+        return .{
+            .action = .agent_error,
+            .content = result_allocator.dupe(u8, "sub-agent exceeded maximum iterations without producing a result") catch "",
+            .content_owned = true,
+        };
     }
 
     fn executeTool(self: *Agent, tool_allocator: std.mem.Allocator, call: ParsedToolCall) ToolExecutionResult {

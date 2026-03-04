@@ -466,15 +466,23 @@ pub const SessionManager = struct {
                 defer skills_mod.freeHookResult(self.allocator, &hook_result);
 
                 if (hook_result.action == .agent) {
-                    const agent_result = skills_mod.executeSkillAgent(
-                        self.allocator, session.agent.provider, session.agent.model_name,
-                        hook_result.content, content,
-                    ) catch skills_mod.SkillHookResult{};
+                    const agent_result = session.agent.runSkillSubAgent(
+                        self.allocator,
+                        hook_result.content,
+                        content,
+                    );
                     skills_mod.freeHookResult(self.allocator, &hook_result);
                     hook_result = agent_result;
                 }
 
                 switch (hook_result.action) {
+                    .agent_error => {
+                        const err_response = if (hook_result.content.len > 0)
+                            try self.allocator.dupe(u8, hook_result.content)
+                        else
+                            try self.allocator.dupe(u8, "[skill hook agent error]");
+                        return err_response;
+                    },
                     .intercept => {
                         const intercept_response = if (hook_result.content.len > 0)
                             try self.allocator.dupe(u8, hook_result.content)
@@ -507,15 +515,24 @@ pub const SessionManager = struct {
                 defer skills_mod.freeHookResult(self.allocator, &hook_result);
 
                 if (hook_result.action == .agent) {
-                    const agent_result = skills_mod.executeSkillAgent(
-                        self.allocator, session.agent.provider, session.agent.model_name,
-                        hook_result.content, response,
-                    ) catch skills_mod.SkillHookResult{};
+                    const agent_result = session.agent.runSkillSubAgent(
+                        self.allocator,
+                        hook_result.content,
+                        response,
+                    );
                     skills_mod.freeHookResult(self.allocator, &hook_result);
                     hook_result = agent_result;
                 }
 
                 switch (hook_result.action) {
+                    .agent_error => {
+                        self.allocator.free(response);
+                        const err_response = if (hook_result.content.len > 0)
+                            try self.allocator.dupe(u8, hook_result.content)
+                        else
+                            try self.allocator.dupe(u8, "[skill hook agent error]");
+                        return err_response;
+                    },
                     .continue_with => {
                         if (hook_result.content.len > 0) {
                             post_receive_response = try self.allocator.dupe(u8, hook_result.content);
@@ -542,15 +559,24 @@ pub const SessionManager = struct {
                 defer skills_mod.freeHookResult(self.allocator, &hook_result);
 
                 if (hook_result.action == .agent) {
-                    const agent_result = skills_mod.executeSkillAgent(
-                        self.allocator, session.agent.provider, session.agent.model_name,
-                        hook_result.content, post_receive_response,
-                    ) catch skills_mod.SkillHookResult{};
+                    const agent_result = session.agent.runSkillSubAgent(
+                        self.allocator,
+                        hook_result.content,
+                        post_receive_response,
+                    );
                     skills_mod.freeHookResult(self.allocator, &hook_result);
                     hook_result = agent_result;
                 }
 
                 switch (hook_result.action) {
+                    .agent_error => {
+                        if (post_receive_owned) self.allocator.free(post_receive_response);
+                        if (!post_receive_owned) self.allocator.free(response);
+                        return if (hook_result.content.len > 0)
+                            try self.allocator.dupe(u8, hook_result.content)
+                        else
+                            try self.allocator.dupe(u8, "[skill hook agent error]");
+                    },
                     .intercept => {
                         if (post_receive_owned) self.allocator.free(post_receive_response);
                         if (!post_receive_owned) self.allocator.free(response);
@@ -616,10 +642,11 @@ pub const SessionManager = struct {
             if (skills_mod.hasSkillsForTrigger(hs, .on_channel_send_after)) {
                 var hook_result = skills_mod.evaluateSkillHook(self.allocator, hs, .on_channel_send_after, final_response) catch skills_mod.SkillHookResult{};
                 if (hook_result.action == .agent) {
-                    const agent_result = skills_mod.executeSkillAgent(
-                        self.allocator, session.agent.provider, session.agent.model_name,
-                        hook_result.content, final_response,
-                    ) catch skills_mod.SkillHookResult{};
+                    const agent_result = session.agent.runSkillSubAgent(
+                        self.allocator,
+                        hook_result.content,
+                        final_response,
+                    );
                     skills_mod.freeHookResult(self.allocator, &hook_result);
                     hook_result = agent_result;
                 }
