@@ -1,4 +1,6 @@
 const std = @import("std");
+const builtin = @import("builtin");
+const native_os = builtin.os.tag;
 const root = @import("root.zig");
 const config_types = @import("../config_types.zig");
 const bus_mod = @import("../bus.zig");
@@ -434,16 +436,17 @@ pub const MqttChannel = struct {
         const self: *MqttChannel = @ptrCast(@alignCast(ptr));
         self.running.store(false, .release);
 
-        // Send SIGTERM to subscriber processes to unblock reader threads.
-        // IMPORTANT: use posix.kill() directly — do NOT call proc.kill() here
-        // because Child.kill() internally calls waitpid() which would reap
+        // Terminate subscriber processes to unblock reader threads.
+        // IMPORTANT: do NOT call proc.kill() here because Child.kill()
+        // internally calls waitpid/WaitForSingleObject which would reap
         // the child.  The reader thread's defer block also calls child.kill()
         // + child.wait() on its *local* copy of the Child struct; if we reap
         // first via the array copy, that second waitpid() hits ECHILD →
         // "reached unreachable code" panic inside std.process.Child.
+        // Use terminateChildNoWait which sends the signal without reaping.
         for (&self.sub_processes) |*proc_slot| {
             if (proc_slot.*) |proc| {
-                std.posix.kill(proc.id, std.posix.SIG.TERM) catch {};
+                terminateChildNoWait(proc);
             }
         }
 
@@ -498,6 +501,23 @@ pub const MqttChannel = struct {
         return .{ .ptr = @ptrCast(self), .vtable = &vtable };
     }
 };
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Cross-platform process helpers
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Terminate a child process without waiting for it to exit.
+/// On POSIX sends SIGTERM; on Windows calls TerminateProcess.
+/// This avoids the waitpid/WaitForSingleObject race when another thread
+/// will perform its own kill+wait on its copy of the Child struct.
+fn terminateChildNoWait(child: std.process.Child) void {
+    if (native_os == .windows) {
+        const windows = std.os.windows;
+        windows.TerminateProcess(child.id, 1) catch {};
+    } else {
+        std.posix.kill(child.id, std.posix.SIG.TERM) catch {};
+    }
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Wire format types
