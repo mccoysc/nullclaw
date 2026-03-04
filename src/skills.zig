@@ -350,27 +350,34 @@ fn parseTomlStringPrefix(raw_value: []const u8) ?TomlStringPrefix {
 }
 
 fn parseTomlSkillField(toml_bytes: []const u8, key: []const u8) ?[]const u8 {
-    // Accept keys in the root table (before any section) OR under [skill].
-    // This allows TOML files both with and without a [skill] header.
-    var in_valid_section = true; // start true = root table is valid
-    var lines = std.mem.splitScalar(u8, toml_bytes, '\n');
-    while (lines.next()) |line_raw| {
-        const line = std.mem.trim(u8, line_raw, " \t\r");
-        if (line.len == 0) continue;
+    // Prefer [skill] section values; fall back to root-level keys.
+    // Two-pass: first scan for key under [skill], then under root.
+    const passes = [_]bool{ true, false }; // pass 0 = [skill] only, pass 1 = root only
+    for (passes) |want_skill_section| {
+        var in_skill_section = false;
+        var in_root = true; // true until we hit any section header
+        var lines = std.mem.splitScalar(u8, toml_bytes, '\n');
+        while (lines.next()) |line_raw| {
+            const line = std.mem.trim(u8, line_raw, " \t\r");
+            if (line.len == 0) continue;
 
-        const section_line = std.mem.trim(u8, stripTomlInlineComment(line), " \t\r");
-        if (section_line.len >= 3 and section_line[0] == '[' and section_line[section_line.len - 1] == ']') {
-            in_valid_section = std.mem.eql(u8, section_line, "[skill]");
-            continue;
+            const section_line = std.mem.trim(u8, stripTomlInlineComment(line), " \t\r");
+            if (section_line.len >= 3 and section_line[0] == '[' and section_line[section_line.len - 1] == ']') {
+                in_skill_section = std.mem.eql(u8, section_line, "[skill]");
+                in_root = false;
+                continue;
+            }
+
+            const dominated = if (want_skill_section) in_skill_section else in_root;
+            if (!dominated) continue;
+
+            const eq_idx = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+            const candidate_key = std.mem.trim(u8, line[0..eq_idx], " \t");
+            if (!std.mem.eql(u8, candidate_key, key)) continue;
+
+            const value_part = line[eq_idx + 1 ..];
+            return parseTomlStringLiteral(value_part);
         }
-        if (!in_valid_section) continue;
-
-        const eq_idx = std.mem.indexOfScalar(u8, line, '=') orelse continue;
-        const candidate_key = std.mem.trim(u8, line[0..eq_idx], " \t");
-        if (!std.mem.eql(u8, candidate_key, key)) continue;
-
-        const value_part = line[eq_idx + 1 ..];
-        return parseTomlStringLiteral(value_part);
     }
     return null;
 }
@@ -378,33 +385,39 @@ fn parseTomlSkillField(toml_bytes: []const u8, key: []const u8) ?[]const u8 {
 /// Parse a boolean field from a TOML skill manifest.
 /// Handles both bare values (true/false) and quoted strings ("true"/"false").
 fn parseTomlBoolField(toml_bytes: []const u8, key: []const u8) ?bool {
-    var in_valid_section = true; // root table is valid
-    var lines = std.mem.splitScalar(u8, toml_bytes, '\n');
-    while (lines.next()) |line_raw| {
-        const line = std.mem.trim(u8, line_raw, " \t\r");
-        if (line.len == 0) continue;
+    // Prefer [skill] section values; fall back to root-level keys.
+    const passes = [_]bool{ true, false };
+    for (passes) |want_skill_section| {
+        var in_skill_section = false;
+        var in_root = true;
+        var lines = std.mem.splitScalar(u8, toml_bytes, '\n');
+        while (lines.next()) |line_raw| {
+            const line = std.mem.trim(u8, line_raw, " \t\r");
+            if (line.len == 0) continue;
 
-        const section_line = std.mem.trim(u8, stripTomlInlineComment(line), " \t\r");
-        if (section_line.len >= 3 and section_line[0] == '[' and section_line[section_line.len - 1] == ']') {
-            in_valid_section = std.mem.eql(u8, section_line, "[skill]");
-            continue;
+            const section_line = std.mem.trim(u8, stripTomlInlineComment(line), " \t\r");
+            if (section_line.len >= 3 and section_line[0] == '[' and section_line[section_line.len - 1] == ']') {
+                in_skill_section = std.mem.eql(u8, section_line, "[skill]");
+                in_root = false;
+                continue;
+            }
+
+            const dominated = if (want_skill_section) in_skill_section else in_root;
+            if (!dominated) continue;
+
+            const eq_idx = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+            const candidate_key = std.mem.trim(u8, line[0..eq_idx], " \t");
+            if (!std.mem.eql(u8, candidate_key, key)) continue;
+
+            const value_part = std.mem.trim(u8, stripTomlInlineComment(line[eq_idx + 1 ..]), " \t\r");
+            if (std.mem.eql(u8, value_part, "true")) return true;
+            if (std.mem.eql(u8, value_part, "false")) return false;
+            if (parseTomlStringLiteral(line[eq_idx + 1 ..])) |s| {
+                if (std.mem.eql(u8, s, "true")) return true;
+                if (std.mem.eql(u8, s, "false")) return false;
+            }
+            return null;
         }
-        if (!in_valid_section) continue;
-
-        const eq_idx = std.mem.indexOfScalar(u8, line, '=') orelse continue;
-        const candidate_key = std.mem.trim(u8, line[0..eq_idx], " \t");
-        if (!std.mem.eql(u8, candidate_key, key)) continue;
-
-        const value_part = std.mem.trim(u8, stripTomlInlineComment(line[eq_idx + 1 ..]), " \t\r");
-        // Bare boolean
-        if (std.mem.eql(u8, value_part, "true")) return true;
-        if (std.mem.eql(u8, value_part, "false")) return false;
-        // Quoted boolean
-        if (parseTomlStringLiteral(line[eq_idx + 1 ..])) |s| {
-            if (std.mem.eql(u8, s, "true")) return true;
-            if (std.mem.eql(u8, s, "false")) return false;
-        }
-        return null;
     }
     return null;
 }
