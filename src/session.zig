@@ -756,7 +756,7 @@ pub const SessionManager = struct {
         }
 
         // Determine the final response to return
-        const final_response = if (send_owned) blk: {
+        const raw_final_response = if (send_owned) blk: {
             // Always free the original response from agent.turn(), then
             // conditionally free post_receive_response if it was a separate allocation.
             self.allocator.free(response);
@@ -766,6 +766,14 @@ pub const SessionManager = struct {
             self.allocator.free(response);
             break :blk post_receive_response;
         } else response;
+
+        // Strip any [behavior:xxx] tags that may have leaked into the final
+        // response (e.g. when the main LLM sees skill instructions containing
+        // behavior-tag examples and parrots them back).  Behavior tags are
+        // internal control directives and must never reach the end-user.
+        const final_response = skills_mod.stripBehaviorTags(self.allocator, raw_final_response) catch raw_final_response;
+        const final_response_stripped = final_response.ptr != raw_final_response.ptr;
+        defer if (final_response_stripped) self.allocator.free(raw_final_response);
 
         // Track consolidation timestamp
         if (session.agent.last_turn_compacted) {
