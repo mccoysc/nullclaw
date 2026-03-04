@@ -1300,27 +1300,20 @@ pub const Agent = struct {
                     continue;
                 }
 
-                // No tool calls — final response.
-                // Strip any [behavior:xxx] tags the main LLM may have parroted
-                // from skill instructions.  These are internal control directives
-                // that must never reach the end-user.
-                const clean_display = skills_mod.stripBehaviorTags(self.allocator, display_text) catch
-                    try self.allocator.dupe(u8, display_text);
-                defer self.allocator.free(clean_display);
-
+                // No tool calls — final response
                 const base_text = if (self.context_was_compacted) blk: {
                     self.context_was_compacted = false;
-                    break :blk try std.fmt.allocPrint(self.allocator, "[Context compacted]\n\n{s}", .{clean_display});
-                } else try self.allocator.dupe(u8, clean_display);
+                    break :blk try std.fmt.allocPrint(self.allocator, "[Context compacted]\n\n{s}", .{display_text});
+                } else try self.allocator.dupe(u8, display_text);
                 errdefer self.allocator.free(base_text);
 
                 const final_text = try self.composeFinalReply(base_text, response.reasoning_content, response.usage);
                 errdefer self.allocator.free(final_text);
 
-                // Dupe from clean_display (not from final_text) to avoid double-dupe
+                // Dupe from display_text directly (not from final_text) to avoid double-dupe
                 try self.history.append(self.allocator, .{
                     .role = .assistant,
-                    .content = try self.allocator.dupe(u8, clean_display),
+                    .content = try self.allocator.dupe(u8, display_text),
                 });
 
                 // Auto-compaction before hard trimming to preserve context

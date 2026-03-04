@@ -791,63 +791,6 @@ pub fn freeHookResult(allocator: std.mem.Allocator, result: *const SkillHookResu
     }
 }
 
-/// Strip `[behavior:xxx]` tags from text so they never leak to end-users.
-/// Returns an owned slice with all recognized behavior tags removed and the
-/// result trimmed.  When the stripped text is empty (i.e. the response was
-/// *only* behavior tags), the original text is returned unchanged so the
-/// caller still has something to show / log.
-pub fn stripBehaviorTags(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
-    const tags = [_][]const u8{
-        "[behavior:passthrough]",
-        "[behavior:intercept]",
-        "[behavior:continue]",
-        "[behavior:error]",
-    };
-
-    var buf: std.ArrayListUnmanaged(u8) = .empty;
-    defer buf.deinit(allocator);
-
-    var remaining = text;
-    var found_any = false;
-    while (remaining.len > 0) {
-        // Find the earliest behavior tag in `remaining`.
-        var earliest_pos: ?usize = null;
-        var earliest_len: usize = 0;
-        for (tags) |tag| {
-            if (std.mem.indexOf(u8, remaining, tag)) |pos| {
-                if (earliest_pos == null or pos < earliest_pos.?) {
-                    earliest_pos = pos;
-                    earliest_len = tag.len;
-                }
-            }
-        }
-
-        if (earliest_pos) |pos| {
-            found_any = true;
-            // Append everything before the tag
-            try buf.appendSlice(allocator, remaining[0..pos]);
-            remaining = remaining[pos + earliest_len ..];
-        } else {
-            // No more tags — append the rest
-            try buf.appendSlice(allocator, remaining);
-            break;
-        }
-    }
-
-    if (!found_any) {
-        // No tags found — return a dupe of the original
-        return try allocator.dupe(u8, text);
-    }
-
-    const stripped = std.mem.trim(u8, buf.items, " \t\r\n");
-    if (stripped.len == 0) {
-        // Nothing left after stripping — return original so caller has content
-        return try allocator.dupe(u8, text);
-    }
-
-    return try allocator.dupe(u8, stripped);
-}
-
 /// Check whether any skills match the given trigger.
 pub fn hasSkillsForTrigger(skills_slice: []const Skill, trigger: SkillTrigger) bool {
     for (skills_slice) |skill| {
