@@ -26,6 +26,7 @@ const Observer = observability.Observer;
 const ObserverEvent = observability.ObserverEvent;
 const SecurityPolicy = @import("../security/policy.zig").SecurityPolicy;
 
+const skills_mod = @import("../skills.zig");
 const cache = memory_mod.cache;
 pub const dispatcher = @import("dispatcher.zig");
 pub const compaction = @import("compaction.zig");
@@ -445,6 +446,24 @@ pub const Agent = struct {
         return compaction.forceCompressHistory(self.allocator, &self.history);
     }
 
+    /// Load workspace skills for hook evaluation.
+    /// Returns a slice that must be freed with skills_mod.freeSkills().
+    fn loadSkillsForHooks(self: *Agent) ?[]skills_mod.Skill {
+        const home_dir = platform.getHomeDir(self.allocator) catch null;
+        defer if (home_dir) |h| self.allocator.free(h);
+        const community_base = if (home_dir) |h|
+            std.fs.path.join(self.allocator, &.{ h, ".nullclaw", "skills" }) catch null
+        else
+            null;
+        defer if (community_base) |cb| self.allocator.free(cb);
+
+        if (community_base) |cb| {
+            return skills_mod.listSkillsMerged(self.allocator, cb, self.workspace_dir) catch
+                skills_mod.listSkills(self.allocator, self.workspace_dir) catch null;
+        }
+        return skills_mod.listSkills(self.allocator, self.workspace_dir) catch null;
+    }
+
     fn appendUniqueString(
         list: *std.ArrayListUnmanaged([]const u8),
         allocator: std.mem.Allocator,
@@ -803,6 +822,10 @@ pub const Agent = struct {
         } };
         self.observer.recordEvent(&start_event);
 
+        // Load skills once for hook evaluation across the entire turn
+        const hook_skills = self.loadSkillsForHooks();
+        defer if (hook_skills) |hs| skills_mod.freeSkills(self.allocator, hs);
+
         // Tool call loop — reuse a single arena across iterations (retains pages)
         var iter_arena = std.heap.ArenaAllocator.init(self.allocator);
         defer iter_arena.deinit();
@@ -813,8 +836,132 @@ pub const Agent = struct {
             _ = iter_arena.reset(.retain_capacity);
             const arena = iter_arena.allocator();
 
+            // ── on_llm_request hook: evaluate before building messages ──
+            if (hook_skills) |hs| {
+                if (skills_mod.hasSkillsForTrigger(hs, .on_llm_request)) {
+                    var hook_result = skills_mod.evaluateSkillHook(self.allocator, hs, .on_llm_request, "") catch skills_mod.SkillHookResult{};
+                    defer skills_mod.freeHookResult(self.allocator, &hook_result);
+
+                    // If agent action, invoke sub-agent with multi-turn tool loop
+                    if (hook_result.action == .agent) {
+                        const agent_result = self.runSkillSubAgent(
+                            self.allocator,
+                            hook_result.content,
+                            "",
+                        );
+                        skills_mod.freeHookResult(self.allocator, &hook_result);
+                        hook_result = agent_result;
+                    }
+
+                    switch (hook_result.action) {
+                        .agent_error => {
+                            const err_response = if (hook_result.content.len > 0)
+                                try self.allocator.dupe(u8, hook_result.content)
+                            else
+                                try self.allocator.dupe(u8, "[skill hook agent error]");
+                            errdefer self.allocator.free(err_response);
+                            try self.history.append(self.allocator, .{
+                                .role = .assistant,
+                                .content = try self.allocator.dupe(u8, err_response),
+                            });
+                            const complete_event = ObserverEvent{ .turn_complete = {} };
+                            self.observer.recordEvent(&complete_event);
+                            return err_response;
+                        },
+                        .intercept => {
+                            const intercept_response = if (hook_result.content.len > 0)
+                                try self.allocator.dupe(u8, hook_result.content)
+                            else
+                                try self.allocator.dupe(u8, "[intercepted by skill hook]");
+                            errdefer self.allocator.free(intercept_response);
+                            try self.history.append(self.allocator, .{
+                                .role = .assistant,
+                                .content = try self.allocator.dupe(u8, intercept_response),
+                            });
+                            const complete_event = ObserverEvent{ .turn_complete = {} };
+                            self.observer.recordEvent(&complete_event);
+                            return intercept_response;
+                        },
+                        .continue_with => {
+                            if (hook_result.content.len > 0 and self.history.items.len > 0) {
+                                const last_idx = self.history.items.len - 1;
+                                if (self.history.items[last_idx].role == .user) {
+                                    self.history.items[last_idx].deinit(self.allocator);
+                                    self.history.items[last_idx] = .{
+                                        .role = .user,
+                                        .content = try self.allocator.dupe(u8, hook_result.content),
+                                    };
+                                }
+                            }
+                        },
+                        .passthrough, .agent => {},
+                    }
+                }
+            }
+
             // Build messages slice for provider (arena-owned; freed at end of iteration)
-            const messages = try self.buildProviderMessages(arena);
+            var messages = try self.buildProviderMessages(arena);
+
+            // ── on_llm_before hook: modify messages content before LLM call ──
+            if (hook_skills) |hs| {
+                if (skills_mod.hasSkillsForTrigger(hs, .on_llm_before)) {
+                    for (0..messages.len) |i| {
+                        const idx = messages.len - 1 - i;
+                        if (messages[idx].role == .user) {
+                            var hook_result = skills_mod.evaluateSkillHook(arena, hs, .on_llm_before, messages[idx].content) catch break;
+                            defer skills_mod.freeHookResult(arena, &hook_result);
+
+                            if (hook_result.action == .agent) {
+                                const agent_result = self.runSkillSubAgent(
+                                    arena,
+                                    hook_result.content,
+                                    messages[idx].content,
+                                );
+                                skills_mod.freeHookResult(arena, &hook_result);
+                                hook_result = agent_result;
+                            }
+
+                            switch (hook_result.action) {
+                                .agent_error => {
+                                    const err_response = if (hook_result.content.len > 0)
+                                        try self.allocator.dupe(u8, hook_result.content)
+                                    else
+                                        try self.allocator.dupe(u8, "[skill hook agent error]");
+                                    errdefer self.allocator.free(err_response);
+                                    try self.history.append(self.allocator, .{
+                                        .role = .assistant,
+                                        .content = try self.allocator.dupe(u8, err_response),
+                                    });
+                                    const complete_event = ObserverEvent{ .turn_complete = {} };
+                                    self.observer.recordEvent(&complete_event);
+                                    return err_response;
+                                },
+                                .intercept => {
+                                    const intercept_response = if (hook_result.content.len > 0)
+                                        try self.allocator.dupe(u8, hook_result.content)
+                                    else
+                                        try self.allocator.dupe(u8, "[intercepted by on_llm_before hook]");
+                                    errdefer self.allocator.free(intercept_response);
+                                    try self.history.append(self.allocator, .{
+                                        .role = .assistant,
+                                        .content = try self.allocator.dupe(u8, intercept_response),
+                                    });
+                                    const complete_event = ObserverEvent{ .turn_complete = {} };
+                                    self.observer.recordEvent(&complete_event);
+                                    return intercept_response;
+                                },
+                                .continue_with => {
+                                    if (hook_result.content.len > 0) {
+                                        messages[idx].content = try arena.dupe(u8, hook_result.content);
+                                    }
+                                },
+                                .passthrough, .agent => {},
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
 
             const timer_start = std.time.milliTimestamp();
             const is_streaming = self.stream_callback != null and self.stream_ctx != null and self.provider.supportsStreaming();
@@ -980,7 +1127,67 @@ pub const Agent = struct {
             self.last_turn_usage = response.usage;
             self.emitUsageRecord(&response, true);
 
-            const response_text = response.contentOrEmpty();
+            // ── on_llm_after hook: process LLM response before further handling ──
+            var llm_after_replacement: ?[]const u8 = null;
+            defer if (llm_after_replacement) |r| arena.free(r);
+            if (hook_skills) |hs| {
+                if (skills_mod.hasSkillsForTrigger(hs, .on_llm_after)) {
+                    const raw_resp = response.contentOrEmpty();
+                    var hook_result = skills_mod.evaluateSkillHook(arena, hs, .on_llm_after, raw_resp) catch skills_mod.SkillHookResult{};
+                    defer skills_mod.freeHookResult(arena, &hook_result);
+
+                    if (hook_result.action == .agent) {
+                        const agent_result = self.runSkillSubAgent(
+                            arena,
+                            hook_result.content,
+                            raw_resp,
+                        );
+                        skills_mod.freeHookResult(arena, &hook_result);
+                        hook_result = agent_result;
+                    }
+
+                    switch (hook_result.action) {
+                        .agent_error => {
+                            const err_response = if (hook_result.content.len > 0)
+                                try self.allocator.dupe(u8, hook_result.content)
+                            else
+                                try self.allocator.dupe(u8, "[skill hook agent error]");
+                            errdefer self.allocator.free(err_response);
+                            try self.history.append(self.allocator, .{
+                                .role = .assistant,
+                                .content = try self.allocator.dupe(u8, err_response),
+                            });
+                            self.freeResponseFields(&response);
+                            const complete_event = ObserverEvent{ .turn_complete = {} };
+                            self.observer.recordEvent(&complete_event);
+                            return err_response;
+                        },
+                        .intercept => {
+                            const intercept_response = if (hook_result.content.len > 0)
+                                try self.allocator.dupe(u8, hook_result.content)
+                            else
+                                try self.allocator.dupe(u8, "[intercepted by on_llm_after hook]");
+                            errdefer self.allocator.free(intercept_response);
+                            try self.history.append(self.allocator, .{
+                                .role = .assistant,
+                                .content = try self.allocator.dupe(u8, intercept_response),
+                            });
+                            self.freeResponseFields(&response);
+                            const complete_event = ObserverEvent{ .turn_complete = {} };
+                            self.observer.recordEvent(&complete_event);
+                            return intercept_response;
+                        },
+                        .continue_with => {
+                            if (hook_result.content.len > 0) {
+                                llm_after_replacement = try arena.dupe(u8, hook_result.content);
+                            }
+                        },
+                        .passthrough, .agent => {},
+                    }
+                }
+            }
+
+            const response_text = if (llm_after_replacement) |replacement| replacement else response.contentOrEmpty();
             const use_native = response.hasToolCalls();
 
             // Determine tool calls: structured (native) first, then XML fallback.
@@ -1197,8 +1404,53 @@ pub const Agent = struct {
                 const tool_start_event = ObserverEvent{ .tool_call_start = .{ .tool = call.name } };
                 self.observer.recordEvent(&tool_start_event);
 
+                // ── on_tool_call_before hook ──
+                var tool_intercepted = false;
+                var tool_before_result_override: ?ToolExecutionResult = null;
+                if (hook_skills) |hs| {
+                    if (skills_mod.hasSkillsForTrigger(hs, .on_tool_call_before)) {
+                        const tool_ctx = std.fmt.allocPrint(arena, "tool:{s} args:{s}", .{ call.name, call.arguments_json }) catch "";
+                        var hook_result = skills_mod.evaluateSkillHook(arena, hs, .on_tool_call_before, tool_ctx) catch skills_mod.SkillHookResult{};
+                        defer skills_mod.freeHookResult(arena, &hook_result);
+
+                        if (hook_result.action == .agent) {
+                            const agent_result = self.runSkillSubAgent(
+                                arena,
+                                hook_result.content,
+                                tool_ctx,
+                            );
+                            skills_mod.freeHookResult(arena, &hook_result);
+                            hook_result = agent_result;
+                        }
+
+                        switch (hook_result.action) {
+                            .agent_error => {
+                                tool_intercepted = true;
+                                tool_before_result_override = ToolExecutionResult{
+                                    .name = call.name,
+                                    .output = if (hook_result.content.len > 0) hook_result.content else "[skill hook agent error]",
+                                    .success = false,
+                                    .tool_call_id = call.tool_call_id,
+                                };
+                            },
+                            .intercept => {
+                                tool_intercepted = true;
+                                tool_before_result_override = ToolExecutionResult{
+                                    .name = call.name,
+                                    .output = if (hook_result.content.len > 0) hook_result.content else "[intercepted by on_tool_call_before hook]",
+                                    .success = true,
+                                    .tool_call_id = call.tool_call_id,
+                                };
+                            },
+                            .continue_with, .passthrough, .agent => {},
+                        }
+                    }
+                }
+
                 const tool_timer = std.time.milliTimestamp();
-                const result = if (should_skip_tools_memory_store_duplicate(arena, batch_updates_tools_md, call))
+                const result = if (tool_before_result_override) |override|
+                    override
+                else if (should_skip_tools_memory_store_duplicate(arena, batch_updates_tools_md, call))
                     ToolExecutionResult{
                         .name = call.name,
                         .output = "Skipped duplicate memory_store: TOOLS.md was updated in the same tool batch",
@@ -1209,22 +1461,57 @@ pub const Agent = struct {
                     self.executeTool(arena, call);
                 const tool_duration: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - tool_timer)));
 
+                // ── on_tool_call_after hook ──
+                var final_result = result;
+                if (!tool_intercepted) {
+                    if (hook_skills) |hs| {
+                        if (skills_mod.hasSkillsForTrigger(hs, .on_tool_call_after)) {
+                            var hook_result = skills_mod.evaluateSkillHook(arena, hs, .on_tool_call_after, result.output) catch skills_mod.SkillHookResult{};
+                            defer skills_mod.freeHookResult(arena, &hook_result);
+
+                            if (hook_result.action == .agent) {
+                                const agent_result = self.runSkillSubAgent(
+                                    arena,
+                                    hook_result.content,
+                                    result.output,
+                                );
+                                skills_mod.freeHookResult(arena, &hook_result);
+                                hook_result = agent_result;
+                            }
+
+                            switch (hook_result.action) {
+                                .continue_with => {
+                                    if (hook_result.content.len > 0) {
+                                        final_result = ToolExecutionResult{
+                                            .name = result.name,
+                                            .output = hook_result.content,
+                                            .success = result.success,
+                                            .tool_call_id = result.tool_call_id,
+                                        };
+                                    }
+                                },
+                                .agent_error, .intercept, .passthrough, .agent => {},
+                            }
+                        }
+                    }
+                }
+
                 if (self.log_tool_calls) {
                     log.info(
                         "tool-call done session=0x{x} index={d} name={s} success={} duration_ms={d}",
-                        .{ session_hash, idx + 1, call.name, result.success, tool_duration },
+                        .{ session_hash, idx + 1, call.name, final_result.success, tool_duration },
                     );
                 }
 
                 const tool_event = ObserverEvent{ .tool_call = .{
                     .tool = call.name,
                     .duration_ms = tool_duration,
-                    .success = result.success,
-                    .detail = if (result.success) null else result.output,
+                    .success = final_result.success,
+                    .detail = if (final_result.success) null else final_result.output,
                 } };
                 self.observer.recordEvent(&tool_event);
 
-                try results_buf.append(self.allocator, result);
+                try results_buf.append(self.allocator, final_result);
             }
 
             // Format tool results, scrub credentials, add reflection prompt, and add to history
@@ -1396,6 +1683,239 @@ pub const Agent = struct {
         return starts_with_ascii_ignore_case(key, "pref.tools.") or
             starts_with_ascii_ignore_case(key, "preference.tools.") or
             std.ascii.eqlIgnoreCase(key, "__bootstrap.prompt.TOOLS.md");
+    }
+
+    /// Run a sub-agent LLM call for an [action:agent] skill hook.
+    ///
+    /// Implements a mini turn loop that:
+    /// 1. Sends skill instructions (system prompt) + hook content (user message) to the LLM.
+    /// 2. Supports multi-turn tool calls within a single invocation.
+    /// 3. Requires that the final text response contains a valid behavior tag ([behavior:xxx]).
+    /// 4. On any error (LLM failure, invalid output, iterations exhausted), returns agent_error
+    ///    immediately with no retries, and logs detailed error info.
+    ///
+    /// The sub-agent is stateless between invocations — no history is preserved.
+    /// The sub-agent's execution does NOT trigger any skill hooks (isolated).
+    pub fn runSkillSubAgent(
+        self: *Agent,
+        result_allocator: std.mem.Allocator,
+        skill_instructions: []const u8,
+        hook_content: []const u8,
+    ) skills_mod.SkillHookResult {
+        // Use an arena for all intermediate allocations within this sub-agent invocation.
+        var sub_arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer sub_arena.deinit();
+        const arena = sub_arena.allocator();
+
+        // Build system prompt: sub_agent_system_prompt + skill instructions
+        const system_prompt = std.fmt.allocPrint(
+            arena,
+            "{s}{s}",
+            .{ skills_mod.sub_agent_system_prompt, skill_instructions },
+        ) catch {
+            log.warn(
+                "sub-agent error: could not build system prompt | instructions={s} hook_content={s}",
+                .{ skill_instructions, hook_content },
+            );
+            return .{
+                .action = .agent_error,
+                .content = result_allocator.dupe(u8, "sub-agent failed: could not build system prompt") catch "",
+                .content_owned = true,
+            };
+        };
+
+        // Build initial messages list (system + user)
+        var messages = std.ArrayListUnmanaged(ChatMessage).empty;
+        messages.append(arena, ChatMessage.system(system_prompt)) catch {
+            log.warn(
+                "sub-agent error: out of memory building messages | instructions={s}",
+                .{skill_instructions},
+            );
+            return .{
+                .action = .agent_error,
+                .content = result_allocator.dupe(u8, "sub-agent failed: out of memory") catch "",
+                .content_owned = true,
+            };
+        };
+        messages.append(arena, ChatMessage.user(
+            if (hook_content.len > 0) hook_content else "(empty content)",
+        )) catch {
+            log.warn(
+                "sub-agent error: out of memory building messages | instructions={s}",
+                .{skill_instructions},
+            );
+            return .{
+                .action = .agent_error,
+                .content = result_allocator.dupe(u8, "sub-agent failed: out of memory") catch "",
+                .content_owned = true,
+            };
+        };
+
+        const native_tools_enabled = self.provider.supportsNativeTools();
+        var total_iterations: u32 = 0;
+
+        while (total_iterations < skills_mod.SUB_AGENT_MAX_ITERATIONS) : (total_iterations += 1) {
+            // Call provider with tools
+            const response = self.provider.chat(
+                arena,
+                .{
+                    .messages = messages.items,
+                    .model = self.model_name,
+                    .temperature = 0.3, // low temperature for deterministic behavior
+                    .max_tokens = self.max_tokens,
+                    .tools = if (native_tools_enabled) self.tool_specs else null,
+                    .timeout_secs = self.message_timeout_secs,
+                },
+                self.model_name,
+                0.3,
+            ) catch |err| {
+                log.warn(
+                    "sub-agent error: LLM call failed | error={s} model={s} instructions={s} hook_content={s} iteration={d}",
+                    .{
+                        @errorName(err),
+                        self.model_name,
+                        skill_instructions,
+                        hook_content,
+                        total_iterations + 1,
+                    },
+                );
+                const err_msg = std.fmt.allocPrint(
+                    result_allocator,
+                    "sub-agent LLM call failed: {s}",
+                    .{@errorName(err)},
+                ) catch return .{
+                    .action = .agent_error,
+                    .content = result_allocator.dupe(u8, "sub-agent LLM call failed") catch "",
+                    .content_owned = true,
+                };
+                return .{ .action = .agent_error, .content = err_msg, .content_owned = true };
+            };
+
+            const response_text = response.contentOrEmpty();
+
+            // Check for tool calls (native first, then XML fallback)
+            var has_tool_calls = false;
+            var parsed_calls: []ParsedToolCall = &.{};
+
+            if (native_tools_enabled and response.tool_calls.len > 0) {
+                parsed_calls = dispatcher.parseStructuredToolCalls(arena, response.tool_calls) catch &.{};
+                has_tool_calls = parsed_calls.len > 0;
+            }
+
+            if (!has_tool_calls and response_text.len > 0) {
+                const xml_parsed = dispatcher.parseToolCalls(arena, response_text) catch null;
+                if (xml_parsed) |xp| {
+                    parsed_calls = xp.calls;
+                    has_tool_calls = xp.calls.len > 0;
+                }
+            }
+
+            if (has_tool_calls) {
+                // Add assistant message to conversation
+                messages.append(arena, ChatMessage.assistant(
+                    arena.dupe(u8, response_text) catch response_text,
+                )) catch break;
+
+                // Execute each tool call and collect results
+                var results_buf = std.ArrayListUnmanaged([]const u8).empty;
+                for (parsed_calls) |call| {
+                    const result = self.executeTool(arena, call);
+                    const formatted = std.fmt.allocPrint(
+                        arena,
+                        "[Tool: {s}] {s}{s}",
+                        .{
+                            call.name,
+                            if (result.success) "" else "(FAILED) ",
+                            result.output,
+                        },
+                    ) catch continue;
+                    results_buf.append(arena, formatted) catch continue;
+                }
+
+                // Format all results and add as user message
+                const joined = std.mem.join(arena, "\n\n", results_buf.items) catch "";
+                messages.append(arena, ChatMessage.user(
+                    if (joined.len > 0) joined else "Tool execution completed with no output.",
+                )) catch break;
+
+                // Continue the loop for the next LLM call
+                continue;
+            }
+
+            // No tool calls — check if the response contains a valid behavior tag.
+            if (skills_mod.hasValidBehaviorTag(response_text)) {
+                // Parse and return the result
+                const parsed = skills_mod.parseSubAgentResponse(result_allocator, response_text) catch {
+                    log.warn(
+                        "sub-agent error: failed to parse valid response | output={s} instructions={s} hook_content={s}",
+                        .{
+                                            response_text,
+                                            skill_instructions,
+                                            hook_content,
+                                        },
+                                    );
+                                    return .{
+                                        .action = .agent_error,
+                                        .content = result_allocator.dupe(u8, "sub-agent error: failed to parse response") catch "",
+                                        .content_owned = true,
+                                    };
+                                };
+                                // parseSubAgentResponse returns .agent as sentinel when no tag found
+                                // (shouldn't happen since we checked hasValidBehaviorTag, but be safe)
+                                if (parsed.action == .agent) {
+                                    log.warn(
+                                        "sub-agent error: behavior tag detected but parse returned sentinel | output={s} instructions={s} hook_content={s}",
+                                        .{
+                                            response_text,
+                                            skill_instructions,
+                                            hook_content,
+                        },
+                    );
+                    return .{
+                        .action = .agent_error,
+                        .content = result_allocator.dupe(u8, "sub-agent error: could not parse behavior tag") catch "",
+                        .content_owned = true,
+                    };
+                }
+                return parsed;
+            }
+
+            // No valid behavior tag in response — treat as error immediately (no retries)
+            log.warn(
+                "sub-agent error: invalid output format (no behavior tag) | output={s} instructions={s} hook_content={s} iteration={d}",
+                .{
+                    response_text,
+                    skill_instructions,
+                    hook_content,
+                    total_iterations + 1,
+                },
+            );
+            const err_msg = std.fmt.allocPrint(
+                result_allocator,
+                "sub-agent produced invalid output (no behavior tag): {s}",
+                .{response_text},
+            ) catch return .{
+                .action = .agent_error,
+                .content = result_allocator.dupe(u8, "sub-agent produced invalid output format") catch "",
+                .content_owned = true,
+            };
+            return .{ .action = .agent_error, .content = err_msg, .content_owned = true };
+        }
+
+        // Total iterations exhausted (only reachable via tool call loops)
+        log.warn(
+            "sub-agent error: max iterations exhausted ({d}) | instructions={s} hook_content={s}",
+            .{
+                skills_mod.SUB_AGENT_MAX_ITERATIONS,
+                skill_instructions,
+                hook_content,
+            },
+        );
+        return .{
+            .action = .agent_error,
+            .content = result_allocator.dupe(u8, "sub-agent exceeded maximum iterations without producing a result") catch "",
+            .content_owned = true,
+        };
     }
 
     fn executeTool(self: *Agent, tool_allocator: std.mem.Allocator, call: ParsedToolCall) ToolExecutionResult {
