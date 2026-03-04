@@ -468,18 +468,18 @@ pub const ChannelManager = struct {
                             // Structural change (host/port/keys/topic) → reset session
                             log.info("MQTT endpoint '{s}' structural change, resetting session", .{endpointLabel(old_ep.endpoint_id, old_ep.listen_topic)});
                             topology_changed = true;
-                            self.evictSessionByEndpoint("mqtt", old_ep);
+                            self.evictSessionByEndpoint("mqtt", old_mqtt.account_id, old_ep);
                         } else if (!modelOverrideEqual(old_ep.model_override, new_ep.model_override)) {
                             // Only model params changed → hot-update in place
                             log.info("MQTT endpoint '{s}' model config changed, hot-updating", .{endpointLabel(old_ep.endpoint_id, old_ep.listen_topic)});
-                            self.hotUpdateSessionByEndpoint("mqtt", old_ep, new_ep.model_override);
+                            self.hotUpdateSessionByEndpoint("mqtt", old_mqtt.account_id, old_ep, new_ep.model_override);
                         }
                         // else: no change at all — leave session untouched
                     } else {
                         // Endpoint removed (endpoint_id no longer in new config)
                         log.info("MQTT endpoint '{s}' removed, evicting session", .{endpointLabel(old_ep.endpoint_id, old_ep.listen_topic)});
                         topology_changed = true;
-                        self.evictSessionByEndpoint("mqtt", old_ep);
+                        self.evictSessionByEndpoint("mqtt", old_mqtt.account_id, old_ep);
                     }
                 }
                 // Check for added endpoints (in new but not in old)
@@ -499,7 +499,7 @@ pub const ChannelManager = struct {
                     for (new_mqtt.endpoints) |ep| {
                         if (!hasModelOverride(ep.model_override)) {
                             log.info("Global model changed, hot-updating MQTT endpoint '{s}'", .{endpointLabel(ep.endpoint_id, ep.listen_topic)});
-                            self.hotUpdateSessionByEndpointGlobal("mqtt", ep, new_config);
+                            self.hotUpdateSessionByEndpointGlobal("mqtt", new_mqtt.account_id, ep, new_config);
                         }
                     }
                 }
@@ -544,15 +544,15 @@ pub const ChannelManager = struct {
                         if (rsEndpointStructuralChanged(old_ep, new_ep)) {
                             log.info("Redis Stream endpoint '{s}' structural change, resetting session", .{endpointLabel(old_ep.endpoint_id, old_ep.listen_topic)});
                             topology_changed = true;
-                            self.evictSessionByRsEndpoint("redis_stream", old_ep);
+                            self.evictSessionByRsEndpoint("redis_stream", old_rs.account_id, old_ep);
                         } else if (!modelOverrideEqual(old_ep.model_override, new_ep.model_override)) {
                             log.info("Redis Stream endpoint '{s}' model config changed, hot-updating", .{endpointLabel(old_ep.endpoint_id, old_ep.listen_topic)});
-                            self.hotUpdateSessionByRsEndpoint("redis_stream", old_ep, new_ep.model_override);
+                            self.hotUpdateSessionByRsEndpoint("redis_stream", old_rs.account_id, old_ep, new_ep.model_override);
                         }
                     } else {
                         log.info("Redis Stream endpoint '{s}' removed, evicting session", .{endpointLabel(old_ep.endpoint_id, old_ep.listen_topic)});
                         topology_changed = true;
-                        self.evictSessionByRsEndpoint("redis_stream", old_ep);
+                        self.evictSessionByRsEndpoint("redis_stream", old_rs.account_id, old_ep);
                     }
                 }
                 for (new_rs.endpoints) |new_ep| {
@@ -569,7 +569,7 @@ pub const ChannelManager = struct {
                     for (new_rs.endpoints) |ep| {
                         if (!hasModelOverride(ep.model_override)) {
                             log.info("Global model changed, hot-updating Redis Stream endpoint '{s}'", .{endpointLabel(ep.endpoint_id, ep.listen_topic)});
-                            self.hotUpdateSessionByRsEndpointGlobal("redis_stream", ep, new_config);
+                            self.hotUpdateSessionByRsEndpointGlobal("redis_stream", new_rs.account_id, ep, new_config);
                         }
                     }
                 }
@@ -626,53 +626,53 @@ pub const ChannelManager = struct {
 
     /// Evict session(s) for a specific MQTT endpoint.
     /// Uses endpoint_id when available, falls back to account_id:topic.
-    fn evictSessionByEndpoint(self: *ChannelManager, channel_type: []const u8, ep: config_types.MqttEndpointConfig) void {
+    fn evictSessionByEndpoint(self: *ChannelManager, channel_type: []const u8, account_id: []const u8, ep: config_types.MqttEndpointConfig) void {
         if (self.runtime) |rt| {
             var key_buf: [512]u8 = undefined;
-            const prefix = endpointSessionPrefix(&key_buf, channel_type, ep.endpoint_id, ep.listen_topic);
+            const prefix = endpointSessionPrefix(&key_buf, channel_type, account_id, ep.endpoint_id, ep.listen_topic);
             const evicted = rt.session_mgr.evictByPrefix(prefix);
             if (evicted > 0) log.info("Evicted {d} session(s) for {s}", .{ evicted, prefix });
         }
     }
 
     /// Evict session(s) for a specific Redis Stream endpoint.
-    fn evictSessionByRsEndpoint(self: *ChannelManager, channel_type: []const u8, ep: config_types.RedisStreamEndpointConfig) void {
+    fn evictSessionByRsEndpoint(self: *ChannelManager, channel_type: []const u8, account_id: []const u8, ep: config_types.RedisStreamEndpointConfig) void {
         if (self.runtime) |rt| {
             var key_buf: [512]u8 = undefined;
-            const prefix = endpointSessionPrefix(&key_buf, channel_type, ep.endpoint_id, ep.listen_topic);
+            const prefix = endpointSessionPrefix(&key_buf, channel_type, account_id, ep.endpoint_id, ep.listen_topic);
             const evicted = rt.session_mgr.evictByPrefix(prefix);
             if (evicted > 0) log.info("Evicted {d} session(s) for {s}", .{ evicted, prefix });
         }
     }
 
     /// Hot-update model params on an MQTT endpoint's session in place.
-    fn hotUpdateSessionByEndpoint(self: *ChannelManager, channel_type: []const u8, ep: config_types.MqttEndpointConfig, mo: config_types.ChannelModelOverride) void {
+    fn hotUpdateSessionByEndpoint(self: *ChannelManager, channel_type: []const u8, account_id: []const u8, ep: config_types.MqttEndpointConfig, mo: config_types.ChannelModelOverride) void {
         if (self.runtime) |rt| {
             var key_buf: [512]u8 = undefined;
-            const prefix = endpointSessionPrefix(&key_buf, channel_type, ep.endpoint_id, ep.listen_topic);
+            const prefix = endpointSessionPrefix(&key_buf, channel_type, account_id, ep.endpoint_id, ep.listen_topic);
             const updated = rt.session_mgr.updateModelParamsByPrefix(prefix, mo);
             if (updated > 0) log.info("Hot-updated model on {d} session(s) for {s}", .{ updated, prefix });
         }
     }
 
     /// Hot-update model params on a Redis Stream endpoint's session in place.
-    fn hotUpdateSessionByRsEndpoint(self: *ChannelManager, channel_type: []const u8, ep: config_types.RedisStreamEndpointConfig, mo: config_types.ChannelModelOverride) void {
+    fn hotUpdateSessionByRsEndpoint(self: *ChannelManager, channel_type: []const u8, account_id: []const u8, ep: config_types.RedisStreamEndpointConfig, mo: config_types.ChannelModelOverride) void {
         if (self.runtime) |rt| {
             var key_buf: [512]u8 = undefined;
-            const prefix = endpointSessionPrefix(&key_buf, channel_type, ep.endpoint_id, ep.listen_topic);
+            const prefix = endpointSessionPrefix(&key_buf, channel_type, account_id, ep.endpoint_id, ep.listen_topic);
             const updated = rt.session_mgr.updateModelParamsByPrefix(prefix, mo);
             if (updated > 0) log.info("Hot-updated model on {d} session(s) for {s}", .{ updated, prefix });
         }
     }
 
     /// Hot-update model params for an MQTT endpoint that inherits global config.
-    fn hotUpdateSessionByEndpointGlobal(self: *ChannelManager, channel_type: []const u8, ep: config_types.MqttEndpointConfig, new_config: *const Config) void {
-        self.hotUpdateSessionByEndpoint(channel_type, ep, buildGlobalModelOverride(new_config));
+    fn hotUpdateSessionByEndpointGlobal(self: *ChannelManager, channel_type: []const u8, account_id: []const u8, ep: config_types.MqttEndpointConfig, new_config: *const Config) void {
+        self.hotUpdateSessionByEndpoint(channel_type, account_id, ep, buildGlobalModelOverride(new_config));
     }
 
     /// Hot-update model params for a Redis Stream endpoint that inherits global config.
-    fn hotUpdateSessionByRsEndpointGlobal(self: *ChannelManager, channel_type: []const u8, ep: config_types.RedisStreamEndpointConfig, new_config: *const Config) void {
-        self.hotUpdateSessionByRsEndpoint(channel_type, ep, buildGlobalModelOverride(new_config));
+    fn hotUpdateSessionByRsEndpointGlobal(self: *ChannelManager, channel_type: []const u8, account_id: []const u8, ep: config_types.RedisStreamEndpointConfig, new_config: *const Config) void {
+        self.hotUpdateSessionByRsEndpoint(channel_type, account_id, ep, buildGlobalModelOverride(new_config));
     }
 
     /// Create and start a new MQTT channel from config at runtime.
@@ -907,12 +907,14 @@ fn hasModelOverride(mo: config_types.ChannelModelOverride) bool {
 }
 
 /// Build the session key prefix for an endpoint: uses endpoint_id when set,
-/// falls back to legacy "channel_type:endpoint_id" or "channel_type:topic".
-fn endpointSessionPrefix(buf: []u8, channel_type: []const u8, endpoint_id: []const u8, listen_topic: []const u8) []const u8 {
+/// falls back to legacy "channel_type:account_id:topic" format.
+fn endpointSessionPrefix(buf: []u8, channel_type: []const u8, account_id: []const u8, endpoint_id: []const u8, listen_topic: []const u8) []const u8 {
     if (endpoint_id.len > 0) {
         return std.fmt.bufPrint(buf, "{s}:{s}", .{ channel_type, endpoint_id }) catch "";
     }
-    return std.fmt.bufPrint(buf, "{s}:{s}", .{ channel_type, listen_topic }) catch "";
+    // Legacy fallback must match the session key format used in
+    // handleInboundLine / handleStreamEntry: "channel_type:account_id:topic"
+    return std.fmt.bufPrint(buf, "{s}:{s}:{s}", .{ channel_type, account_id, listen_topic }) catch "";
 }
 
 /// Return a human-readable label for an endpoint (prefer endpoint_id, fall back to topic).

@@ -1811,7 +1811,7 @@ test "concurrent processMessage different keys — no crash" {
 
     for (0..num_threads) |t| {
         keys[t] = std.fmt.bufPrint(&key_bufs[t], "conc:{d}", .{t}) catch "?";
-        handles[t] = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, struct {
+        handles[t] = try std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, struct {
             fn run(mgr: *SessionManager, key: []const u8, alloc: Allocator) void {
                 for (0..3) |_| {
                     const resp = mgr.processMessage(key, "hello", null) catch return;
