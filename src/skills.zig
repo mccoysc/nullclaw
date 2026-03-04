@@ -14,6 +14,90 @@ const platform = @import("platform.zig");
 
 // ── Types ───────────────────────────────────────────────────────
 
+/// Lifecycle timing point for skill invocation.
+/// Default is `.prompt` which injects instructions into the system prompt (current behavior).
+pub const SkillTrigger = enum {
+    /// Default: inject into system prompt.
+    prompt,
+    /// Before processing a received channel message.
+    on_channel_receive_before,
+    /// After processing a received channel message (before returning response).
+    on_channel_receive_after,
+    /// Before sending response to channel.
+    on_channel_send_before,
+    /// After sending response to channel.
+    on_channel_send_after,
+    /// Before sending content to LLM (simple content transformation).
+    on_llm_before,
+    /// After receiving LLM response (content transformation).
+    on_llm_after,
+    /// Special: controls the LLM request lifecycle.
+    /// Supports action directives: passthrough, intercept, replace, compact.
+    on_llm_request,
+    /// Before executing a tool call.
+    on_tool_call_before,
+    /// After executing a tool call.
+    on_tool_call_after,
+
+    pub fn fromString(s: []const u8) SkillTrigger {
+        if (std.mem.eql(u8, s, "on_channel_receive_before")) return .on_channel_receive_before;
+        if (std.mem.eql(u8, s, "on_channel_receive_after")) return .on_channel_receive_after;
+        if (std.mem.eql(u8, s, "on_channel_send_before")) return .on_channel_send_before;
+        if (std.mem.eql(u8, s, "on_channel_send_after")) return .on_channel_send_after;
+        if (std.mem.eql(u8, s, "on_llm_before")) return .on_llm_before;
+        if (std.mem.eql(u8, s, "on_llm_after")) return .on_llm_after;
+        if (std.mem.eql(u8, s, "on_llm_request")) return .on_llm_request;
+        if (std.mem.eql(u8, s, "on_tool_call_before")) return .on_tool_call_before;
+        if (std.mem.eql(u8, s, "on_tool_call_after")) return .on_tool_call_after;
+        return .prompt;
+    }
+
+    pub fn toSlice(self: SkillTrigger) []const u8 {
+        return switch (self) {
+            .prompt => "prompt",
+            .on_channel_receive_before => "on_channel_receive_before",
+            .on_channel_receive_after => "on_channel_receive_after",
+            .on_channel_send_before => "on_channel_send_before",
+            .on_channel_send_after => "on_channel_send_after",
+            .on_llm_before => "on_llm_before",
+            .on_llm_after => "on_llm_after",
+            .on_llm_request => "on_llm_request",
+            .on_tool_call_before => "on_tool_call_before",
+            .on_tool_call_after => "on_tool_call_after",
+        };
+    }
+
+    /// Returns true if this is a "before" trigger (instructions prepended).
+    pub fn isBefore(self: SkillTrigger) bool {
+        return switch (self) {
+            .on_channel_receive_before, .on_channel_send_before, .on_llm_before, .on_tool_call_before => true,
+            else => false,
+        };
+    }
+};
+
+/// Action directive for on_llm_request hook skills.
+pub const SkillHookAction = enum {
+    /// No modification, proceed with LLM call normally.
+    passthrough,
+    /// Block the LLM call entirely, return a custom response.
+    intercept,
+    /// Replace the user message content before sending to LLM.
+    replace,
+    /// Force history compaction, then proceed with LLM call.
+    compact,
+};
+
+/// Result of evaluating an on_llm_request hook skill.
+pub const SkillHookResult = struct {
+    action: SkillHookAction = .passthrough,
+    /// For intercept: the response to return. For replace: the new content.
+    /// Owned by caller; must be freed.
+    content: []const u8 = "",
+    /// Whether content is heap-allocated and should be freed.
+    content_owned: bool = false,
+};
+
 pub const Skill = struct {
     name: []const u8,
     version: []const u8 = "0.0.1",
@@ -24,6 +108,8 @@ pub const Skill = struct {
     /// If true, full instructions are always included in the system prompt.
     /// If false, only an XML summary is included and the agent must use read_file to load instructions.
     always: bool = false,
+    /// Lifecycle timing point for this skill. Default is `.prompt`.
+    trigger: SkillTrigger = .prompt,
     /// List of CLI binaries required by this skill (e.g. "docker", "git").
     requires_bins: []const []const u8 = &.{},
     /// List of environment variables required by this skill (e.g. "OPENAI_API_KEY").
@@ -42,6 +128,7 @@ pub const SkillManifest = struct {
     description: []const u8,
     author: []const u8,
     always: bool = false,
+    trigger: SkillTrigger = .prompt,
     requires_bins: []const []const u8 = &.{},
     requires_env: []const []const u8 = &.{},
 };
@@ -161,6 +248,7 @@ pub fn parseManifest(json_bytes: []const u8) !SkillManifest {
     const version = parseStringField(json_bytes, "version") orelse "0.0.1";
     const description = parseStringField(json_bytes, "description") orelse "";
     const author = parseStringField(json_bytes, "author") orelse "";
+    const trigger_str = parseStringField(json_bytes, "trigger");
 
     return SkillManifest{
         .name = name,
@@ -168,6 +256,7 @@ pub fn parseManifest(json_bytes: []const u8) !SkillManifest {
         .description = description,
         .author = author,
         .always = parseBoolField(json_bytes, "always") orelse false,
+        .trigger = if (trigger_str) |ts| SkillTrigger.fromString(ts) else .prompt,
     };
 }
 
@@ -301,6 +390,8 @@ pub fn loadSkill(allocator: std.mem.Allocator, skill_dir_path: []const u8) !Skil
         const toml_version = parseTomlSkillField(toml, "version") orelse "0.1.0";
         const toml_description = parseTomlSkillField(toml, "description") orelse "";
         const toml_author = parseTomlSkillField(toml, "author") orelse "";
+        const toml_trigger_str = parseTomlSkillField(toml, "trigger");
+        const toml_trigger = if (toml_trigger_str) |ts| SkillTrigger.fromString(ts) else SkillTrigger.prompt;
 
         const name = try allocator.dupe(u8, toml_name);
         errdefer allocator.free(name);
@@ -323,6 +414,7 @@ pub fn loadSkill(allocator: std.mem.Allocator, skill_dir_path: []const u8) !Skil
             .instructions = instructions,
             .enabled = true,
             .always = false,
+            .trigger = toml_trigger,
             .requires_bins = &.{},
             .requires_env = &.{},
             .path = path,
@@ -362,6 +454,7 @@ pub fn loadSkill(allocator: std.mem.Allocator, skill_dir_path: []const u8) !Skil
             .instructions = instructions,
             .enabled = true,
             .always = manifest.always,
+            .trigger = manifest.trigger,
             .requires_bins = manifest.requires_bins,
             .requires_env = manifest.requires_env,
             .path = path,
@@ -419,6 +512,145 @@ pub fn freeSkills(allocator: std.mem.Allocator, skills_slice: []Skill) void {
         freeSkill(allocator, s);
     }
     allocator.free(skills_slice);
+}
+
+// ── Skill Hook Functions ────────────────────────────────────────
+
+/// Parse an action directive from skill instructions.
+/// Looks for `[action:ACTION]` at the start of the instructions text.
+/// Returns the action and any content following the directive tag.
+/// When no directive is found, returns null (caller should use default behavior).
+pub fn parseHookAction(instructions: []const u8) ?SkillHookResult {
+    const trimmed = std.mem.trimLeft(u8, instructions, " \t\r\n");
+    if (trimmed.len == 0) return null;
+
+    if (std.mem.startsWith(u8, trimmed, "[action:intercept]")) {
+        const rest = trimmed["[action:intercept]".len..];
+        const content = std.mem.trimLeft(u8, rest, " \t\r\n");
+        return .{ .action = .intercept, .content = content };
+    }
+    if (std.mem.startsWith(u8, trimmed, "[action:replace]")) {
+        const rest = trimmed["[action:replace]".len..];
+        const content = std.mem.trimLeft(u8, rest, " \t\r\n");
+        return .{ .action = .replace, .content = content };
+    }
+    if (std.mem.startsWith(u8, trimmed, "[action:compact]")) {
+        return .{ .action = .compact };
+    }
+    if (std.mem.startsWith(u8, trimmed, "[action:passthrough]")) {
+        return .{ .action = .passthrough };
+    }
+    // No recognized directive — return null so caller uses default behavior
+    return null;
+}
+
+/// Evaluate skill hooks for a given trigger point against the provided content.
+/// All hook points support action directives in skill instructions:
+///   - `[action:passthrough]` — do nothing, continue normally
+///   - `[action:intercept]<response>` — block pipeline, return custom content
+///   - `[action:replace]<new content>` — replace content and continue
+///   - `[action:compact]` — (on_llm_request only) compress history and continue
+/// If no directive is found, the default behavior is to prepend (before hooks)
+/// or append (after hooks) the skill instructions to the content.
+/// Returns an owned SkillHookResult; caller must free content if content_owned is true.
+pub fn evaluateSkillHook(
+    allocator: std.mem.Allocator,
+    skills_slice: []const Skill,
+    trigger: SkillTrigger,
+    content: []const u8,
+) !SkillHookResult {
+    var matched_any = false;
+
+    // First pass: check for action-directive skills (first non-passthrough wins)
+    for (skills_slice) |skill| {
+        if (skill.trigger != trigger or !skill.enabled or !skill.available) continue;
+        if (skill.instructions.len == 0) continue;
+        matched_any = true;
+
+        if (parseHookAction(skill.instructions)) |result| {
+            switch (result.action) {
+                .passthrough => continue,
+                .intercept, .replace => {
+                    if (result.content.len > 0) {
+                        return .{
+                            .action = result.action,
+                            .content = try allocator.dupe(u8, result.content),
+                            .content_owned = true,
+                        };
+                    }
+                    return .{ .action = result.action };
+                },
+                .compact => return .{ .action = .compact },
+            }
+        }
+    }
+
+    if (!matched_any) {
+        // No matching skills — passthrough with original content
+        return .{
+            .action = .passthrough,
+            .content = try allocator.dupe(u8, content),
+            .content_owned = true,
+        };
+    }
+
+    // Second pass: no action directives found, use default prepend/append behavior.
+    // Build the modified content with skill instructions wrapped in tags.
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(allocator);
+
+    const is_before = trigger.isBefore();
+
+    if (is_before) {
+        for (skills_slice) |skill| {
+            if (skill.trigger != trigger or !skill.enabled or !skill.available) continue;
+            if (skill.instructions.len == 0) continue;
+            if (parseHookAction(skill.instructions) != null) continue; // skip directive skills
+            try buf.appendSlice(allocator, "[skill-hook:");
+            try buf.appendSlice(allocator, trigger.toSlice());
+            try buf.appendSlice(allocator, " name=");
+            try buf.appendSlice(allocator, skill.name);
+            try buf.appendSlice(allocator, "]\n");
+            try buf.appendSlice(allocator, skill.instructions);
+            try buf.appendSlice(allocator, "\n[/skill-hook]\n\n");
+        }
+        try buf.appendSlice(allocator, content);
+    } else {
+        try buf.appendSlice(allocator, content);
+        for (skills_slice) |skill| {
+            if (skill.trigger != trigger or !skill.enabled or !skill.available) continue;
+            if (skill.instructions.len == 0) continue;
+            if (parseHookAction(skill.instructions) != null) continue; // skip directive skills
+            try buf.appendSlice(allocator, "\n\n[skill-hook:");
+            try buf.appendSlice(allocator, trigger.toSlice());
+            try buf.appendSlice(allocator, " name=");
+            try buf.appendSlice(allocator, skill.name);
+            try buf.appendSlice(allocator, "]\n");
+            try buf.appendSlice(allocator, skill.instructions);
+            try buf.appendSlice(allocator, "\n[/skill-hook]");
+        }
+    }
+
+    return .{
+        .action = .replace,
+        .content = try allocator.dupe(u8, buf.items),
+        .content_owned = true,
+    };
+}
+
+/// Free a SkillHookResult's owned content if applicable.
+pub fn freeHookResult(allocator: std.mem.Allocator, result: *const SkillHookResult) void {
+    if (result.content_owned and result.content.len > 0) {
+        allocator.free(result.content);
+    }
+}
+
+/// Check whether any skills match the given trigger.
+pub fn hasSkillsForTrigger(skills_slice: []const Skill, trigger: SkillTrigger) bool {
+    for (skills_slice) |skill| {
+        if (skill.trigger == trigger and skill.enabled and skill.available) return true;
+    }
+    return false;
 }
 
 // ── Requirement Checking ────────────────────────────────────────
@@ -3892,4 +4124,305 @@ test "freeSyncResult frees message" {
     };
     // freeSyncResult should not leak — testing allocator will catch leaks
     freeSyncResult(allocator, &result);
+}
+
+// ── SkillTrigger Tests ──────────────────────────────────────────
+
+test "SkillTrigger.fromString parses all trigger types" {
+    try std.testing.expectEqual(SkillTrigger.on_channel_receive_before, SkillTrigger.fromString("on_channel_receive_before"));
+    try std.testing.expectEqual(SkillTrigger.on_channel_receive_after, SkillTrigger.fromString("on_channel_receive_after"));
+    try std.testing.expectEqual(SkillTrigger.on_channel_send_before, SkillTrigger.fromString("on_channel_send_before"));
+    try std.testing.expectEqual(SkillTrigger.on_channel_send_after, SkillTrigger.fromString("on_channel_send_after"));
+    try std.testing.expectEqual(SkillTrigger.on_llm_before, SkillTrigger.fromString("on_llm_before"));
+    try std.testing.expectEqual(SkillTrigger.on_llm_after, SkillTrigger.fromString("on_llm_after"));
+    try std.testing.expectEqual(SkillTrigger.on_llm_request, SkillTrigger.fromString("on_llm_request"));
+    try std.testing.expectEqual(SkillTrigger.on_tool_call_before, SkillTrigger.fromString("on_tool_call_before"));
+    try std.testing.expectEqual(SkillTrigger.on_tool_call_after, SkillTrigger.fromString("on_tool_call_after"));
+}
+
+test "SkillTrigger.fromString defaults to prompt for unknown" {
+    try std.testing.expectEqual(SkillTrigger.prompt, SkillTrigger.fromString("unknown_trigger"));
+    try std.testing.expectEqual(SkillTrigger.prompt, SkillTrigger.fromString(""));
+    try std.testing.expectEqual(SkillTrigger.prompt, SkillTrigger.fromString("prompt"));
+}
+
+test "SkillTrigger.toSlice roundtrips" {
+    const triggers = [_]SkillTrigger{ .prompt, .on_channel_receive_before, .on_llm_before, .on_llm_request, .on_tool_call_after };
+    for (triggers) |t| {
+        try std.testing.expectEqual(t, SkillTrigger.fromString(t.toSlice()));
+    }
+}
+
+test "SkillTrigger.isBefore identifies before triggers" {
+    try std.testing.expect(SkillTrigger.on_channel_receive_before.isBefore());
+    try std.testing.expect(SkillTrigger.on_channel_send_before.isBefore());
+    try std.testing.expect(SkillTrigger.on_llm_before.isBefore());
+    try std.testing.expect(SkillTrigger.on_tool_call_before.isBefore());
+    try std.testing.expect(!SkillTrigger.on_channel_receive_after.isBefore());
+    try std.testing.expect(!SkillTrigger.on_llm_after.isBefore());
+    try std.testing.expect(!SkillTrigger.prompt.isBefore());
+    try std.testing.expect(!SkillTrigger.on_llm_request.isBefore());
+}
+
+test "Skill default trigger is prompt" {
+    const skill = Skill{ .name = "test-skill" };
+    try std.testing.expectEqual(SkillTrigger.prompt, skill.trigger);
+}
+
+test "SkillManifest default trigger is prompt" {
+    const manifest = SkillManifest{ .name = "m", .version = "1", .description = "", .author = "" };
+    try std.testing.expectEqual(SkillTrigger.prompt, manifest.trigger);
+}
+
+// ── parseHookAction Tests ───────────────────────────────────────
+
+test "parseHookAction returns null for plain instructions" {
+    try std.testing.expect(parseHookAction("Some plain skill instructions") == null);
+    try std.testing.expect(parseHookAction("# Markdown heading\nSome content") == null);
+}
+
+test "parseHookAction returns null for empty instructions" {
+    try std.testing.expect(parseHookAction("") == null);
+    try std.testing.expect(parseHookAction("   \n\t  ") == null);
+}
+
+test "parseHookAction parses intercept" {
+    const result = parseHookAction("[action:intercept]Custom response text") orelse unreachable;
+    try std.testing.expectEqual(SkillHookAction.intercept, result.action);
+    try std.testing.expectEqualStrings("Custom response text", result.content);
+}
+
+test "parseHookAction parses replace" {
+    const result = parseHookAction("[action:replace]New content here") orelse unreachable;
+    try std.testing.expectEqual(SkillHookAction.replace, result.action);
+    try std.testing.expectEqualStrings("New content here", result.content);
+}
+
+test "parseHookAction parses compact" {
+    const result = parseHookAction("[action:compact]") orelse unreachable;
+    try std.testing.expectEqual(SkillHookAction.compact, result.action);
+}
+
+test "parseHookAction parses passthrough" {
+    const result = parseHookAction("[action:passthrough]") orelse unreachable;
+    try std.testing.expectEqual(SkillHookAction.passthrough, result.action);
+}
+
+test "parseHookAction trims leading whitespace" {
+    const result = parseHookAction("  \n  [action:intercept]response") orelse unreachable;
+    try std.testing.expectEqual(SkillHookAction.intercept, result.action);
+    try std.testing.expectEqualStrings("response", result.content);
+}
+
+// ── evaluateSkillHook Tests ─────────────────────────────────────
+
+test "evaluateSkillHook passthrough when no matching skills" {
+    const allocator = std.testing.allocator;
+    const skills_slice: []const Skill = &.{};
+    const result = try evaluateSkillHook(allocator, skills_slice, .on_llm_before, "test content");
+    defer freeHookResult(allocator, &result);
+    try std.testing.expectEqual(SkillHookAction.passthrough, result.action);
+    try std.testing.expectEqualStrings("test content", result.content);
+}
+
+test "evaluateSkillHook passthrough when skill has different trigger" {
+    const allocator = std.testing.allocator;
+    const skills_slice: []const Skill = &.{Skill{
+        .name = "my-skill",
+        .trigger = .on_llm_after,
+        .instructions = "Some instructions",
+    }};
+    const result = try evaluateSkillHook(allocator, skills_slice, .on_llm_before, "test content");
+    defer freeHookResult(allocator, &result);
+    try std.testing.expectEqual(SkillHookAction.passthrough, result.action);
+}
+
+test "evaluateSkillHook intercept returns custom content" {
+    const allocator = std.testing.allocator;
+    const skills_slice: []const Skill = &.{Skill{
+        .name = "blocker",
+        .trigger = .on_llm_before,
+        .instructions = "[action:intercept]Blocked!",
+    }};
+    const result = try evaluateSkillHook(allocator, skills_slice, .on_llm_before, "original");
+    defer freeHookResult(allocator, &result);
+    try std.testing.expectEqual(SkillHookAction.intercept, result.action);
+    try std.testing.expectEqualStrings("Blocked!", result.content);
+}
+
+test "evaluateSkillHook replace returns new content" {
+    const allocator = std.testing.allocator;
+    const skills_slice: []const Skill = &.{Skill{
+        .name = "replacer",
+        .trigger = .on_llm_before,
+        .instructions = "[action:replace]New content",
+    }};
+    const result = try evaluateSkillHook(allocator, skills_slice, .on_llm_before, "original");
+    defer freeHookResult(allocator, &result);
+    try std.testing.expectEqual(SkillHookAction.replace, result.action);
+    try std.testing.expectEqualStrings("New content", result.content);
+}
+
+test "evaluateSkillHook default prepends for before trigger" {
+    const allocator = std.testing.allocator;
+    const skills_slice: []const Skill = &.{Skill{
+        .name = "prepender",
+        .trigger = .on_llm_before,
+        .instructions = "Extra instructions",
+    }};
+    const result = try evaluateSkillHook(allocator, skills_slice, .on_llm_before, "original content");
+    defer freeHookResult(allocator, &result);
+    try std.testing.expectEqual(SkillHookAction.replace, result.action);
+    // Content should have skill instructions before original content
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "Extra instructions") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "original content") != null);
+    // Instructions should come BEFORE original content
+    const instr_pos = std.mem.indexOf(u8, result.content, "Extra instructions").?;
+    const content_pos = std.mem.indexOf(u8, result.content, "original content").?;
+    try std.testing.expect(instr_pos < content_pos);
+}
+
+test "evaluateSkillHook default appends for after trigger" {
+    const allocator = std.testing.allocator;
+    const skills_slice: []const Skill = &.{Skill{
+        .name = "appender",
+        .trigger = .on_llm_after,
+        .instructions = "Post-process instructions",
+    }};
+    const result = try evaluateSkillHook(allocator, skills_slice, .on_llm_after, "llm response");
+    defer freeHookResult(allocator, &result);
+    try std.testing.expectEqual(SkillHookAction.replace, result.action);
+    // Content should have original content before skill instructions
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "llm response") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "Post-process instructions") != null);
+    const resp_pos = std.mem.indexOf(u8, result.content, "llm response").?;
+    const instr_pos = std.mem.indexOf(u8, result.content, "Post-process instructions").?;
+    try std.testing.expect(resp_pos < instr_pos);
+}
+
+test "evaluateSkillHook skips disabled skills" {
+    const allocator = std.testing.allocator;
+    const skills_slice: []const Skill = &.{Skill{
+        .name = "disabled",
+        .trigger = .on_llm_before,
+        .instructions = "[action:intercept]Should not fire",
+        .enabled = false,
+    }};
+    const result = try evaluateSkillHook(allocator, skills_slice, .on_llm_before, "content");
+    defer freeHookResult(allocator, &result);
+    try std.testing.expectEqual(SkillHookAction.passthrough, result.action);
+}
+
+test "evaluateSkillHook skips unavailable skills" {
+    const allocator = std.testing.allocator;
+    const skills_slice: []const Skill = &.{Skill{
+        .name = "unavail",
+        .trigger = .on_llm_before,
+        .instructions = "[action:intercept]Should not fire",
+        .available = false,
+    }};
+    const result = try evaluateSkillHook(allocator, skills_slice, .on_llm_before, "content");
+    defer freeHookResult(allocator, &result);
+    try std.testing.expectEqual(SkillHookAction.passthrough, result.action);
+}
+
+test "evaluateSkillHook compact action for on_llm_request" {
+    const allocator = std.testing.allocator;
+    const skills_slice: []const Skill = &.{Skill{
+        .name = "compactor",
+        .trigger = .on_llm_request,
+        .instructions = "[action:compact]",
+    }};
+    const result = try evaluateSkillHook(allocator, skills_slice, .on_llm_request, "");
+    defer freeHookResult(allocator, &result);
+    try std.testing.expectEqual(SkillHookAction.compact, result.action);
+}
+
+test "evaluateSkillHook first non-passthrough action wins" {
+    const allocator = std.testing.allocator;
+    const skills_slice: []const Skill = &.{
+        Skill{
+            .name = "first",
+            .trigger = .on_llm_before,
+            .instructions = "[action:passthrough]",
+        },
+        Skill{
+            .name = "second",
+            .trigger = .on_llm_before,
+            .instructions = "[action:intercept]Winner",
+        },
+        Skill{
+            .name = "third",
+            .trigger = .on_llm_before,
+            .instructions = "[action:replace]Loser",
+        },
+    };
+    const result = try evaluateSkillHook(allocator, skills_slice, .on_llm_before, "content");
+    defer freeHookResult(allocator, &result);
+    try std.testing.expectEqual(SkillHookAction.intercept, result.action);
+    try std.testing.expectEqualStrings("Winner", result.content);
+}
+
+// ── hasSkillsForTrigger Tests ───────────────────────────────────
+
+test "hasSkillsForTrigger true when matching" {
+    const skills_slice: []const Skill = &.{Skill{
+        .name = "matcher",
+        .trigger = .on_llm_before,
+    }};
+    try std.testing.expect(hasSkillsForTrigger(skills_slice, .on_llm_before));
+    try std.testing.expect(!hasSkillsForTrigger(skills_slice, .on_llm_after));
+}
+
+test "hasSkillsForTrigger false for disabled" {
+    const skills_slice: []const Skill = &.{Skill{
+        .name = "disabled",
+        .trigger = .on_llm_before,
+        .enabled = false,
+    }};
+    try std.testing.expect(!hasSkillsForTrigger(skills_slice, .on_llm_before));
+}
+
+// ── Trigger Parsing from JSON Tests ─────────────────────────────
+
+test "parseManifest reads trigger field from JSON" {
+    const json = "{\"name\": \"test\", \"trigger\": \"on_llm_before\"}";
+    const manifest = try parseManifest(json);
+    try std.testing.expectEqual(SkillTrigger.on_llm_before, manifest.trigger);
+}
+
+test "parseManifest defaults trigger to prompt when missing" {
+    const json = "{\"name\": \"test\"}";
+    const manifest = try parseManifest(json);
+    try std.testing.expectEqual(SkillTrigger.prompt, manifest.trigger);
+}
+
+test "parseManifest defaults trigger to prompt for unknown value" {
+    const json = "{\"name\": \"test\", \"trigger\": \"unknown_value\"}";
+    const manifest = try parseManifest(json);
+    try std.testing.expectEqual(SkillTrigger.prompt, manifest.trigger);
+}
+
+// ── freeHookResult Tests ────────────────────────────────────────
+
+test "freeHookResult frees owned content" {
+    const allocator = std.testing.allocator;
+    const content = try allocator.dupe(u8, "owned content");
+    const result = SkillHookResult{
+        .action = .replace,
+        .content = content,
+        .content_owned = true,
+    };
+    freeHookResult(allocator, &result);
+}
+
+test "freeHookResult skips non-owned content" {
+    const allocator = std.testing.allocator;
+    const result = SkillHookResult{
+        .action = .passthrough,
+        .content = "static content",
+        .content_owned = false,
+    };
+    // Should not crash or leak
+    freeHookResult(allocator, &result);
 }

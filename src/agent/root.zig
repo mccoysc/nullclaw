@@ -26,6 +26,7 @@ const Observer = observability.Observer;
 const ObserverEvent = observability.ObserverEvent;
 const SecurityPolicy = @import("../security/policy.zig").SecurityPolicy;
 
+const skills_mod = @import("../skills.zig");
 const cache = memory_mod.cache;
 pub const dispatcher = @import("dispatcher.zig");
 pub const compaction = @import("compaction.zig");
@@ -445,6 +446,24 @@ pub const Agent = struct {
         return compaction.forceCompressHistory(self.allocator, &self.history);
     }
 
+    /// Load workspace skills for hook evaluation.
+    /// Returns a slice that must be freed with skills_mod.freeSkills().
+    fn loadSkillsForHooks(self: *Agent) ?[]skills_mod.Skill {
+        const home_dir = platform.getHomeDir(self.allocator) catch null;
+        defer if (home_dir) |h| self.allocator.free(h);
+        const community_base = if (home_dir) |h|
+            std.fs.path.join(self.allocator, &.{ h, ".nullclaw", "skills" }) catch null
+        else
+            null;
+        defer if (community_base) |cb| self.allocator.free(cb);
+
+        if (community_base) |cb| {
+            return skills_mod.listSkillsMerged(self.allocator, cb, self.workspace_dir) catch
+                skills_mod.listSkills(self.allocator, self.workspace_dir) catch null;
+        }
+        return skills_mod.listSkills(self.allocator, self.workspace_dir) catch null;
+    }
+
     fn appendUniqueString(
         list: *std.ArrayListUnmanaged([]const u8),
         allocator: std.mem.Allocator,
@@ -803,6 +822,10 @@ pub const Agent = struct {
         } };
         self.observer.recordEvent(&start_event);
 
+        // Load skills once for hook evaluation across the entire turn
+        const hook_skills = self.loadSkillsForHooks();
+        defer if (hook_skills) |hs| skills_mod.freeSkills(self.allocator, hs);
+
         // Tool call loop — reuse a single arena across iterations (retains pages)
         var iter_arena = std.heap.ArenaAllocator.init(self.allocator);
         defer iter_arena.deinit();
@@ -813,8 +836,93 @@ pub const Agent = struct {
             _ = iter_arena.reset(.retain_capacity);
             const arena = iter_arena.allocator();
 
+            // ── on_llm_request hook: evaluate before building messages ──
+            if (hook_skills) |hs| {
+                if (skills_mod.hasSkillsForTrigger(hs, .on_llm_request)) {
+                    const hook_result = skills_mod.evaluateSkillHook(self.allocator, hs, .on_llm_request, "") catch skills_mod.SkillHookResult{};
+                    defer skills_mod.freeHookResult(self.allocator, &hook_result);
+
+                    switch (hook_result.action) {
+                        .intercept => {
+                            // Skip LLM call entirely, return the hook's content as response
+                            const intercept_response = if (hook_result.content.len > 0)
+                                try self.allocator.dupe(u8, hook_result.content)
+                            else
+                                try self.allocator.dupe(u8, "[intercepted by skill hook]");
+                            errdefer self.allocator.free(intercept_response);
+
+                            try self.history.append(self.allocator, .{
+                                .role = .assistant,
+                                .content = try self.allocator.dupe(u8, intercept_response),
+                            });
+                            const complete_event = ObserverEvent{ .turn_complete = {} };
+                            self.observer.recordEvent(&complete_event);
+                            return intercept_response;
+                        },
+                        .compact => {
+                            // Force history compaction, then continue with LLM call
+                            if (self.forceCompressHistory()) {
+                                self.context_was_compacted = true;
+                            }
+                        },
+                        .replace => {
+                            // Replace the last user message in history
+                            if (hook_result.content.len > 0 and self.history.items.len > 0) {
+                                const last_idx = self.history.items.len - 1;
+                                if (self.history.items[last_idx].role == .user) {
+                                    self.history.items[last_idx].deinit(self.allocator);
+                                    self.history.items[last_idx] = .{
+                                        .role = .user,
+                                        .content = try self.allocator.dupe(u8, hook_result.content),
+                                    };
+                                }
+                            }
+                        },
+                        .passthrough => {},
+                    }
+                }
+            }
+
             // Build messages slice for provider (arena-owned; freed at end of iteration)
-            const messages = try self.buildProviderMessages(arena);
+            var messages = try self.buildProviderMessages(arena);
+
+            // ── on_llm_before hook: modify messages content before LLM call ──
+            if (hook_skills) |hs| {
+                if (skills_mod.hasSkillsForTrigger(hs, .on_llm_before)) {
+                    // Apply hook to the last user message in the messages slice
+                    for (0..messages.len) |i| {
+                        const idx = messages.len - 1 - i;
+                        if (messages[idx].role == .user) {
+                            const hook_result = skills_mod.evaluateSkillHook(arena, hs, .on_llm_before, messages[idx].content) catch break;
+                            defer skills_mod.freeHookResult(arena, &hook_result);
+                            switch (hook_result.action) {
+                                .intercept => {
+                                    const intercept_response = if (hook_result.content.len > 0)
+                                        try self.allocator.dupe(u8, hook_result.content)
+                                    else
+                                        try self.allocator.dupe(u8, "[intercepted by on_llm_before hook]");
+                                    errdefer self.allocator.free(intercept_response);
+                                    try self.history.append(self.allocator, .{
+                                        .role = .assistant,
+                                        .content = try self.allocator.dupe(u8, intercept_response),
+                                    });
+                                    const complete_event = ObserverEvent{ .turn_complete = {} };
+                                    self.observer.recordEvent(&complete_event);
+                                    return intercept_response;
+                                },
+                                .replace => {
+                                    if (hook_result.content.len > 0) {
+                                        const new_content = try arena.dupe(u8, hook_result.content);
+                                        messages[idx].content = new_content;
+                                    }
+                                },
+                                .passthrough, .compact => {},
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
 
             const timer_start = std.time.milliTimestamp();
             const is_streaming = self.stream_callback != null and self.stream_ctx != null and self.provider.supportsStreaming();
@@ -980,7 +1088,42 @@ pub const Agent = struct {
             self.last_turn_usage = response.usage;
             self.emitUsageRecord(&response, true);
 
-            const response_text = response.contentOrEmpty();
+            // ── on_llm_after hook: process LLM response before further handling ──
+            var llm_after_replacement: ?[]const u8 = null;
+            defer if (llm_after_replacement) |r| arena.free(r);
+            if (hook_skills) |hs| {
+                if (skills_mod.hasSkillsForTrigger(hs, .on_llm_after)) {
+                    const raw_resp = response.contentOrEmpty();
+                    const hook_result = skills_mod.evaluateSkillHook(arena, hs, .on_llm_after, raw_resp) catch skills_mod.SkillHookResult{};
+                    defer skills_mod.freeHookResult(arena, &hook_result);
+                    switch (hook_result.action) {
+                        .intercept => {
+                            // Intercept the LLM response: return the hook's content instead
+                            const intercept_response = if (hook_result.content.len > 0)
+                                try self.allocator.dupe(u8, hook_result.content)
+                            else
+                                try self.allocator.dupe(u8, "[intercepted by on_llm_after hook]");
+                            errdefer self.allocator.free(intercept_response);
+                            try self.history.append(self.allocator, .{
+                                .role = .assistant,
+                                .content = try self.allocator.dupe(u8, intercept_response),
+                            });
+                            self.freeResponseFields(&response);
+                            const complete_event = ObserverEvent{ .turn_complete = {} };
+                            self.observer.recordEvent(&complete_event);
+                            return intercept_response;
+                        },
+                        .replace => {
+                            if (hook_result.content.len > 0) {
+                                llm_after_replacement = try arena.dupe(u8, hook_result.content);
+                            }
+                        },
+                        .passthrough, .compact => {},
+                    }
+                }
+            }
+
+            const response_text = if (llm_after_replacement) |replacement| replacement else response.contentOrEmpty();
             const use_native = response.hasToolCalls();
 
             // Determine tool calls: structured (native) first, then XML fallback.
@@ -1197,8 +1340,33 @@ pub const Agent = struct {
                 const tool_start_event = ObserverEvent{ .tool_call_start = .{ .tool = call.name } };
                 self.observer.recordEvent(&tool_start_event);
 
+                // ── on_tool_call_before hook ──
+                var tool_intercepted = false;
+                var tool_before_result_override: ?ToolExecutionResult = null;
+                if (hook_skills) |hs| {
+                    if (skills_mod.hasSkillsForTrigger(hs, .on_tool_call_before)) {
+                        const tool_ctx = std.fmt.allocPrint(arena, "tool:{s} args:{s}", .{ call.name, call.arguments_json }) catch "";
+                        const hook_result = skills_mod.evaluateSkillHook(arena, hs, .on_tool_call_before, tool_ctx) catch skills_mod.SkillHookResult{};
+                        defer skills_mod.freeHookResult(arena, &hook_result);
+                        switch (hook_result.action) {
+                            .intercept => {
+                                tool_intercepted = true;
+                                tool_before_result_override = ToolExecutionResult{
+                                    .name = call.name,
+                                    .output = if (hook_result.content.len > 0) hook_result.content else "[intercepted by on_tool_call_before hook]",
+                                    .success = true,
+                                    .tool_call_id = call.tool_call_id,
+                                };
+                            },
+                            .replace, .passthrough, .compact => {},
+                        }
+                    }
+                }
+
                 const tool_timer = std.time.milliTimestamp();
-                const result = if (should_skip_tools_memory_store_duplicate(arena, batch_updates_tools_md, call))
+                const result = if (tool_before_result_override) |override|
+                    override
+                else if (should_skip_tools_memory_store_duplicate(arena, batch_updates_tools_md, call))
                     ToolExecutionResult{
                         .name = call.name,
                         .output = "Skipped duplicate memory_store: TOOLS.md was updated in the same tool batch",
@@ -1209,22 +1377,46 @@ pub const Agent = struct {
                     self.executeTool(arena, call);
                 const tool_duration: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - tool_timer)));
 
+                // ── on_tool_call_after hook ──
+                var final_result = result;
+                if (!tool_intercepted) {
+                    if (hook_skills) |hs| {
+                        if (skills_mod.hasSkillsForTrigger(hs, .on_tool_call_after)) {
+                            const hook_result = skills_mod.evaluateSkillHook(arena, hs, .on_tool_call_after, result.output) catch skills_mod.SkillHookResult{};
+                            defer skills_mod.freeHookResult(arena, &hook_result);
+                            switch (hook_result.action) {
+                                .replace => {
+                                    if (hook_result.content.len > 0) {
+                                        final_result = ToolExecutionResult{
+                                            .name = result.name,
+                                            .output = hook_result.content,
+                                            .success = result.success,
+                                            .tool_call_id = result.tool_call_id,
+                                        };
+                                    }
+                                },
+                                .intercept, .passthrough, .compact => {},
+                            }
+                        }
+                    }
+                }
+
                 if (self.log_tool_calls) {
                     log.info(
                         "tool-call done session=0x{x} index={d} name={s} success={} duration_ms={d}",
-                        .{ session_hash, idx + 1, call.name, result.success, tool_duration },
+                        .{ session_hash, idx + 1, call.name, final_result.success, tool_duration },
                     );
                 }
 
                 const tool_event = ObserverEvent{ .tool_call = .{
                     .tool = call.name,
                     .duration_ms = tool_duration,
-                    .success = result.success,
-                    .detail = if (result.success) null else result.output,
+                    .success = final_result.success,
+                    .detail = if (final_result.success) null else final_result.output,
                 } };
                 self.observer.recordEvent(&tool_event);
 
-                try results_buf.append(self.allocator, result);
+                try results_buf.append(self.allocator, final_result);
             }
 
             // Format tool results, scrub credentials, add reflection prompt, and add to history

@@ -498,9 +498,10 @@ fn appendSkillsSection(
 
     if (skill_list.len == 0) return;
 
-    // Render always=true skills with full instructions first
+    // Render always=true skills with full instructions first (only prompt-trigger skills)
     var has_always = false;
     for (skill_list) |skill| {
+        if (skill.trigger != .prompt) continue; // Only prompt-trigger skills in system prompt
         if (!skill.always or !skill.available) continue;
         if (!has_always) {
             try w.writeAll("## Skills\n\n");
@@ -516,9 +517,10 @@ fn appendSkillsSection(
         }
     }
 
-    // Render summary skills and unavailable skills as XML
+    // Render summary skills and unavailable skills as XML (only prompt-trigger skills)
     var has_summary = false;
     for (skill_list) |skill| {
+        if (skill.trigger != .prompt) continue; // Only prompt-trigger skills in system prompt
         if (skill.always and skill.available) continue; // already rendered above
         if (!has_summary) {
             try w.writeAll("## Available Skills\n\n");

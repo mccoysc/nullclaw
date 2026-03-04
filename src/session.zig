@@ -23,10 +23,29 @@ const tools_mod = @import("tools/root.zig");
 const Tool = tools_mod.Tool;
 const SecurityPolicy = @import("security/policy.zig").SecurityPolicy;
 const streaming = @import("streaming.zig");
+const skills_mod = @import("skills.zig");
+const platform = @import("platform.zig");
 const log = std.log.scoped(.session);
 const MESSAGE_LOG_MAX_BYTES: usize = 4096;
 const TOKEN_USAGE_LEDGER_FILENAME = "llm_token_usage.jsonl";
 const NS_PER_SEC: i128 = std.time.ns_per_s;
+
+/// Load workspace skills for channel hook evaluation.
+fn loadSessionSkills(allocator: Allocator, workspace_dir: []const u8) ?[]skills_mod.Skill {
+    const home_dir = platform.getHomeDir(allocator) catch null;
+    defer if (home_dir) |h| allocator.free(h);
+    const community_base = if (home_dir) |h|
+        std.fs.path.join(allocator, &.{ h, ".nullclaw", "skills" }) catch null
+    else
+        null;
+    defer if (community_base) |cb| allocator.free(cb);
+
+    if (community_base) |cb| {
+        return skills_mod.listSkillsMerged(allocator, cb, workspace_dir) catch
+            skills_mod.listSkills(allocator, workspace_dir) catch null;
+    }
+    return skills_mod.listSkills(allocator, workspace_dir) catch null;
+}
 
 fn messageLogPreview(text: []const u8) struct { slice: []const u8, truncated: bool } {
     if (text.len <= MESSAGE_LOG_MAX_BYTES) {
@@ -432,9 +451,107 @@ pub const SessionManager = struct {
             session.agent.stream_ctx = null;
         }
 
-        const response = try session.agent.turn(content);
+        // ── Load skills for channel hooks ──
+        const hook_skills = loadSessionSkills(self.allocator, session.agent.workspace_dir);
+        defer if (hook_skills) |hs| skills_mod.freeSkills(self.allocator, hs);
+
+        // ── on_channel_receive_before hook ──
+        var effective_content = content;
+        var effective_content_owned = false;
+        defer if (effective_content_owned) self.allocator.free(effective_content);
+
+        if (hook_skills) |hs| {
+            if (skills_mod.hasSkillsForTrigger(hs, .on_channel_receive_before)) {
+                const hook_result = skills_mod.evaluateSkillHook(self.allocator, hs, .on_channel_receive_before, content) catch skills_mod.SkillHookResult{};
+                defer skills_mod.freeHookResult(self.allocator, &hook_result);
+                switch (hook_result.action) {
+                    .intercept => {
+                        // Intercept: don't process message, return hook's content
+                        const intercept_response = if (hook_result.content.len > 0)
+                            try self.allocator.dupe(u8, hook_result.content)
+                        else
+                            try self.allocator.dupe(u8, "[intercepted by on_channel_receive_before hook]");
+                        return intercept_response;
+                    },
+                    .replace => {
+                        if (hook_result.content.len > 0) {
+                            effective_content = try self.allocator.dupe(u8, hook_result.content);
+                            effective_content_owned = true;
+                        }
+                    },
+                    .passthrough, .compact => {},
+                }
+            }
+        }
+
+        const response = try session.agent.turn(effective_content);
+        errdefer self.allocator.free(response);
         session.turn_count += 1;
         session.last_active = std.time.timestamp();
+
+        // ── on_channel_receive_after hook ──
+        var post_receive_response = response;
+        var post_receive_owned = false;
+        if (hook_skills) |hs| {
+            if (skills_mod.hasSkillsForTrigger(hs, .on_channel_receive_after)) {
+                const hook_result = skills_mod.evaluateSkillHook(self.allocator, hs, .on_channel_receive_after, response) catch skills_mod.SkillHookResult{};
+                defer skills_mod.freeHookResult(self.allocator, &hook_result);
+                switch (hook_result.action) {
+                    .replace => {
+                        if (hook_result.content.len > 0) {
+                            post_receive_response = try self.allocator.dupe(u8, hook_result.content);
+                            post_receive_owned = true;
+                        }
+                    },
+                    .intercept => {
+                        if (hook_result.content.len > 0) {
+                            self.allocator.free(response);
+                            return try self.allocator.dupe(u8, hook_result.content);
+                        }
+                    },
+                    .passthrough, .compact => {},
+                }
+            }
+        }
+
+        // ── on_channel_send_before hook ──
+        var send_response = post_receive_response;
+        var send_owned = false;
+        if (hook_skills) |hs| {
+            if (skills_mod.hasSkillsForTrigger(hs, .on_channel_send_before)) {
+                const hook_result = skills_mod.evaluateSkillHook(self.allocator, hs, .on_channel_send_before, post_receive_response) catch skills_mod.SkillHookResult{};
+                defer skills_mod.freeHookResult(self.allocator, &hook_result);
+                switch (hook_result.action) {
+                    .intercept => {
+                        if (post_receive_owned) self.allocator.free(post_receive_response);
+                        if (!post_receive_owned) self.allocator.free(response);
+                        return if (hook_result.content.len > 0)
+                            try self.allocator.dupe(u8, hook_result.content)
+                        else
+                            try self.allocator.dupe(u8, "[intercepted by on_channel_send_before hook]");
+                    },
+                    .replace => {
+                        if (hook_result.content.len > 0) {
+                            send_response = try self.allocator.dupe(u8, hook_result.content);
+                            send_owned = true;
+                        }
+                    },
+                    .passthrough, .compact => {},
+                }
+            }
+        }
+
+        // Determine the final response to return
+        const final_response = if (send_owned) blk: {
+            // Free intermediate allocations
+            if (post_receive_owned) self.allocator.free(post_receive_response);
+            if (post_receive_owned or send_owned) {} // response freed below if needed
+            if (!post_receive_owned) self.allocator.free(response);
+            break :blk send_response;
+        } else if (post_receive_owned) blk: {
+            self.allocator.free(response);
+            break :blk post_receive_response;
+        } else response;
 
         // Track consolidation timestamp
         if (session.agent.last_turn_compacted) {
@@ -452,25 +569,34 @@ pub const SessionManager = struct {
             } else if (!std.mem.startsWith(u8, trimmed, "/")) {
                 // Persist user + assistant messages (skip slash commands)
                 store.saveMessage(session_key, "user", content) catch {};
-                store.saveMessage(session_key, "assistant", response) catch {};
+                store.saveMessage(session_key, "assistant", final_response) catch {};
             }
         }
 
         if (self.config.diagnostics.log_message_payloads) {
-            const preview = messageLogPreview(response);
+            const preview = messageLogPreview(final_response);
             log.info(
                 "message outbound channel={s} session=0x{x} bytes={d} content={f}{s}",
                 .{
                     channel,
                     session_hash,
-                    response.len,
+                    final_response.len,
                     std.json.fmt(preview.slice, .{}),
                     if (preview.truncated) " [truncated]" else "",
                 },
             );
         }
 
-        return response;
+        // ── on_channel_send_after hook (fire-and-forget, does not modify return) ──
+        if (hook_skills) |hs| {
+            if (skills_mod.hasSkillsForTrigger(hs, .on_channel_send_after)) {
+                const hook_result = skills_mod.evaluateSkillHook(self.allocator, hs, .on_channel_send_after, final_response) catch skills_mod.SkillHookResult{};
+                skills_mod.freeHookResult(self.allocator, &hook_result);
+                // on_channel_send_after is observational — response already committed
+            }
+        }
+
+        return final_response;
     }
 
     /// Number of active sessions.
