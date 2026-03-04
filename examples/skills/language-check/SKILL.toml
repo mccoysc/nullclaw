@@ -1,0 +1,4 @@
+name = "language-check"
+description = "Checks incoming messages for abusive or violent language before processing"
+trigger = "on_channel_receive_before"
+always = true
