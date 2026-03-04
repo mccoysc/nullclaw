@@ -11,7 +11,10 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Config = @import("config.zig").Config;
-const Agent = @import("agent/root.zig").Agent;
+const config_types = @import("config_types.zig");
+const agent_root = @import("agent/root.zig");
+const Agent = agent_root.Agent;
+const context_tokens = agent_root.context_tokens;
 const ConversationContext = @import("agent/prompt.zig").ConversationContext;
 const providers = @import("providers/root.zig");
 const Provider = providers.Provider;
@@ -135,6 +138,156 @@ pub const SessionManager = struct {
         self.sessions.deinit(self.allocator);
     }
 
+    /// Look up per-channel model override from config based on session_key.
+    /// Session keys for MQTT/Redis follow the pattern: "mqtt:<account_id>:<topic>"
+    /// or "redis_stream:<account_id>:<topic>".
+    fn lookupChannelModelOverride(config: *const Config, session_key: []const u8) config_types.ChannelModelOverride {
+        // Try MQTT prefix — supports both "mqtt:<endpoint_id>" and legacy "mqtt:<account_id>:<topic>"
+        if (std.mem.startsWith(u8, session_key, "mqtt:")) {
+            const rest = session_key["mqtt:".len..];
+            // First try endpoint_id match (no colon in rest means it's an endpoint_id)
+            for (config.channels.mqtt) |mqtt_cfg| {
+                for (mqtt_cfg.endpoints) |ep| {
+                    if (ep.endpoint_id.len > 0 and std.mem.eql(u8, ep.endpoint_id, rest)) {
+                        return ep.model_override;
+                    }
+                }
+            }
+            // Fall back to legacy account_id:topic match
+            const sep = std.mem.indexOfScalar(u8, rest, ':');
+            if (sep) |s| {
+                const account_id = rest[0..s];
+                const topic = rest[s + 1 ..];
+                for (config.channels.mqtt) |mqtt_cfg| {
+                    if (std.mem.eql(u8, mqtt_cfg.account_id, account_id)) {
+                        for (mqtt_cfg.endpoints) |ep| {
+                            if (std.mem.eql(u8, ep.listen_topic, topic)) {
+                                return ep.model_override;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Try Redis Stream prefix — supports both "redis_stream:<endpoint_id>" and legacy format
+        if (std.mem.startsWith(u8, session_key, "redis_stream:")) {
+            const rest = session_key["redis_stream:".len..];
+            // First try endpoint_id match
+            for (config.channels.redis_stream) |rs_cfg| {
+                for (rs_cfg.endpoints) |ep| {
+                    if (ep.endpoint_id.len > 0 and std.mem.eql(u8, ep.endpoint_id, rest)) {
+                        return ep.model_override;
+                    }
+                }
+            }
+            // Fall back to legacy account_id:topic match
+            const sep = std.mem.indexOfScalar(u8, rest, ':');
+            if (sep) |s| {
+                const account_id = rest[0..s];
+                const topic = rest[s + 1 ..];
+                for (config.channels.redis_stream) |rs_cfg| {
+                    if (std.mem.eql(u8, rs_cfg.account_id, account_id)) {
+                        for (rs_cfg.endpoints) |ep| {
+                            if (std.mem.eql(u8, ep.listen_topic, topic)) {
+                                return ep.model_override;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return .{};
+    }
+
+    /// Apply per-channel model overrides to an agent.
+    /// Only overrides fields that are explicitly set in the override config.
+    fn applyModelOverride(agent: *Agent, mo: config_types.ChannelModelOverride) void {
+        if (mo.provider) |prov| {
+            agent.default_provider = prov;
+        }
+        if (mo.model) |model| {
+            agent.model_name = model;
+            agent.default_model = model;
+            // Re-resolve token_limit with the new model
+            const new_token_limit = context_tokens.resolveContextTokens(agent.token_limit_override, model);
+            if (mo.max_context_tokens > 0 and (new_token_limit == 0 or mo.max_context_tokens < new_token_limit)) {
+                agent.token_limit = mo.max_context_tokens;
+            } else {
+                agent.token_limit = new_token_limit;
+            }
+        } else if (mo.max_context_tokens > 0) {
+            // No model override but max_context_tokens is set — cap the current token_limit
+            if (agent.token_limit == 0 or mo.max_context_tokens < agent.token_limit) {
+                agent.token_limit = mo.max_context_tokens;
+            }
+        }
+        if (mo.temperature) |temp| {
+            agent.temperature = temp;
+        }
+    }
+
+    /// Evict all sessions whose key starts with the given prefix.
+    /// Used during config hot-reload to clean up sessions for removed channels.
+    /// Returns the number of sessions evicted.
+    pub fn evictByPrefix(self: *SessionManager, prefix: []const u8) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var to_remove: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer to_remove.deinit(self.allocator);
+
+        var it = self.sessions.iterator();
+        while (it.next()) |entry| {
+            if (std.mem.startsWith(u8, entry.key_ptr.*, prefix)) {
+                to_remove.append(self.allocator, entry.key_ptr.*) catch continue;
+            }
+        }
+
+        for (to_remove.items) |key| {
+            if (self.sessions.fetchRemove(key)) |kv| {
+                kv.value.deinit(self.allocator);
+                self.allocator.destroy(kv.value);
+            }
+        }
+        return to_remove.items.len;
+    }
+
+    /// Hot-update model parameters on an existing session without destroying it.
+    /// The session keeps its conversation history and state; only model-related
+    /// agent fields are patched in place.  Returns true if a matching session was
+    /// found and updated.
+    pub fn updateSessionModelParams(self: *SessionManager, session_key: []const u8, mo: config_types.ChannelModelOverride) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const sess = self.sessions.get(session_key) orelse return false;
+        applyModelOverride(&sess.agent, mo);
+        return true;
+    }
+
+    /// Hot-update model parameters on all sessions whose key starts with the
+    /// given prefix.  Returns the number of sessions updated.
+    pub fn updateModelParamsByPrefix(self: *SessionManager, prefix: []const u8, mo: config_types.ChannelModelOverride) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var count: usize = 0;
+        var it = self.sessions.iterator();
+        while (it.next()) |entry| {
+            if (std.mem.startsWith(u8, entry.key_ptr.*, prefix)) {
+                applyModelOverride(&entry.value_ptr.*.agent, mo);
+                count += 1;
+            }
+        }
+        return count;
+    }
+
+    /// Update the config pointer for all future session creations.
+    /// Existing sessions keep their agent state; new sessions will use the new config.
+    pub fn updateConfig(self: *SessionManager, new_config: *const Config) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.config = new_config;
+    }
+
     /// Find or create a session for the given key. Thread-safe.
     pub fn getOrCreate(self: *SessionManager, session_key: []const u8) !*Session {
         self.mutex.lock();
@@ -169,6 +322,10 @@ pub const SessionManager = struct {
             agent.usage_record_callback = usageRecordForwarder;
             agent.usage_record_ctx = @ptrCast(self);
         }
+
+        // Apply per-channel model overrides (MQTT / Redis Stream)
+        const mo = lookupChannelModelOverride(self.config, session_key);
+        applyModelOverride(&agent, mo);
 
         session.* = .{
             .agent = agent,

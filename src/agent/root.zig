@@ -347,7 +347,11 @@ pub const Agent = struct {
     ) !Agent {
         const default_model = cfg.default_model orelse return error.NoDefaultModel;
         const token_limit_override = if (cfg.agent.token_limit_explicit) cfg.agent.token_limit else null;
-        const resolved_token_limit = context_tokens.resolveContextTokens(token_limit_override, default_model);
+        var resolved_token_limit = context_tokens.resolveContextTokens(token_limit_override, default_model);
+        // Apply global max_context_tokens cap if configured (0 = no cap)
+        if (cfg.agent.max_context_tokens > 0 and (resolved_token_limit == 0 or cfg.agent.max_context_tokens < resolved_token_limit)) {
+            resolved_token_limit = cfg.agent.max_context_tokens;
+        }
         const resolved_max_tokens_raw = max_tokens_resolver.resolveMaxTokens(cfg.max_tokens, default_model);
         const token_limit_cap: u32 = @intCast(@min(resolved_token_limit, @as(u64, std.math.maxInt(u32))));
         const resolved_max_tokens = @min(resolved_max_tokens_raw, token_limit_cap);
