@@ -197,6 +197,9 @@ pub const AgentConfig = struct {
     /// Per-turn MCP tool filtering. Empty slice = no filtering (all tools included).
     /// See ToolFilterGroup for semantics.
     tool_filter_groups: []const ToolFilterGroup = &.{},
+    /// Maximum iterations for the skill sub-agent turn loop (tool calls only).
+    /// 0 = use compiled default (10).
+    sub_agent_max_iterations: u32 = 0,
 };
 
 pub const ToolsConfig = struct {

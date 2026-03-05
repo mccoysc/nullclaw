@@ -741,6 +741,7 @@ pub const Config = struct {
             .compaction_max_source_chars = self.agent.compaction_max_source_chars,
             .status_show_emojis = self.agent.status_show_emojis,
             .message_timeout_secs = self.agent.message_timeout_secs,
+            .sub_agent_max_iterations = self.agent.sub_agent_max_iterations,
         }, .{})});
 
         // Channels

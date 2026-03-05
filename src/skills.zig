@@ -732,6 +732,25 @@ pub const sub_agent_system_prompt =
 /// Maximum iterations for the sub-agent turn loop (tool calls only; no format retries).
 pub const SUB_AGENT_MAX_ITERATIONS: u32 = 10;
 
+/// Name of the sentinel file that triggers a skills reload.
+/// When this file exists inside a skills directory, skills are reloaded from
+/// disk and the file is deleted afterwards.
+const SKILLS_RELOAD_SENTINEL = ".reload";
+
+/// Check for a `.reload` sentinel file in the given skills directory and
+/// delete it if found.  Returns `true` when the sentinel was present (i.e.
+/// a reload was explicitly requested).
+pub fn consumeReloadSentinel(allocator: std.mem.Allocator, skills_dir: []const u8) bool {
+    const sentinel_path = std.fmt.allocPrint(allocator, "{s}/" ++ SKILLS_RELOAD_SENTINEL, .{skills_dir}) catch return false;
+    defer allocator.free(sentinel_path);
+
+    std.fs.cwd().deleteFile(sentinel_path) catch return false;
+
+    // File existed and was deleted — a reload was requested.
+    log.info("Skills reload sentinel detected and consumed: {s}", .{sentinel_path});
+    return true;
+}
+
 /// Parse the output of a sub-agent LLM call into a SkillHookResult.
 /// When multiple behavior tags are present, the LAST one wins — the agent may
 /// output reasoning with intermediate tags before settling on a final decision.

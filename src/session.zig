@@ -34,6 +34,7 @@ const TOKEN_USAGE_LEDGER_FILENAME = "llm_token_usage.jsonl";
 const NS_PER_SEC: i128 = std.time.ns_per_s;
 
 /// Load workspace skills for channel hook evaluation.
+/// Also consumes any `.reload` sentinel files in the skills directories.
 fn loadSessionSkills(allocator: Allocator, workspace_dir: []const u8) ?[]skills_mod.Skill {
     const home_dir = platform.getHomeDir(allocator) catch null;
     defer if (home_dir) |h| allocator.free(h);
@@ -42,6 +43,11 @@ fn loadSessionSkills(allocator: Allocator, workspace_dir: []const u8) ?[]skills_
     else
         null;
     defer if (community_base) |cb| allocator.free(cb);
+
+    // Consume reload sentinels (best-effort; result unused here because
+    // skills are always loaded fresh from disk on every turn).
+    if (community_base) |cb| _ = skills_mod.consumeReloadSentinel(allocator, cb);
+    _ = skills_mod.consumeReloadSentinel(allocator, workspace_dir);
 
     if (community_base) |cb| {
         return skills_mod.listSkillsMerged(allocator, cb, workspace_dir) catch
