@@ -730,7 +730,7 @@ pub const sub_agent_system_prompt =
 ;
 
 /// Maximum iterations for the sub-agent turn loop (tool calls only; no format retries).
-pub const SUB_AGENT_MAX_ITERATIONS: u32 = 10;
+pub const SUB_AGENT_MAX_ITERATIONS: u32 = 128;
 
 /// Default number of consecutive tool-call iterations before triggering an
 /// LLM review of the sub-agent loop progress.

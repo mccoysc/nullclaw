@@ -1989,7 +1989,7 @@ pub const Agent = struct {
             const configured = if (self.sub_agent_review_after > 0) self.sub_agent_review_after else skills_mod.SUB_AGENT_DEFAULT_REVIEW_AFTER;
             break :blk @min(configured, max_sub_iterations - 1);
         };
-        var review_done = false; // only review once per invocation
+        var next_review_at: u32 = review_after; // fires every review_after iterations
         var tool_call_summaries = std.ArrayListUnmanaged([]const u8).empty;
 
         while (total_iterations < max_sub_iterations) : (total_iterations += 1) {
@@ -2091,10 +2091,10 @@ pub const Agent = struct {
                 )) catch break;
 
                 // ── Smart review check ──────────────────────────────
-                // After review_after consecutive tool-call iterations,
+                // Every review_after consecutive tool-call iterations,
                 // ask the LLM whether the loop is making progress.
-                if (!review_done and total_iterations + 1 >= review_after and tool_call_summaries.items.len > 0) {
-                    review_done = true;
+                if (total_iterations + 1 >= next_review_at and tool_call_summaries.items.len > 0) {
+                    next_review_at += review_after; // schedule next review
                     const review_result = self.runSubAgentReview(arena, skill_instructions, tool_call_summaries.items);
                     if (review_result) |stop_reason| {
                         log.info(
@@ -2112,8 +2112,8 @@ pub const Agent = struct {
                         };
                         return .{ .action = .agent_error, .content = user_msg, .content_owned = true };
                     }
-                    // Verdict was continue (or review failed) — keep going until hard limit.
-                    log.info("sub-agent review: LLM recommended continue | iterations={d}", .{total_iterations + 1});
+                    // Verdict was continue (or review failed) — keep going until next review or hard limit.
+                    log.info("sub-agent review: LLM recommended continue | iterations={d} next_review_at={d}", .{ total_iterations + 1, next_review_at });
                 }
 
                 // Continue the loop for the next LLM call

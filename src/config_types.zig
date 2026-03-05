@@ -198,7 +198,7 @@ pub const AgentConfig = struct {
     /// See ToolFilterGroup for semantics.
     tool_filter_groups: []const ToolFilterGroup = &.{},
     /// Maximum iterations for the skill sub-agent turn loop (tool calls only).
-    /// 0 = use compiled default (10).
+    /// 0 = use compiled default (128).
     sub_agent_max_iterations: u32 = 0,
     /// After this many consecutive tool-call iterations in the sub-agent loop,
     /// trigger an LLM review to decide whether the loop is stuck.
