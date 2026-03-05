@@ -3,6 +3,8 @@ name: Release
 on:
   push:
     tags: ['v*']
+    branches: [main]
+  workflow_dispatch:
 
 jobs:
   build:
@@ -67,6 +69,8 @@ jobs:
       contents: write
 
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
 
       - name: Rename binaries
@@ -79,9 +83,29 @@ jobs:
           mv nullclaw-windows-x86_64/nullclaw.exe nullclaw-windows-x86_64.exe
           mv nullclaw-windows-aarch64/nullclaw.exe nullclaw-windows-aarch64.exe
 
+      - name: Determine release info
+        id: release_info
+        shell: bash
+        run: |
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            echo "tag=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+            echo "prerelease=false" >> $GITHUB_OUTPUT
+          else
+            VERSION=$(grep -m1 'version' build.zig.zon | sed 's/.*"\(.*\)".*/\1/')
+            if [[ -z "$VERSION" ]]; then
+              echo "ERROR: Could not extract version from build.zig.zon" >&2
+              exit 1
+            fi
+            SHORT_SHA="${{ github.sha }}"
+            echo "tag=v${VERSION}-dev-${SHORT_SHA:0:7}" >> $GITHUB_OUTPUT
+            echo "prerelease=true" >> $GITHUB_OUTPUT
+          fi
+
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.release_info.outputs.tag }}
+          prerelease: ${{ steps.release_info.outputs.prerelease }}
           files: |
             nullclaw-linux-x86_64.bin
             nullclaw-linux-aarch64.bin
@@ -94,6 +118,7 @@ jobs:
 
   docker:
     needs: release
+    if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     permissions:
       contents: read
