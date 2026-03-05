@@ -303,6 +303,10 @@ pub const Agent = struct {
     /// Empty = no filtering; all tool specs are sent as-is.
     tool_filter_groups: []const config_types.ToolFilterGroup = &.{},
 
+    /// Background queue for fire-and-forget [action:asyncAgent] skill tasks.
+    /// Lazily initialised on first enqueue; shut down in deinit.
+    async_skill_queue: skills_mod.AsyncSkillQueue = skills_mod.AsyncSkillQueue.init(undefined),
+
     /// Optional security policy for autonomy checks and rate limiting.
     policy: ?*const SecurityPolicy = null,
 
@@ -431,6 +435,7 @@ pub const Agent = struct {
                 .full, .read_only => .off,
                 .supervised => .on_miss,
             },
+            .async_skill_queue = skills_mod.AsyncSkillQueue.init(allocator),
             .history = .empty,
             .total_tokens = 0,
             .has_system_prompt = false,
@@ -439,6 +444,8 @@ pub const Agent = struct {
     }
 
     pub fn deinit(self: *Agent) void {
+        // Shut down the async skill queue first (blocks until worker exits).
+        self.async_skill_queue.deinit();
         if (self.bootstrap) |bp| bp.deinit();
         if (self.model_name_owned) self.allocator.free(self.model_name);
         if (self.default_provider_owned) self.allocator.free(self.default_provider);
@@ -1047,18 +1054,22 @@ pub const Agent = struct {
             // ── on_llm_request hook: evaluate before building messages ──
             if (hook_skills) |hs| {
                 if (skills_mod.hasSkillsForTrigger(hs, .on_llm_request)) {
-                    var hook_result = skills_mod.evaluateSkillHook(self.allocator, hs, .on_llm_request, "") catch skills_mod.SkillHookResult{};
+                    // 1. Run all [action:agent] skills in chain
+                    const agent_skills = skills_mod.collectAgentSkills(self.allocator, hs, .on_llm_request) catch &.{};
+                    defer if (agent_skills.len > 0) self.allocator.free(agent_skills);
+                    var hook_result = self.runSkillSubAgentChain(self.allocator, agent_skills, "");
                     defer skills_mod.freeHookResult(self.allocator, &hook_result);
 
-                    // If agent action, invoke sub-agent with multi-turn tool loop
-                    if (hook_result.action == .agent) {
-                        const agent_result = self.runSkillSubAgent(
-                            self.allocator,
-                            hook_result.content,
-                            "",
-                        );
-                        skills_mod.freeHookResult(self.allocator, &hook_result);
-                        hook_result = agent_result;
+                    // 2. If chain didn't intercept, run plain skills
+                    if (hook_result.action != .intercept and hook_result.action != .agent_error) {
+                        const effective = if (hook_result.action == .continue_with and hook_result.content.len > 0) hook_result.content else "";
+                        var plain_result = skills_mod.evaluateSkillHook(self.allocator, hs, .on_llm_request, effective) catch skills_mod.SkillHookResult{};
+                        if (plain_result.action == .continue_with or plain_result.action == .intercept or plain_result.action == .agent_error) {
+                            skills_mod.freeHookResult(self.allocator, &hook_result);
+                            hook_result = plain_result;
+                        } else {
+                            skills_mod.freeHookResult(self.allocator, &plain_result);
+                        }
                     }
 
                     switch (hook_result.action) {
@@ -1102,7 +1113,7 @@ pub const Agent = struct {
                                 }
                             }
                         },
-                        .passthrough, .agent => {},
+                        .passthrough, .agent, .async_agent => {},
                     }
                 }
             }
@@ -1116,17 +1127,22 @@ pub const Agent = struct {
                     for (0..messages.len) |i| {
                         const idx = messages.len - 1 - i;
                         if (messages[idx].role == .user) {
-                            var hook_result = skills_mod.evaluateSkillHook(arena, hs, .on_llm_before, messages[idx].content) catch break;
+                            // 1. Run all [action:agent] skills in chain
+                            const agent_skills = skills_mod.collectAgentSkills(arena, hs, .on_llm_before) catch break;
+                            defer if (agent_skills.len > 0) arena.free(agent_skills);
+                            var hook_result = self.runSkillSubAgentChain(arena, agent_skills, messages[idx].content);
                             defer skills_mod.freeHookResult(arena, &hook_result);
 
-                            if (hook_result.action == .agent) {
-                                const agent_result = self.runSkillSubAgent(
-                                    arena,
-                                    hook_result.content,
-                                    messages[idx].content,
-                                );
-                                skills_mod.freeHookResult(arena, &hook_result);
-                                hook_result = agent_result;
+                            // 2. If chain didn't intercept, run plain skills
+                            if (hook_result.action != .intercept and hook_result.action != .agent_error) {
+                                const effective = if (hook_result.action == .continue_with and hook_result.content.len > 0) hook_result.content else messages[idx].content;
+                                var plain_result = skills_mod.evaluateSkillHook(arena, hs, .on_llm_before, effective) catch skills_mod.SkillHookResult{};
+                                if (plain_result.action == .continue_with or plain_result.action == .intercept or plain_result.action == .agent_error) {
+                                    skills_mod.freeHookResult(arena, &hook_result);
+                                    hook_result = plain_result;
+                                } else {
+                                    skills_mod.freeHookResult(arena, &plain_result);
+                                }
                             }
 
                             switch (hook_result.action) {
@@ -1163,15 +1179,15 @@ pub const Agent = struct {
                                         messages[idx].content = try arena.dupe(u8, hook_result.content);
                                     }
                                 },
-                                .passthrough, .agent => {},
+                                            .passthrough, .agent, .async_agent => {},
+                                        }
+                                        break;
+                                    }
+                                }
                             }
-                            break;
                         }
-                    }
-                }
-            }
 
-            const timer_start = std.time.milliTimestamp();
+                        const timer_start = std.time.milliTimestamp();
             const is_streaming = self.stream_callback != null and self.stream_ctx != null and self.provider.supportsStreaming();
             const native_tools_enabled = !is_streaming and self.provider.supportsNativeTools();
 
@@ -1356,17 +1372,22 @@ pub const Agent = struct {
             if (hook_skills) |hs| {
                 if (skills_mod.hasSkillsForTrigger(hs, .on_llm_after)) {
                     const raw_resp = response.contentOrEmpty();
-                    var hook_result = skills_mod.evaluateSkillHook(arena, hs, .on_llm_after, raw_resp) catch skills_mod.SkillHookResult{};
+                    // 1. Run all [action:agent] skills in chain
+                    const agent_skills = skills_mod.collectAgentSkills(arena, hs, .on_llm_after) catch &.{};
+                    defer if (agent_skills.len > 0) arena.free(agent_skills);
+                    var hook_result = self.runSkillSubAgentChain(arena, agent_skills, raw_resp);
                     defer skills_mod.freeHookResult(arena, &hook_result);
 
-                    if (hook_result.action == .agent) {
-                        const agent_result = self.runSkillSubAgent(
-                            arena,
-                            hook_result.content,
-                            raw_resp,
-                        );
-                        skills_mod.freeHookResult(arena, &hook_result);
-                        hook_result = agent_result;
+                    // 2. If chain didn't intercept, run plain skills
+                    if (hook_result.action != .intercept and hook_result.action != .agent_error) {
+                        const effective = if (hook_result.action == .continue_with and hook_result.content.len > 0) hook_result.content else raw_resp;
+                        var plain_result = skills_mod.evaluateSkillHook(arena, hs, .on_llm_after, effective) catch skills_mod.SkillHookResult{};
+                        if (plain_result.action == .continue_with or plain_result.action == .intercept or plain_result.action == .agent_error) {
+                            skills_mod.freeHookResult(arena, &hook_result);
+                            hook_result = plain_result;
+                        } else {
+                            skills_mod.freeHookResult(arena, &plain_result);
+                        }
                     }
 
                     switch (hook_result.action) {
@@ -1405,7 +1426,7 @@ pub const Agent = struct {
                                 llm_after_replacement = try arena.dupe(u8, hook_result.content);
                             }
                         },
-                        .passthrough, .agent => {},
+                        .passthrough, .agent, .async_agent => {},
                     }
                 }
             }
@@ -1633,17 +1654,22 @@ pub const Agent = struct {
                 if (hook_skills) |hs| {
                     if (skills_mod.hasSkillsForTrigger(hs, .on_tool_call_before)) {
                         const tool_ctx = std.fmt.allocPrint(arena, "tool:{s} args:{s}", .{ call.name, call.arguments_json }) catch "";
-                        var hook_result = skills_mod.evaluateSkillHook(arena, hs, .on_tool_call_before, tool_ctx) catch skills_mod.SkillHookResult{};
+                        // 1. Run all [action:agent] skills in chain
+                        const agent_skills = skills_mod.collectAgentSkills(arena, hs, .on_tool_call_before) catch &.{};
+                        defer if (agent_skills.len > 0) arena.free(agent_skills);
+                        var hook_result = self.runSkillSubAgentChain(arena, agent_skills, tool_ctx);
                         defer skills_mod.freeHookResult(arena, &hook_result);
 
-                        if (hook_result.action == .agent) {
-                            const agent_result = self.runSkillSubAgent(
-                                arena,
-                                hook_result.content,
-                                tool_ctx,
-                            );
-                            skills_mod.freeHookResult(arena, &hook_result);
-                            hook_result = agent_result;
+                        // 2. If chain didn't intercept, run plain skills
+                        if (hook_result.action != .intercept and hook_result.action != .agent_error) {
+                            const effective = if (hook_result.action == .continue_with and hook_result.content.len > 0) hook_result.content else tool_ctx;
+                            var plain_result = skills_mod.evaluateSkillHook(arena, hs, .on_tool_call_before, effective) catch skills_mod.SkillHookResult{};
+                            if (plain_result.action == .continue_with or plain_result.action == .intercept or plain_result.action == .agent_error) {
+                                skills_mod.freeHookResult(arena, &hook_result);
+                                hook_result = plain_result;
+                            } else {
+                                skills_mod.freeHookResult(arena, &plain_result);
+                            }
                         }
 
                         switch (hook_result.action) {
@@ -1665,7 +1691,7 @@ pub const Agent = struct {
                                     .tool_call_id = call.tool_call_id,
                                 };
                             },
-                            .continue_with, .passthrough, .agent => {},
+                            .continue_with, .passthrough, .agent, .async_agent => {},
                         }
                     }
                 }
@@ -1689,17 +1715,22 @@ pub const Agent = struct {
                 if (!tool_intercepted) {
                     if (hook_skills) |hs| {
                         if (skills_mod.hasSkillsForTrigger(hs, .on_tool_call_after)) {
-                            var hook_result = skills_mod.evaluateSkillHook(arena, hs, .on_tool_call_after, result.output) catch skills_mod.SkillHookResult{};
+                            // 1. Run all [action:agent] skills in chain
+                            const agent_skills = skills_mod.collectAgentSkills(arena, hs, .on_tool_call_after) catch &.{};
+                            defer if (agent_skills.len > 0) arena.free(agent_skills);
+                            var hook_result = self.runSkillSubAgentChain(arena, agent_skills, result.output);
                             defer skills_mod.freeHookResult(arena, &hook_result);
 
-                            if (hook_result.action == .agent) {
-                                const agent_result = self.runSkillSubAgent(
-                                    arena,
-                                    hook_result.content,
-                                    result.output,
-                                );
-                                skills_mod.freeHookResult(arena, &hook_result);
-                                hook_result = agent_result;
+                            // 2. If chain didn't intercept, run plain skills
+                            if (hook_result.action != .intercept and hook_result.action != .agent_error) {
+                                const effective = if (hook_result.action == .continue_with and hook_result.content.len > 0) hook_result.content else result.output;
+                                var plain_result = skills_mod.evaluateSkillHook(arena, hs, .on_tool_call_after, effective) catch skills_mod.SkillHookResult{};
+                                if (plain_result.action == .continue_with or plain_result.action == .intercept or plain_result.action == .agent_error) {
+                                    skills_mod.freeHookResult(arena, &hook_result);
+                                    hook_result = plain_result;
+                                } else {
+                                    skills_mod.freeHookResult(arena, &plain_result);
+                                }
                             }
 
                             switch (hook_result.action) {
@@ -1713,7 +1744,7 @@ pub const Agent = struct {
                                         };
                                     }
                                 },
-                                .agent_error, .intercept, .passthrough, .agent => {},
+                                .agent_error, .intercept, .passthrough, .agent, .async_agent => {},
                             }
                         }
                     }
@@ -1907,6 +1938,105 @@ pub const Agent = struct {
         return starts_with_ascii_ignore_case(key, "pref.tools.") or
             starts_with_ascii_ignore_case(key, "preference.tools.") or
             std.ascii.eqlIgnoreCase(key, "__bootstrap.prompt.TOOLS.md");
+    }
+
+    /// Static wrapper for `runSkillSubAgent` that matches the `AsyncSkillQueue.RunFn`
+    /// signature so the background worker can call back into the Agent.
+    fn asyncSkillRunFn(ctx: *anyopaque, alloc: std.mem.Allocator, instructions: []const u8, content: []const u8) skills_mod.SkillHookResult {
+        const agent: *Agent = @ptrCast(@alignCast(ctx));
+        return agent.runSkillSubAgent(alloc, instructions, content);
+    }
+
+    /// Run a chain of [action:agent] / [action:asyncAgent] skill hooks in sequence.
+    ///
+    /// Synchronous (`agent`) skills are executed inline via `runSkillSubAgent`.
+    /// The chain obeys short-circuit semantics:
+    ///   - `intercept` / `agent_error` → stop immediately, return that result.
+    ///   - `continue_with` → adopt the modified content for the next skill.
+    ///   - `passthrough` → leave content unchanged, proceed to next skill.
+    ///
+    /// Asynchronous (`async_agent`) skills are enqueued on the Agent's
+    /// `async_skill_queue` and do NOT block the chain or influence the
+    /// pipeline result.
+    ///
+    /// After all skills have been evaluated:
+    ///   - If any skill returned `continue_with`, the final result is
+    ///     `continue_with` with the (cumulatively) modified content.
+    ///   - Otherwise the result is a plain `passthrough` (empty, not owned).
+    pub fn runSkillSubAgentChain(
+        self: *Agent,
+        result_allocator: std.mem.Allocator,
+        agent_skills: []const skills_mod.AgentSkillEntry,
+        initial_content: []const u8,
+    ) skills_mod.SkillHookResult {
+        if (agent_skills.len == 0) {
+            return .{}; // passthrough, empty, not owned
+        }
+
+        var current_content: []const u8 = initial_content;
+        var owns_current: bool = false;
+
+        for (agent_skills) |entry| {
+            // ── asyncAgent: fire-and-forget ──────────────────────────────
+            if (entry.is_async) {
+                log.info(
+                    "sub-agent chain: enqueueing async skill '{s}' | content_len={d}",
+                    .{ entry.name, current_content.len },
+                );
+                // Lazily bind the queue to this Agent on first use.
+                if (!self.async_skill_queue.started) {
+                    self.async_skill_queue.bind(@ptrCast(self), asyncSkillRunFn);
+                }
+                self.async_skill_queue.enqueue(entry.instructions, current_content);
+                continue; // does not affect chain result
+            }
+
+            // ── synchronous agent ───────────────────────────────────────
+            log.info(
+                "sub-agent chain: running skill '{s}' | content_len={d}",
+                .{ entry.name, current_content.len },
+            );
+
+            var result = self.runSkillSubAgent(result_allocator, entry.instructions, current_content);
+
+            switch (result.action) {
+                .intercept, .agent_error => {
+                    // Terminal — free intermediate content and return.
+                    if (owns_current) {
+                        result_allocator.free(@constCast(current_content));
+                    }
+                    return result;
+                },
+                .continue_with => {
+                    // Adopt new content; free the old intermediate if owned.
+                    if (owns_current) {
+                        result_allocator.free(@constCast(current_content));
+                    }
+                    current_content = result.content;
+                    owns_current = result.content_owned;
+                },
+                .passthrough => {
+                    // No change — free the result's content (if any).
+                    skills_mod.freeHookResult(result_allocator, &result);
+                },
+                .agent, .async_agent => {
+                    // Should not happen from runSkillSubAgent; treat as passthrough.
+                    skills_mod.freeHookResult(result_allocator, &result);
+                },
+            }
+        }
+
+        // All skills completed without intercept.
+        if (owns_current) {
+            return .{
+                .action = .continue_with,
+                .content = current_content,
+                .content_owned = true,
+            };
+        }
+
+        // No modifications — plain passthrough.
+        return .{};
     }
 
     /// Run a sub-agent LLM call for an [action:agent] skill hook.

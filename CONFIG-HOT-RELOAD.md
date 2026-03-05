@@ -199,6 +199,73 @@ Global model changed, hot-updating MQTT endpoint 'ddd...'
 Config reload complete
 ```
 
+## Sub-Agent Configuration
+
+The skill sub-agent (used by `[action:agent]` and `[action:asyncAgent]` skills) has a tool-call loop with configurable limits and a smart review mechanism. These settings are in the `agent` section of `config.json`:
+
+```jsonc
+{
+  "agent": {
+    "sub_agent_max_iterations": 128,
+    "sub_agent_review_after": 5
+  }
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `sub_agent_max_iterations` | integer | `128` | Hard limit on tool-call iterations in the sub-agent loop. When exhausted, the sub-agent returns `agent_error`. Set to `0` to use the compiled default (128). |
+| `sub_agent_review_after` | integer | `5` | After this many consecutive tool-call iterations, trigger a lightweight LLM review to decide if the loop is stuck or making progress. Set to `0` to use the compiled default (5). |
+
+### Smart Review: How It Works
+
+When the sub-agent enters a tool-call loop (e.g. calling `shell`, `web_fetch`, etc. repeatedly), the system periodically checks whether the loop is productive:
+
+1. **Trigger**: Every `sub_agent_review_after` consecutive tool-call iterations, a review is triggered.
+2. **Review call**: A separate LLM call receives a summary of all tool calls so far and the sub-agent's original goal.
+3. **Verdict**: The review LLM responds with one of:
+   - `[continue]` -- the loop is making progress, keep going.
+   - `[stop:<reason>]` -- the loop appears stuck; terminate with the given reason as error message.
+4. **Fail-open**: If the review LLM call fails or produces an unparseable response, the loop continues (no false positives).
+5. **Temperature**: Review uses temperature 0.1 for deterministic judgment.
+6. **Scheduling**: Reviews fire at iterations `review_after`, `2 * review_after`, `3 * review_after`, etc. The threshold is clamped to `max_iterations - 1`, so at least one iteration always runs before the first review.
+
+### Runtime Behavior
+
+- `sub_agent_review_after` is clamped to `sub_agent_max_iterations - 1` at runtime.
+- If `sub_agent_max_iterations <= 1`, reviews are effectively disabled (the loop has no room for a review before hitting the hard limit).
+- Both settings are hot-reloadable: changing them in `config.json` takes effect for new sub-agent invocations immediately after the config reload. Running sub-agent calls are not interrupted.
+
+### Example: Tune for a Long-Running Sub-Agent
+
+If you have a skill that legitimately needs many tool calls (e.g. a multi-step research agent):
+
+```json
+{
+  "agent": {
+    "sub_agent_max_iterations": 50,
+    "sub_agent_review_after": 10
+  }
+}
+```
+
+This allows up to 50 tool-call rounds, with progress reviews at iterations 10, 20, 30, and 40.
+
+### Example: Disable Reviews
+
+To disable smart reviews entirely (rely only on the hard iteration limit):
+
+```json
+{
+  "agent": {
+    "sub_agent_max_iterations": 20,
+    "sub_agent_review_after": 20
+  }
+}
+```
+
+Setting `review_after` equal to `max_iterations` means the review would fire at the last iteration, which is effectively the same as no review.
+
 ## Context Auto-Compaction
 
 When `max_context_tokens` is configured (globally or per-endpoint), NullClaw automatically monitors the token count of each session's conversation context. When the limit is reached, context compaction is triggered automatically -- summarizing older messages to free up space while retaining essential context.
