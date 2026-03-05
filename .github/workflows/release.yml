@@ -5,6 +5,11 @@ on:
     tags: ['v*']
     branches: [main]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v2026.3.5). Leave empty for a dev pre-release build.'
+        required: false
+        default: ''
 
 jobs:
   build:
@@ -92,6 +97,9 @@ jobs:
           echo "title=${DATE}.${SHORT_SHA:0:7}" >> $GITHUB_OUTPUT
           if [[ "${{ github.ref_type }}" == "tag" ]]; then
             echo "tag=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+            echo "prerelease=false" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ inputs.tag }}" ]]; then
+            echo "tag=${{ inputs.tag }}" >> $GITHUB_OUTPUT
             echo "prerelease=false" >> $GITHUB_OUTPUT
           else
             VERSION=$(grep -m1 'version' build.zig.zon | sed 's/.*"\(.*\)".*/\1/')
