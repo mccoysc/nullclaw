@@ -291,6 +291,10 @@ pub const Agent = struct {
     compaction_max_summary_chars: u32 = compaction.DEFAULT_COMPACTION_MAX_SUMMARY_CHARS,
     compaction_max_source_chars: u32 = compaction.DEFAULT_COMPACTION_MAX_SOURCE_CHARS,
 
+    /// Maximum iterations for the skill sub-agent turn loop (tool calls only).
+    /// 0 = use compiled default (skills_mod.SUB_AGENT_MAX_ITERATIONS).
+    sub_agent_max_iterations: u32 = 0,
+
     /// Per-turn MCP tool filter groups (slice into config-owned memory; not freed by Agent).
     /// Empty = no filtering; all tool specs are sent as-is.
     tool_filter_groups: []const config_types.ToolFilterGroup = &.{},
@@ -412,6 +416,7 @@ pub const Agent = struct {
             .compaction_max_summary_chars = cfg.agent.compaction_max_summary_chars,
             .compaction_max_source_chars = cfg.agent.compaction_max_source_chars,
             .tool_filter_groups = cfg.agent.tool_filter_groups,
+            .sub_agent_max_iterations = cfg.agent.sub_agent_max_iterations,
             .exec_security = switch (cfg.autonomy.level) {
                 .full => .full,
                 .read_only => .deny,
@@ -546,6 +551,7 @@ pub const Agent = struct {
 
     /// Load workspace skills for hook evaluation.
     /// Returns a slice that must be freed with skills_mod.freeSkills().
+    /// Also consumes any `.reload` sentinel files in the skills directories.
     fn loadSkillsForHooks(self: *Agent) ?[]skills_mod.Skill {
         const home_dir = platform.getHomeDir(self.allocator) catch null;
         defer if (home_dir) |h| self.allocator.free(h);
@@ -554,6 +560,11 @@ pub const Agent = struct {
         else
             null;
         defer if (community_base) |cb| self.allocator.free(cb);
+
+        // Consume reload sentinels (best-effort; result unused here because
+        // skills are always loaded fresh from disk on every turn).
+        if (community_base) |cb| _ = skills_mod.consumeReloadSentinel(self.allocator, cb);
+        _ = skills_mod.consumeReloadSentinel(self.allocator, self.workspace_dir);
 
         if (community_base) |cb| {
             return skills_mod.listSkillsMerged(self.allocator, cb, self.workspace_dir) catch
@@ -1961,8 +1972,9 @@ pub const Agent = struct {
 
         const native_tools_enabled = self.provider.supportsNativeTools();
         var total_iterations: u32 = 0;
+        const max_sub_iterations = if (self.sub_agent_max_iterations > 0) self.sub_agent_max_iterations else skills_mod.SUB_AGENT_MAX_ITERATIONS;
 
-        while (total_iterations < skills_mod.SUB_AGENT_MAX_ITERATIONS) : (total_iterations += 1) {
+        while (total_iterations < max_sub_iterations) : (total_iterations += 1) {
             // Call provider with tools
             const response = self.provider.chat(
                 arena,
@@ -2114,7 +2126,7 @@ pub const Agent = struct {
         log.warn(
             "sub-agent error: max iterations exhausted ({d}) | instructions={s} hook_content={s}",
             .{
-                skills_mod.SUB_AGENT_MAX_ITERATIONS,
+                max_sub_iterations,
                 skill_instructions,
                 hook_content,
             },
