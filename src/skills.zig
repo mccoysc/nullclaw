@@ -730,7 +730,63 @@ pub const sub_agent_system_prompt =
 ;
 
 /// Maximum iterations for the sub-agent turn loop (tool calls only; no format retries).
-pub const SUB_AGENT_MAX_ITERATIONS: u32 = 10;
+pub const SUB_AGENT_MAX_ITERATIONS: u32 = 128;
+
+/// Default number of consecutive tool-call iterations before triggering an
+/// LLM review of the sub-agent loop progress.
+pub const SUB_AGENT_DEFAULT_REVIEW_AFTER: u32 = 5;
+
+/// System prompt used for the sub-agent loop review call.
+/// The LLM is asked to evaluate whether the tool-call chain is making
+/// progress or is stuck, and respond with [continue] or [stop:<reason>].
+pub const sub_agent_review_prompt =
+    \\You are a supervisor reviewing the progress of an automated sub-agent.
+    \\The sub-agent has been executing tool calls in a loop. Below is a summary
+    \\of each tool call and its result so far.
+    \\
+    \\Evaluate whether the sub-agent is making meaningful progress toward its
+    \\goal or is stuck in a repetitive/unproductive loop.
+    \\
+    \\Respond with EXACTLY ONE of the following:
+    \\  [continue] — if the sub-agent appears to be making progress and should keep going.
+    \\  [stop:<reason>] — if the sub-agent appears stuck or is not making progress.
+    \\    Replace <reason> with a brief explanation for the user (1-2 sentences).
+    \\
+    \\Do NOT output anything other than the tag above.
+    \\
+;
+
+/// Result of parsing a sub-agent review LLM response.
+pub const ReviewVerdict = enum {
+    /// The reviewer says the loop should continue.
+    @"continue",
+    /// The reviewer says the loop should stop (reason is captured separately).
+    stop,
+    /// The response could not be parsed into a verdict.
+    unknown,
+};
+
+/// Parse the response from a sub-agent review LLM call.
+/// Expects `[continue]` or `[stop:<reason>]`.  Returns the verdict and,
+/// for `stop`, extracts the reason string (points into `response`).
+pub fn parseReviewResponse(response: []const u8) struct { verdict: ReviewVerdict, reason: []const u8 } {
+    const trimmed = std.mem.trim(u8, response, " \t\r\n");
+
+    // Check for [continue]
+    if (std.mem.indexOf(u8, trimmed, "[continue]") != null) {
+        return .{ .verdict = .@"continue", .reason = "" };
+    }
+
+    // Check for [stop:reason]
+    if (std.mem.indexOf(u8, trimmed, "[stop:")) |start| {
+        const after_tag = trimmed[start + "[stop:".len ..];
+        if (std.mem.indexOfScalar(u8, after_tag, ']')) |end| {
+            return .{ .verdict = .stop, .reason = std.mem.trim(u8, after_tag[0..end], " \t") };
+        }
+    }
+
+    return .{ .verdict = .unknown, .reason = "" };
+}
 
 /// Name of the sentinel file that triggers a skills reload.
 /// When this file exists inside a skills directory, skills are reloaded from
