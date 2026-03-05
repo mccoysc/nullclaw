@@ -737,11 +737,14 @@ pub const SUB_AGENT_MAX_ITERATIONS: u32 = 10;
 /// disk and the file is deleted afterwards.
 const SKILLS_RELOAD_SENTINEL = ".reload";
 
-/// Check for a `.reload` sentinel file in the given skills directory and
-/// delete it if found.  Returns `true` when the sentinel was present (i.e.
-/// a reload was explicitly requested).
-pub fn consumeReloadSentinel(allocator: std.mem.Allocator, skills_dir: []const u8) bool {
-    const sentinel_path = std.fmt.allocPrint(allocator, "{s}/" ++ SKILLS_RELOAD_SENTINEL, .{skills_dir}) catch return false;
+/// Check for a `.reload` sentinel file in the resolved skills directory
+/// (`base_dir/skills/.reload`) and delete it if found.  The `base_dir`
+/// parameter follows the same convention as `listSkills` — the actual
+/// skills subdirectory is `base_dir/skills/`.
+/// Returns `true` when the sentinel was present (i.e. a reload was
+/// explicitly requested).
+pub fn consumeReloadSentinel(allocator: std.mem.Allocator, base_dir: []const u8) bool {
+    const sentinel_path = std.fmt.allocPrint(allocator, "{s}/skills/" ++ SKILLS_RELOAD_SENTINEL, .{base_dir}) catch return false;
     defer allocator.free(sentinel_path);
 
     std.fs.cwd().deleteFile(sentinel_path) catch return false;
