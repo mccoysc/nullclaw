@@ -602,17 +602,22 @@ pub const SessionManager = struct {
 
         if (hook_skills) |hs| {
             if (skills_mod.hasSkillsForTrigger(hs, .on_channel_receive_before)) {
-                var hook_result = skills_mod.evaluateSkillHook(self.allocator, hs, .on_channel_receive_before, content) catch skills_mod.SkillHookResult{};
+                // 1. Run all [action:agent] skills in chain
+                const agent_skills = skills_mod.collectAgentSkills(self.allocator, hs, .on_channel_receive_before) catch &.{};
+                defer if (agent_skills.len > 0) self.allocator.free(agent_skills);
+                var hook_result = session.agent.runSkillSubAgentChain(self.allocator, agent_skills, content);
                 defer skills_mod.freeHookResult(self.allocator, &hook_result);
 
-                if (hook_result.action == .agent) {
-                    const agent_result = session.agent.runSkillSubAgent(
-                        self.allocator,
-                        hook_result.content,
-                        content,
-                    );
-                    skills_mod.freeHookResult(self.allocator, &hook_result);
-                    hook_result = agent_result;
+                // 2. If chain didn't intercept, run plain skills
+                if (hook_result.action != .intercept and hook_result.action != .agent_error) {
+                    const effective = if (hook_result.action == .continue_with and hook_result.content.len > 0) hook_result.content else content;
+                    var plain_result = skills_mod.evaluateSkillHook(self.allocator, hs, .on_channel_receive_before, effective) catch skills_mod.SkillHookResult{};
+                    if (plain_result.action == .continue_with or plain_result.action == .intercept or plain_result.action == .agent_error) {
+                        skills_mod.freeHookResult(self.allocator, &hook_result);
+                        hook_result = plain_result;
+                    } else {
+                        skills_mod.freeHookResult(self.allocator, &plain_result);
+                    }
                 }
 
                 switch (hook_result.action) {
@@ -636,7 +641,7 @@ pub const SessionManager = struct {
                             effective_content_owned = true;
                         }
                     },
-                    .passthrough, .agent => {},
+                    .passthrough, .agent, .async_agent => {},
                 }
             }
         }
@@ -651,17 +656,22 @@ pub const SessionManager = struct {
         var post_receive_owned = false;
         if (hook_skills) |hs| {
             if (skills_mod.hasSkillsForTrigger(hs, .on_channel_receive_after)) {
-                var hook_result = skills_mod.evaluateSkillHook(self.allocator, hs, .on_channel_receive_after, response) catch skills_mod.SkillHookResult{};
+                // 1. Run all [action:agent] skills in chain
+                const agent_skills = skills_mod.collectAgentSkills(self.allocator, hs, .on_channel_receive_after) catch &.{};
+                defer if (agent_skills.len > 0) self.allocator.free(agent_skills);
+                var hook_result = session.agent.runSkillSubAgentChain(self.allocator, agent_skills, response);
                 defer skills_mod.freeHookResult(self.allocator, &hook_result);
 
-                if (hook_result.action == .agent) {
-                    const agent_result = session.agent.runSkillSubAgent(
-                        self.allocator,
-                        hook_result.content,
-                        response,
-                    );
-                    skills_mod.freeHookResult(self.allocator, &hook_result);
-                    hook_result = agent_result;
+                // 2. If chain didn't intercept, run plain skills
+                if (hook_result.action != .intercept and hook_result.action != .agent_error) {
+                    const effective = if (hook_result.action == .continue_with and hook_result.content.len > 0) hook_result.content else response;
+                    var plain_result = skills_mod.evaluateSkillHook(self.allocator, hs, .on_channel_receive_after, effective) catch skills_mod.SkillHookResult{};
+                    if (plain_result.action == .continue_with or plain_result.action == .intercept or plain_result.action == .agent_error) {
+                        skills_mod.freeHookResult(self.allocator, &hook_result);
+                        hook_result = plain_result;
+                    } else {
+                        skills_mod.freeHookResult(self.allocator, &plain_result);
+                    }
                 }
 
                 switch (hook_result.action) {
@@ -685,7 +695,7 @@ pub const SessionManager = struct {
                             return try self.allocator.dupe(u8, hook_result.content);
                         }
                     },
-                    .passthrough, .agent => {},
+                    .passthrough, .agent, .async_agent => {},
                 }
             }
         }
@@ -695,17 +705,22 @@ pub const SessionManager = struct {
         var send_owned = false;
         if (hook_skills) |hs| {
             if (skills_mod.hasSkillsForTrigger(hs, .on_channel_send_before)) {
-                var hook_result = skills_mod.evaluateSkillHook(self.allocator, hs, .on_channel_send_before, post_receive_response) catch skills_mod.SkillHookResult{};
+                // 1. Run all [action:agent] skills in chain
+                const agent_skills = skills_mod.collectAgentSkills(self.allocator, hs, .on_channel_send_before) catch &.{};
+                defer if (agent_skills.len > 0) self.allocator.free(agent_skills);
+                var hook_result = session.agent.runSkillSubAgentChain(self.allocator, agent_skills, post_receive_response);
                 defer skills_mod.freeHookResult(self.allocator, &hook_result);
 
-                if (hook_result.action == .agent) {
-                    const agent_result = session.agent.runSkillSubAgent(
-                        self.allocator,
-                        hook_result.content,
-                        post_receive_response,
-                    );
-                    skills_mod.freeHookResult(self.allocator, &hook_result);
-                    hook_result = agent_result;
+                // 2. If chain didn't intercept, run plain skills
+                if (hook_result.action != .intercept and hook_result.action != .agent_error) {
+                    const effective = if (hook_result.action == .continue_with and hook_result.content.len > 0) hook_result.content else post_receive_response;
+                    var plain_result = skills_mod.evaluateSkillHook(self.allocator, hs, .on_channel_send_before, effective) catch skills_mod.SkillHookResult{};
+                    if (plain_result.action == .continue_with or plain_result.action == .intercept or plain_result.action == .agent_error) {
+                        skills_mod.freeHookResult(self.allocator, &hook_result);
+                        hook_result = plain_result;
+                    } else {
+                        skills_mod.freeHookResult(self.allocator, &plain_result);
+                    }
                 }
 
                 switch (hook_result.action) {
@@ -733,7 +748,7 @@ pub const SessionManager = struct {
                             send_owned = true;
                         }
                     },
-                    .passthrough, .agent => {},
+                    .passthrough, .agent, .async_agent => {},
                 }
             }
         }
@@ -784,16 +799,23 @@ pub const SessionManager = struct {
         // ── on_channel_send_after hook (fire-and-forget, does not modify return) ──
         if (hook_skills) |hs| {
             if (skills_mod.hasSkillsForTrigger(hs, .on_channel_send_after)) {
-                var hook_result = skills_mod.evaluateSkillHook(self.allocator, hs, .on_channel_send_after, final_response) catch skills_mod.SkillHookResult{};
-                if (hook_result.action == .agent) {
-                    const agent_result = session.agent.runSkillSubAgent(
-                        self.allocator,
-                        hook_result.content,
-                        final_response,
-                    );
-                    skills_mod.freeHookResult(self.allocator, &hook_result);
-                    hook_result = agent_result;
+                // 1. Run all [action:agent] skills in chain
+                const agent_skills = skills_mod.collectAgentSkills(self.allocator, hs, .on_channel_send_after) catch &.{};
+                defer if (agent_skills.len > 0) self.allocator.free(agent_skills);
+                var hook_result = session.agent.runSkillSubAgentChain(self.allocator, agent_skills, final_response);
+
+                // 2. If chain didn't intercept, run plain skills
+                if (hook_result.action != .intercept and hook_result.action != .agent_error) {
+                    const effective = if (hook_result.action == .continue_with and hook_result.content.len > 0) hook_result.content else final_response;
+                    var plain_result = skills_mod.evaluateSkillHook(self.allocator, hs, .on_channel_send_after, effective) catch skills_mod.SkillHookResult{};
+                    if (plain_result.action == .continue_with or plain_result.action == .intercept or plain_result.action == .agent_error) {
+                        skills_mod.freeHookResult(self.allocator, &hook_result);
+                        hook_result = plain_result;
+                    } else {
+                        skills_mod.freeHookResult(self.allocator, &plain_result);
+                    }
                 }
+
                 skills_mod.freeHookResult(self.allocator, &hook_result);
                 // on_channel_send_after is observational — response already committed
             }

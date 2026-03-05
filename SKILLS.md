@@ -95,7 +95,7 @@ Each skill fires at exactly one trigger point. The `trigger` field in the manife
 
 ## Skill Modes
 
-There are two modes of operation for skills:
+There are three modes of operation for skills:
 
 ### 1. Plain Mode (Default)
 
@@ -124,9 +124,9 @@ Always respond in French, regardless of the language of the input message.
 When `SKILL.md` starts with `[action:agent]`, a stateless sub-agent is spawned to process the content. The sub-agent receives:
 
 - **System prompt**: built-in processing instructions + your skill's natural-language instructions
-- **User message**: the hook's original content
+- **User message**: the hook's original content (wrapped in `<hook_data>` tags for prompt-injection protection)
 
-The sub-agent can make tool calls (up to 10 iterations) and must output a final decision using one of the behavior tags below.
+The sub-agent can make tool calls and must output a final decision using one of the behavior tags below.
 
 **Example** (`SKILL.md`):
 
@@ -154,12 +154,38 @@ The sub-agent must output exactly one of these tags in its final response:
 - **Tool access**: the sub-agent has access to the same tools as the main agent.
 - **Isolated**: the sub-agent's execution does NOT trigger any skill hooks (prevents infinite recursion).
 - **Temperature**: fixed at 0.3 for deterministic behavior.
-- **Max iterations**: 10 tool-call rounds. If exhausted, returns `agent_error`.
-- **Error handling**: on any error (LLM failure, invalid output format, iterations exhausted), returns `agent_error` immediately with no retries. Detailed error logs include the full input and output for debugging.
+- **Max iterations**: configurable via `sub_agent_max_iterations` (default: 128 tool-call rounds). If exhausted, returns `agent_error`.
+- **Smart review**: after every `sub_agent_review_after` consecutive tool-call iterations (default: 5), an LLM review call evaluates whether the sub-agent loop is making progress or is stuck. If stuck, the loop is terminated early with an error message. See [Configuration](#sub-agent-configuration) for details.
+- **Error handling**: on any error (LLM failure, invalid output format, iterations exhausted, review-terminated), returns `agent_error` immediately with no retries. Detailed error logs include the full input and output for debugging.
 
 #### When Multiple Behavior Tags Appear
 
 If the sub-agent outputs multiple behavior tags (e.g. reasoning with intermediate tags), the **last** tag in the response wins. This allows the agent to "think out loud" before committing to a final decision.
+
+### 3. Async Agent Mode (`[action:asyncAgent]`)
+
+When `SKILL.md` starts with `[action:asyncAgent]`, the skill is executed as a **fire-and-forget** background task. The execution is identical to `[action:agent]` (same sub-agent, same behavior tags), but:
+
+- The main pipeline does **NOT** wait for the result.
+- The result does **NOT** influence the pipeline (no intercept, no content modification).
+- Tasks are enqueued into a single background worker thread (FIFO, sequential execution).
+- Useful for logging, analytics, notifications, or any async side-effect.
+
+**Example** (`SKILL.md`):
+
+```markdown
+[action:asyncAgent]
+You are a logging agent. Analyze the message and log a summary to the audit system.
+Always output [behavior:passthrough] when done.
+```
+
+#### Async Queue Behavior
+
+- **Single worker thread**: one background thread per agent instance, spawned lazily on first enqueue.
+- **FIFO order**: tasks are processed in the order they were enqueued.
+- **Memory safety**: instructions and content are copied on enqueue; the caller's memory can be freed immediately.
+- **In-memory only**: the queue is not persisted to disk. Pending tasks are discarded on shutdown.
+- **Graceful shutdown**: on agent shutdown, the worker finishes the current task, then discards remaining queued tasks.
 
 ## Installation
 
@@ -348,20 +374,77 @@ Output:
 <your rewritten version>
 ```
 
+## Chained Skill Execution
+
+Multiple `[action:agent]` and `[action:asyncAgent]` skills can be registered on the **same hook point**. They are executed as a **chain** in registration order, with short-circuit semantics:
+
+| Sub-agent result | Chain behavior |
+|------------------|----------------|
+| `passthrough` | Content unchanged, proceed to next skill in chain. |
+| `continue_with` | Adopt modified content, pass it to next skill. |
+| `intercept` | **Stop immediately**. Return intercepted content as final result. |
+| `agent_error` | **Stop immediately**. Return error as final result. |
+
+`[action:asyncAgent]` skills in the chain are enqueued to the background worker and do **not** block or influence the chain result.
+
+After all skills in the chain have been evaluated:
+- If any skill returned `continue_with`, the final result uses the cumulatively modified content.
+- If all skills returned `passthrough`, the final result is `passthrough` (original content unchanged).
+
+**Example**: Two agent skills on `on_channel_receive_before`:
+1. `language-check` — intercepts vulgar messages, passes through clean ones.
+2. `translate` — translates non-English messages to English.
+
+If a vulgar message arrives, `language-check` intercepts and the chain stops. If a clean non-English message arrives, `language-check` passes through, then `translate` modifies the content.
+
+Plain mode skills (no `[action:...]` directive) are **not** part of the agent chain. They are always combined (prepended/appended) independently.
+
+## Sub-Agent Configuration
+
+The sub-agent's tool-call loop behavior can be tuned in `config.json` under the `agent` section:
+
+```json
+{
+  "agent": {
+    "sub_agent_max_iterations": 128,
+    "sub_agent_review_after": 5
+  }
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `sub_agent_max_iterations` | integer | `128` | Maximum tool-call iterations for the sub-agent loop. If exhausted, returns `agent_error`. Set to `0` to use the compiled default. |
+| `sub_agent_review_after` | integer | `5` | After this many consecutive tool-call iterations, trigger an LLM review to check if the loop is stuck. The review LLM is asked to output `[continue]` or `[stop:<reason>]`. If `[stop]`, the sub-agent terminates early with an error. Set to `0` to use the compiled default. Clamped to `max_iterations - 1` at runtime; if `max_iterations <= 1`, the review is effectively disabled. |
+
+### Smart Review Mechanism
+
+The smart review is a lightweight LLM call that evaluates the sub-agent's tool-call history:
+
+1. Every `sub_agent_review_after` iterations, a summary of all tool calls so far is sent to the LLM.
+2. The LLM responds with:
+   - `[continue]` — the loop is making progress, keep going.
+   - `[stop:<reason>]` — the loop appears stuck; terminate with the given reason.
+3. If the review LLM call fails or produces an unparseable response, the loop continues (fail-open).
+4. The review uses temperature 0.1 for deterministic judgment.
+
+This prevents sub-agents from getting stuck in infinite tool-call loops while still allowing legitimate long-running tasks to complete.
+
 ## Debugging
 
-When a sub-agent (`[action:agent]`) encounters an error, detailed logs are printed including:
+When a sub-agent (`[action:agent]` or `[action:asyncAgent]`) encounters an error, detailed logs are printed including:
 
 - **Full skill instructions** sent to the sub-agent
 - **Full hook content** (the original content being processed)
 - **Full sub-agent output** (if any response was received)
-- **Error type** (LLM call failure, invalid output format, max iterations exhausted)
+- **Error type** (LLM call failure, invalid output format, max iterations exhausted, review-terminated)
 
 Check nullclaw's log output (stderr) for lines tagged with `skills` scope to diagnose issues.
 
 ## Notes
 
-- Multiple skills can share the same trigger point. For plain mode skills, all matching skills are combined (prepended/appended in order). For agent mode, the first `[action:agent]` skill at a trigger point wins.
+- Multiple skills can share the same trigger point. For plain mode skills, all matching skills are combined (prepended/appended in order). For agent mode, multiple `[action:agent]` / `[action:asyncAgent]` skills are executed as a chain (see [Chained Skill Execution](#chained-skill-execution)).
 - The `on_channel_send_after` hook is fire-and-forget: it executes after the response is already sent and cannot modify the sent content.
 - Environment variable `NULLCLAW_HOME` controls the config directory (default: `~/.nullclaw`). Skills are loaded from `$NULLCLAW_HOME/workspace/skills/`.
 - Unrecognized `[action:xxx]` directives produce a warning log and are treated as plain skill instructions.
+- Skills are reloaded when a `.reload` sentinel file is detected in the skills directory (`$NULLCLAW_HOME/workspace/skills/.reload`). Create this file to trigger a reload; it is automatically deleted after processing.

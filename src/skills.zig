@@ -92,6 +92,10 @@ pub const SkillHookAction = enum {
     /// the hook's original content becomes the user message.
     /// The sub-agent decides the final behavior (passthrough / intercept / continue / error).
     agent,
+    /// Fire-and-forget variant of `agent`.  Execution logic is identical but
+    /// the caller does NOT wait for the result and does NOT let it influence
+    /// the pipeline.  Useful for logging, analytics, or async side-effects.
+    async_agent,
 };
 
 /// Result of evaluating a skill hook.
@@ -586,6 +590,11 @@ pub fn parseHookAction(instructions: []const u8) ?SkillHookResult {
         const content = std.mem.trimLeft(u8, rest, " \t\r\n");
         return .{ .action = .agent, .content = content };
     }
+    if (std.mem.startsWith(u8, trimmed, "[action:asyncAgent]")) {
+        const rest = trimmed["[action:asyncAgent]".len..];
+        const content = std.mem.trimLeft(u8, rest, " \t\r\n");
+        return .{ .action = .async_agent, .content = content };
+    }
     // Warn on unrecognized [action:xxx] directives so skill authors notice typos
     // or removed action types (e.g. [action:replace], [action:compact]).
     if (std.mem.startsWith(u8, trimmed, "[action:")) {
@@ -597,13 +606,12 @@ pub fn parseHookAction(instructions: []const u8) ?SkillHookResult {
     return null;
 }
 
-/// Evaluate skill hooks for a given trigger point against the provided content.
+/// Evaluate **plain** (non-agent) skill hooks for a given trigger point.
 ///
-/// Two modes:
-///   1. `[action:agent]<instructions>` — returns `.agent` with instructions as content.
-///      The caller is responsible for invoking the sub-agent LLM call.
-///   2. No directive (plain skill) — default prepend (before hooks) / append (after hooks)
-///      of skill instructions into the content, returned as `.continue_with`.
+/// [action:agent] skills are deliberately skipped here — they must be
+/// collected via `collectAgentSkills` and executed as a sub-agent chain
+/// by the caller.  This function only handles skills without an action
+/// directive, using the default prepend (before) / append (after) behaviour.
 ///
 /// Returns an owned SkillHookResult; caller must free content if content_owned is true.
 pub fn evaluateSkillHook(
@@ -612,30 +620,19 @@ pub fn evaluateSkillHook(
     trigger: SkillTrigger,
     content: []const u8,
 ) !SkillHookResult {
-    var matched_any = false;
+    var matched_plain = false;
 
-    // First pass: check for [action:agent] skills (first one wins)
+    // Check if there are any non-agent (plain) skills for this trigger.
     for (skills_slice) |skill| {
         if (skill.trigger != trigger or !skill.enabled or !skill.available) continue;
         if (skill.instructions.len == 0) continue;
-        matched_any = true;
-
-        if (parseHookAction(skill.instructions)) |result| {
-            if (result.action == .agent) {
-                return .{
-                    .action = .agent,
-                    .content = if (result.content.len > 0)
-                        try allocator.dupe(u8, result.content)
-                    else
-                        try allocator.dupe(u8, ""),
-                    .content_owned = true,
-                };
-            }
-        }
+        if (parseHookAction(skill.instructions) != null) continue; // skip agent skills
+        matched_plain = true;
+        break;
     }
 
-    if (!matched_any) {
-        // No matching skills — passthrough with original content
+    if (!matched_plain) {
+        // No matching plain skills — passthrough with original content
         return .{
             .action = .passthrough,
             .content = try allocator.dupe(u8, content),
@@ -643,8 +640,7 @@ pub fn evaluateSkillHook(
         };
     }
 
-    // Second pass: no agent directives found, use default prepend/append behavior.
-    // Build the modified content with skill instructions wrapped in tags.
+    // Build the modified content with plain skill instructions wrapped in tags.
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(allocator);
 
@@ -912,7 +908,7 @@ pub fn parseSubAgentResponse(allocator: std.mem.Allocator, response: []const u8)
                     .content_owned = true,
                 };
             },
-            .agent => {},
+            .agent, .async_agent => {},
         }
     }
 
@@ -972,6 +968,188 @@ pub fn freeHookResult(allocator: std.mem.Allocator, result: *const SkillHookResu
     if (result.content_owned) {
         allocator.free(result.content);
     }
+}
+
+// ── Async Skill Queue ──────────────────────────────────────────────
+
+/// A thread-safe FIFO queue for fire-and-forget [action:asyncAgent] skill
+/// tasks.  A single background worker thread drains the queue sequentially;
+/// new tasks are enqueued without blocking the caller.
+///
+/// The queue does NOT own the Agent — the caller must ensure the Agent
+/// outlives the queue (in practice the queue is a field on the Agent and
+/// is shut down in Agent.deinit before any Agent resources are freed).
+pub const AsyncSkillQueue = struct {
+    const Task = struct {
+        instructions: []const u8, // owned copy
+        content: []const u8, // owned copy
+    };
+
+    /// Opaque callback type: `fn(*anyopaque, std.mem.Allocator, []const u8, []const u8) SkillHookResult`
+    /// Signature: runFn(agent_ctx, allocator, instructions, content) → result
+    const RunFn = *const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8) SkillHookResult;
+
+    allocator: std.mem.Allocator,
+    mutex: std.Thread.Mutex = .{},
+    cond: std.Thread.Condition = .{},
+    tasks: std.ArrayListUnmanaged(Task) = .empty,
+    shutdown: bool = false,
+    worker: ?std.Thread = null,
+    /// Opaque pointer to the Agent (passed to run_fn).
+    agent_ctx: *anyopaque = undefined,
+    /// Function that executes a single sub-agent call.
+    run_fn: RunFn = undefined,
+    started: bool = false,
+
+    pub fn init(allocator: std.mem.Allocator) AsyncSkillQueue {
+        return .{ .allocator = allocator };
+    }
+
+    /// Bind the queue to an agent context and its run function.
+    /// Must be called before the first `enqueue`.
+    pub fn bind(self: *AsyncSkillQueue, agent_ctx: *anyopaque, run_fn: RunFn) void {
+        self.agent_ctx = agent_ctx;
+        self.run_fn = run_fn;
+    }
+
+    /// Enqueue a fire-and-forget sub-agent task.  The instructions and
+    /// content are copied into owned allocations; the caller's originals
+    /// can be freed immediately.  Starts the background worker on first use.
+    pub fn enqueue(self: *AsyncSkillQueue, instructions: []const u8, content: []const u8) void {
+        const instr_copy = self.allocator.dupe(u8, instructions) catch {
+            log.warn("asyncAgent: failed to copy instructions (OOM), dropping task", .{});
+            return;
+        };
+        const content_copy = self.allocator.dupe(u8, content) catch {
+            self.allocator.free(instr_copy);
+            log.warn("asyncAgent: failed to copy content (OOM), dropping task", .{});
+            return;
+        };
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        self.tasks.append(self.allocator, .{
+            .instructions = instr_copy,
+            .content = content_copy,
+        }) catch {
+            self.allocator.free(instr_copy);
+            self.allocator.free(content_copy);
+            log.warn("asyncAgent: failed to enqueue task (OOM), dropping", .{});
+            return;
+        };
+
+        // Lazily start the worker thread on first enqueue.
+        if (!self.started) {
+            self.worker = std.Thread.spawn(.{}, workerLoop, .{self}) catch |err| {
+                log.warn("asyncAgent: failed to spawn worker thread: {s}", .{@errorName(err)});
+                // Remove the task we just added since nobody will process it.
+                if (self.tasks.items.len > 0) {
+                    const last = self.tasks.items[self.tasks.items.len - 1];
+                    self.tasks.items.len -= 1;
+                    self.allocator.free(last.instructions);
+                    self.allocator.free(last.content);
+                }
+                return;
+            };
+            self.started = true;
+        }
+
+        self.cond.signal();
+    }
+
+    /// Shut down the worker thread and discard any remaining tasks.
+    /// Blocks until the worker has exited.
+    pub fn deinit(self: *AsyncSkillQueue) void {
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            self.shutdown = true;
+            self.cond.signal();
+        }
+        if (self.worker) |w| w.join();
+
+        // Free any remaining queued tasks.
+        for (self.tasks.items) |task| {
+            self.allocator.free(task.instructions);
+            self.allocator.free(task.content);
+        }
+        self.tasks.deinit(self.allocator);
+    }
+
+    /// Number of pending tasks (for diagnostics / testing).
+    pub fn pendingCount(self: *AsyncSkillQueue) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.tasks.items.len;
+    }
+
+    fn workerLoop(self: *AsyncSkillQueue) void {
+        while (true) {
+            var task: Task = undefined;
+            {
+                self.mutex.lock();
+                defer self.mutex.unlock();
+
+                while (self.tasks.items.len == 0 and !self.shutdown) {
+                    self.cond.wait(&self.mutex);
+                }
+                if (self.shutdown and self.tasks.items.len == 0) return;
+                task = self.tasks.orderedRemove(0);
+            }
+
+            // Execute outside the lock so new tasks can be enqueued concurrently.
+            log.info("asyncAgent worker: executing task | instructions_len={d} content_len={d}", .{
+                task.instructions.len,
+                task.content.len,
+            });
+            var result = self.run_fn(self.agent_ctx, self.allocator, task.instructions, task.content);
+            freeHookResult(self.allocator, &result);
+            self.allocator.free(task.instructions);
+            self.allocator.free(task.content);
+        }
+    }
+};
+
+/// Entry describing a single [action:agent] or [action:asyncAgent] skill to be run in a chain.
+pub const AgentSkillEntry = struct {
+    /// Skill name (borrowed — points into the Skill slice; do NOT free).
+    name: []const u8,
+    /// Skill instructions after stripping the [action:agent] prefix
+    /// (borrowed — points into Skill.instructions; do NOT free).
+    instructions: []const u8,
+    /// When true, this skill should be executed asynchronously (fire-and-forget).
+    is_async: bool = false,
+};
+
+/// Collect all [action:agent] skills that match the given trigger.
+/// Returns a caller-owned slice of AgentSkillEntry. The string fields
+/// inside each entry are borrowed from the original `skills_slice` and
+/// must NOT be freed independently.
+pub fn collectAgentSkills(
+    allocator: std.mem.Allocator,
+    skills_slice: []const Skill,
+    trigger: SkillTrigger,
+) ![]AgentSkillEntry {
+    var entries: std.ArrayListUnmanaged(AgentSkillEntry) = .empty;
+    errdefer entries.deinit(allocator);
+
+    for (skills_slice) |skill| {
+        if (skill.trigger != trigger or !skill.enabled or !skill.available) continue;
+        if (skill.instructions.len == 0) continue;
+
+        if (parseHookAction(skill.instructions)) |result| {
+            if (result.action == .agent or result.action == .async_agent) {
+                try entries.append(allocator, .{
+                    .name = skill.name,
+                    .instructions = result.content,
+                    .is_async = result.action == .async_agent,
+                });
+            }
+        }
+    }
+
+    return try entries.toOwnedSlice(allocator);
 }
 
 /// Check whether any skills match the given trigger.
@@ -4563,17 +4741,18 @@ test "evaluateSkillHook passthrough when skill has different trigger" {
     try std.testing.expectEqual(SkillHookAction.passthrough, result.action);
 }
 
-test "evaluateSkillHook agent returns skill instructions" {
+test "evaluateSkillHook skips agent skills and returns passthrough" {
     const allocator = std.testing.allocator;
     const skills_slice: []const Skill = &.{Skill{
         .name = "translator",
         .trigger = .on_llm_before,
         .instructions = "[action:agent]Translate to English",
     }};
+    // evaluateSkillHook now skips [action:agent] skills — they are handled
+    // separately via collectAgentSkills + runSkillSubAgentChain.
     const result = try evaluateSkillHook(allocator, skills_slice, .on_llm_before, "original");
     defer freeHookResult(allocator, &result);
-    try std.testing.expectEqual(SkillHookAction.agent, result.action);
-    try std.testing.expectEqualStrings("Translate to English", result.content);
+    try std.testing.expectEqual(SkillHookAction.passthrough, result.action);
 }
 
 test "evaluateSkillHook default prepends for before trigger" {
@@ -4639,20 +4818,20 @@ test "evaluateSkillHook skips unavailable skills" {
     try std.testing.expectEqual(SkillHookAction.passthrough, result.action);
 }
 
-test "evaluateSkillHook agent action for on_llm_request" {
+test "evaluateSkillHook skips agent action for on_llm_request" {
     const allocator = std.testing.allocator;
     const skills_slice: []const Skill = &.{Skill{
         .name = "request-processor",
         .trigger = .on_llm_request,
         .instructions = "[action:agent]Compress context if too long",
     }};
+    // Agent skills are now skipped by evaluateSkillHook; handled by collectAgentSkills.
     const result = try evaluateSkillHook(allocator, skills_slice, .on_llm_request, "");
     defer freeHookResult(allocator, &result);
-    try std.testing.expectEqual(SkillHookAction.agent, result.action);
-    try std.testing.expectEqualStrings("Compress context if too long", result.content);
+    try std.testing.expectEqual(SkillHookAction.passthrough, result.action);
 }
 
-test "evaluateSkillHook first agent skill wins" {
+test "evaluateSkillHook plain skill works alongside agent skill" {
     const allocator = std.testing.allocator;
     const skills_slice: []const Skill = &.{
         Skill{
@@ -4666,10 +4845,13 @@ test "evaluateSkillHook first agent skill wins" {
             .instructions = "[action:agent]Agent instructions",
         },
     };
+    // evaluateSkillHook now only processes plain skills; agent skills are skipped.
     const result = try evaluateSkillHook(allocator, skills_slice, .on_llm_before, "content");
     defer freeHookResult(allocator, &result);
-    try std.testing.expectEqual(SkillHookAction.agent, result.action);
-    try std.testing.expectEqualStrings("Agent instructions", result.content);
+    try std.testing.expectEqual(SkillHookAction.continue_with, result.action);
+    // Plain skill instructions should be present, agent instructions should not.
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "Plain skill instructions") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "Agent instructions") == null);
 }
 
 // ── hasSkillsForTrigger Tests ───────────────────────────────────
@@ -4734,4 +4916,480 @@ test "freeHookResult skips non-owned content" {
     };
     // Should not crash or leak
     freeHookResult(allocator, &result);
+}
+
+// ══════════════════════════════════════════════════════════════════
+// ── Chained Skill Execution & AsyncAgent Tests ──────────────────
+// ══════════════════════════════════════════════════════════════════
+
+// ── parseHookAction: asyncAgent ─────────────────────────────────
+
+test "parseHookAction parses asyncAgent with instructions" {
+    const result = parseHookAction("[action:asyncAgent]Log this message for analytics") orelse unreachable;
+    try std.testing.expectEqual(SkillHookAction.async_agent, result.action);
+    try std.testing.expectEqualStrings("Log this message for analytics", result.content);
+}
+
+test "parseHookAction parses asyncAgent with empty instructions" {
+    const result = parseHookAction("[action:asyncAgent]") orelse unreachable;
+    try std.testing.expectEqual(SkillHookAction.async_agent, result.action);
+    try std.testing.expectEqualStrings("", result.content);
+}
+
+test "parseHookAction parses asyncAgent with leading whitespace" {
+    const result = parseHookAction("  \n  [action:asyncAgent]Do something async") orelse unreachable;
+    try std.testing.expectEqual(SkillHookAction.async_agent, result.action);
+    try std.testing.expectEqualStrings("Do something async", result.content);
+}
+
+test "parseHookAction parses asyncAgent with multiline instructions" {
+    const input = "[action:asyncAgent]Line one\nLine two\nLine three";
+    const result = parseHookAction(input) orelse unreachable;
+    try std.testing.expectEqual(SkillHookAction.async_agent, result.action);
+    try std.testing.expectEqualStrings("Line one\nLine two\nLine three", result.content);
+}
+
+test "parseHookAction still returns null for unsupported action types" {
+    try std.testing.expect(parseHookAction("[action:unknown]content") == null);
+    try std.testing.expect(parseHookAction("[action:sync]content") == null);
+    try std.testing.expect(parseHookAction("[action:AGENT]content") == null); // case-sensitive
+    try std.testing.expect(parseHookAction("[action:AsyncAgent]content") == null); // case-sensitive
+}
+
+test "parseHookAction agent and asyncAgent are distinct" {
+    const agent_result = parseHookAction("[action:agent]instructions") orelse unreachable;
+    const async_result = parseHookAction("[action:asyncAgent]instructions") orelse unreachable;
+    try std.testing.expectEqual(SkillHookAction.agent, agent_result.action);
+    try std.testing.expectEqual(SkillHookAction.async_agent, async_result.action);
+    try std.testing.expect(agent_result.action != async_result.action);
+}
+
+// ── collectAgentSkills ──────────────────────────────────────────
+
+test "collectAgentSkills collects both agent and async_agent skills" {
+    const allocator = std.testing.allocator;
+    const skills_slice: []const Skill = &.{
+        Skill{
+            .name = "sync-skill",
+            .trigger = .on_llm_before,
+            .instructions = "[action:agent]Check content",
+        },
+        Skill{
+            .name = "async-skill",
+            .trigger = .on_llm_before,
+            .instructions = "[action:asyncAgent]Log content",
+        },
+    };
+    const entries = try collectAgentSkills(allocator, skills_slice, .on_llm_before);
+    defer allocator.free(entries);
+
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+
+    // First: sync agent
+    try std.testing.expectEqualStrings("sync-skill", entries[0].name);
+    try std.testing.expectEqualStrings("Check content", entries[0].instructions);
+    try std.testing.expect(!entries[0].is_async);
+
+    // Second: async agent
+    try std.testing.expectEqualStrings("async-skill", entries[1].name);
+    try std.testing.expectEqualStrings("Log content", entries[1].instructions);
+    try std.testing.expect(entries[1].is_async);
+}
+
+test "collectAgentSkills sets is_async only for asyncAgent" {
+    const allocator = std.testing.allocator;
+    const skills_slice: []const Skill = &.{
+        Skill{
+            .name = "agent-only",
+            .trigger = .on_channel_receive_before,
+            .instructions = "[action:agent]Moderate content",
+        },
+    };
+    const entries = try collectAgentSkills(allocator, skills_slice, .on_channel_receive_before);
+    defer allocator.free(entries);
+
+    try std.testing.expectEqual(@as(usize, 1), entries.len);
+    try std.testing.expect(!entries[0].is_async);
+}
+
+test "collectAgentSkills skips plain skills" {
+    const allocator = std.testing.allocator;
+    const skills_slice: []const Skill = &.{
+        Skill{
+            .name = "plain",
+            .trigger = .on_llm_before,
+            .instructions = "Just plain instructions",
+        },
+        Skill{
+            .name = "agent",
+            .trigger = .on_llm_before,
+            .instructions = "[action:agent]Agent instructions",
+        },
+    };
+    const entries = try collectAgentSkills(allocator, skills_slice, .on_llm_before);
+    defer allocator.free(entries);
+
+    try std.testing.expectEqual(@as(usize, 1), entries.len);
+    try std.testing.expectEqualStrings("agent", entries[0].name);
+}
+
+test "collectAgentSkills skips disabled and unavailable skills" {
+    const allocator = std.testing.allocator;
+    const skills_slice: []const Skill = &.{
+        Skill{
+            .name = "disabled-agent",
+            .trigger = .on_llm_before,
+            .instructions = "[action:agent]Disabled",
+            .enabled = false,
+        },
+        Skill{
+            .name = "unavail-async",
+            .trigger = .on_llm_before,
+            .instructions = "[action:asyncAgent]Unavailable",
+            .available = false,
+        },
+    };
+    const entries = try collectAgentSkills(allocator, skills_slice, .on_llm_before);
+    defer allocator.free(entries);
+
+    try std.testing.expectEqual(@as(usize, 0), entries.len);
+}
+
+test "collectAgentSkills only matches given trigger" {
+    const allocator = std.testing.allocator;
+    const skills_slice: []const Skill = &.{
+        Skill{
+            .name = "wrong-trigger",
+            .trigger = .on_llm_after,
+            .instructions = "[action:agent]Wrong trigger",
+        },
+        Skill{
+            .name = "right-trigger",
+            .trigger = .on_llm_before,
+            .instructions = "[action:asyncAgent]Right trigger",
+        },
+    };
+    const entries = try collectAgentSkills(allocator, skills_slice, .on_llm_before);
+    defer allocator.free(entries);
+
+    try std.testing.expectEqual(@as(usize, 1), entries.len);
+    try std.testing.expectEqualStrings("right-trigger", entries[0].name);
+}
+
+test "collectAgentSkills returns empty for no matching skills" {
+    const allocator = std.testing.allocator;
+    const skills_slice: []const Skill = &.{};
+    const entries = try collectAgentSkills(allocator, skills_slice, .on_llm_before);
+    defer allocator.free(entries);
+
+    try std.testing.expectEqual(@as(usize, 0), entries.len);
+}
+
+// ── evaluateSkillHook: skips both agent and async_agent ─────────
+
+test "evaluateSkillHook skips async_agent skills" {
+    const allocator = std.testing.allocator;
+    const skills_slice: []const Skill = &.{Skill{
+        .name = "async-only",
+        .trigger = .on_llm_before,
+        .instructions = "[action:asyncAgent]Fire and forget",
+    }};
+    const result = try evaluateSkillHook(allocator, skills_slice, .on_llm_before, "content");
+    defer freeHookResult(allocator, &result);
+    // async_agent skill is skipped by evaluateSkillHook — treated as passthrough
+    try std.testing.expectEqual(SkillHookAction.passthrough, result.action);
+}
+
+test "evaluateSkillHook skips agent skills leaving only plain" {
+    const allocator = std.testing.allocator;
+    const skills_slice: []const Skill = &.{
+        Skill{
+            .name = "agent-skill",
+            .trigger = .on_llm_before,
+            .instructions = "[action:agent]Agent only",
+        },
+        Skill{
+            .name = "plain-skill",
+            .trigger = .on_llm_before,
+            .instructions = "Plain instructions here",
+        },
+    };
+    const result = try evaluateSkillHook(allocator, skills_slice, .on_llm_before, "original");
+    defer freeHookResult(allocator, &result);
+    // Should get continue_with from the plain skill
+    try std.testing.expectEqual(SkillHookAction.continue_with, result.action);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "Plain instructions here") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "original") != null);
+    // Agent instructions should NOT appear
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "Agent only") == null);
+}
+
+test "evaluateSkillHook skips both agent and asyncAgent leaving passthrough" {
+    const allocator = std.testing.allocator;
+    const skills_slice: []const Skill = &.{
+        Skill{
+            .name = "sync-agent",
+            .trigger = .on_llm_before,
+            .instructions = "[action:agent]Sync agent",
+        },
+        Skill{
+            .name = "async-agent",
+            .trigger = .on_llm_before,
+            .instructions = "[action:asyncAgent]Async agent",
+        },
+    };
+    const result = try evaluateSkillHook(allocator, skills_slice, .on_llm_before, "unchanged");
+    defer freeHookResult(allocator, &result);
+    try std.testing.expectEqual(SkillHookAction.passthrough, result.action);
+}
+
+// ── parseSubAgentResponse ───────────────────────────────────────
+
+test "parseSubAgentResponse intercept with content" {
+    const allocator = std.testing.allocator;
+    const result = try parseSubAgentResponse(allocator, "[behavior:intercept]\nBlocked!");
+    defer freeHookResult(allocator, &result);
+    try std.testing.expectEqual(SkillHookAction.intercept, result.action);
+    try std.testing.expectEqualStrings("Blocked!", result.content);
+}
+
+test "parseSubAgentResponse continue_with replaces content" {
+    const allocator = std.testing.allocator;
+    const result = try parseSubAgentResponse(allocator, "[behavior:continue]\nModified content here");
+    defer freeHookResult(allocator, &result);
+    try std.testing.expectEqual(SkillHookAction.continue_with, result.action);
+    try std.testing.expectEqualStrings("Modified content here", result.content);
+}
+
+test "parseSubAgentResponse passthrough returns passthrough" {
+    const allocator = std.testing.allocator;
+    const result = try parseSubAgentResponse(allocator, "[behavior:passthrough]");
+    defer freeHookResult(allocator, &result);
+    try std.testing.expectEqual(SkillHookAction.passthrough, result.action);
+}
+
+test "parseSubAgentResponse error with message" {
+    const allocator = std.testing.allocator;
+    const result = try parseSubAgentResponse(allocator, "[behavior:error]\nSomething went wrong");
+    defer freeHookResult(allocator, &result);
+    try std.testing.expectEqual(SkillHookAction.agent_error, result.action);
+    try std.testing.expectEqualStrings("Something went wrong", result.content);
+}
+
+test "parseSubAgentResponse last tag wins when multiple present" {
+    const allocator = std.testing.allocator;
+    const input = "[behavior:passthrough]\nThinking...\n[behavior:intercept]\nFinal answer";
+    const result = try parseSubAgentResponse(allocator, input);
+    defer freeHookResult(allocator, &result);
+    try std.testing.expectEqual(SkillHookAction.intercept, result.action);
+    try std.testing.expectEqualStrings("Final answer", result.content);
+}
+
+test "parseSubAgentResponse continue with empty content becomes passthrough" {
+    const allocator = std.testing.allocator;
+    const result = try parseSubAgentResponse(allocator, "[behavior:continue]");
+    defer freeHookResult(allocator, &result);
+    try std.testing.expectEqual(SkillHookAction.passthrough, result.action);
+}
+
+test "parseSubAgentResponse empty input returns passthrough" {
+    const allocator = std.testing.allocator;
+    const result = try parseSubAgentResponse(allocator, "");
+    defer freeHookResult(allocator, &result);
+    try std.testing.expectEqual(SkillHookAction.passthrough, result.action);
+}
+
+// ── hasValidBehaviorTag ─────────────────────────────────────────
+
+test "hasValidBehaviorTag detects all tag types" {
+    try std.testing.expect(hasValidBehaviorTag("[behavior:passthrough]"));
+    try std.testing.expect(hasValidBehaviorTag("[behavior:intercept]\ncontent"));
+    try std.testing.expect(hasValidBehaviorTag("[behavior:continue]\nmodified"));
+    try std.testing.expect(hasValidBehaviorTag("[behavior:error]\nerror msg"));
+    try std.testing.expect(!hasValidBehaviorTag("no tags here"));
+    try std.testing.expect(!hasValidBehaviorTag("[behavior:unknown]"));
+    try std.testing.expect(!hasValidBehaviorTag(""));
+}
+
+// ── parseReviewResponse ─────────────────────────────────────────
+
+test "parseReviewResponse detects continue" {
+    const result = parseReviewResponse("[continue]");
+    try std.testing.expectEqual(ReviewVerdict.@"continue", result.verdict);
+}
+
+test "parseReviewResponse detects stop with reason" {
+    const result = parseReviewResponse("[stop:The loop is stuck repeating the same query]");
+    try std.testing.expectEqual(ReviewVerdict.stop, result.verdict);
+    try std.testing.expectEqualStrings("The loop is stuck repeating the same query", result.reason);
+}
+
+test "parseReviewResponse handles unknown verdict" {
+    const result = parseReviewResponse("I think we should keep going");
+    try std.testing.expectEqual(ReviewVerdict.unknown, result.verdict);
+}
+
+test "parseReviewResponse handles whitespace around tags" {
+    const result = parseReviewResponse("  \n  [continue]  \n  ");
+    try std.testing.expectEqual(ReviewVerdict.@"continue", result.verdict);
+}
+
+// ── AsyncSkillQueue ─────────────────────────────────────────────
+
+test "AsyncSkillQueue init and deinit without use" {
+    const allocator = std.testing.allocator;
+    var q = AsyncSkillQueue.init(allocator);
+    q.deinit();
+    // Should not crash or leak — no tasks were enqueued.
+}
+
+test "AsyncSkillQueue enqueue and process tasks" {
+    const allocator = std.testing.allocator;
+
+    // Counter to track how many tasks the "run function" has processed.
+    const Context = struct {
+        var processed: u32 = 0;
+
+        fn reset() void {
+            @This().processed = 0;
+        }
+
+        fn runFn(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8) SkillHookResult {
+            _ = @atomicRmw(u32, &@This().processed, .Add, 1, .seq_cst);
+            return .{ .action = .passthrough };
+        }
+    };
+    Context.reset();
+
+    var ctx_val: u8 = 0; // dummy context
+    var q = AsyncSkillQueue.init(allocator);
+    q.bind(@ptrCast(&ctx_val), Context.runFn);
+
+    // Enqueue 3 tasks
+    q.enqueue("instr1", "content1");
+    q.enqueue("instr2", "content2");
+    q.enqueue("instr3", "content3");
+
+    // Shut down (blocks until worker finishes all tasks)
+    q.deinit();
+
+    try std.testing.expectEqual(@as(u32, 3), Context.processed);
+}
+
+test "AsyncSkillQueue lazy worker spawn" {
+    const allocator = std.testing.allocator;
+    var q = AsyncSkillQueue.init(allocator);
+
+    // Worker should not be started before first enqueue
+    try std.testing.expect(!q.started);
+    try std.testing.expect(q.worker == null);
+
+    q.deinit();
+}
+
+test "AsyncSkillQueue pending count" {
+    const allocator = std.testing.allocator;
+
+    // Use a run function that blocks on a mutex so we can observe pending count
+    const Context = struct {
+        var gate: std.Thread.Mutex = .{};
+
+        fn reset() void {
+            @This().gate = .{};
+        }
+
+        fn runFn(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8) SkillHookResult {
+            // Block until the gate is unlocked
+            @This().gate.lock();
+            @This().gate.unlock();
+            return .{ .action = .passthrough };
+        }
+    };
+    Context.reset();
+
+    var ctx_val: u8 = 0;
+    var q = AsyncSkillQueue.init(allocator);
+    q.bind(@ptrCast(&ctx_val), Context.runFn);
+
+    // Lock the gate so the worker blocks on the first task
+    Context.gate.lock();
+
+    q.enqueue("instr1", "content1");
+
+    // Give the worker thread a moment to start and pick up the first task
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+
+    // Enqueue more while worker is blocked
+    q.enqueue("instr2", "content2");
+    q.enqueue("instr3", "content3");
+
+    // At least 2 should be pending (worker is blocked on first)
+    const pending = q.pendingCount();
+    try std.testing.expect(pending >= 2);
+
+    // Unlock the gate and shut down
+    Context.gate.unlock();
+    q.deinit();
+}
+
+// ── AgentSkillEntry ─────────────────────────────────────────────
+
+test "AgentSkillEntry default is_async is false" {
+    const entry = AgentSkillEntry{
+        .name = "test",
+        .instructions = "test",
+    };
+    try std.testing.expect(!entry.is_async);
+}
+
+// ── Multiple plain skills combine correctly ─────────────────────
+
+test "evaluateSkillHook combines multiple plain skills for before trigger" {
+    const allocator = std.testing.allocator;
+    const skills_slice: []const Skill = &.{
+        Skill{
+            .name = "skill-a",
+            .trigger = .on_llm_before,
+            .instructions = "Instruction A",
+        },
+        Skill{
+            .name = "skill-b",
+            .trigger = .on_llm_before,
+            .instructions = "Instruction B",
+        },
+    };
+    const result = try evaluateSkillHook(allocator, skills_slice, .on_llm_before, "user message");
+    defer freeHookResult(allocator, &result);
+    try std.testing.expectEqual(SkillHookAction.continue_with, result.action);
+    // Both instructions should be present
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "Instruction A") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "Instruction B") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "user message") != null);
+    // Instructions should come before original content
+    const a_pos = std.mem.indexOf(u8, result.content, "Instruction A").?;
+    const msg_pos = std.mem.indexOf(u8, result.content, "user message").?;
+    try std.testing.expect(a_pos < msg_pos);
+}
+
+test "evaluateSkillHook combines multiple plain skills for after trigger" {
+    const allocator = std.testing.allocator;
+    const skills_slice: []const Skill = &.{
+        Skill{
+            .name = "post-a",
+            .trigger = .on_llm_after,
+            .instructions = "Post-process A",
+        },
+        Skill{
+            .name = "post-b",
+            .trigger = .on_llm_after,
+            .instructions = "Post-process B",
+        },
+    };
+    const result = try evaluateSkillHook(allocator, skills_slice, .on_llm_after, "llm output");
+    defer freeHookResult(allocator, &result);
+    try std.testing.expectEqual(SkillHookAction.continue_with, result.action);
+    // Original content should come before instructions
+    const output_pos = std.mem.indexOf(u8, result.content, "llm output").?;
+    const a_pos = std.mem.indexOf(u8, result.content, "Post-process A").?;
+    try std.testing.expect(output_pos < a_pos);
 }
