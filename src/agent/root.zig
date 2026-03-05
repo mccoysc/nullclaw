@@ -1965,7 +1965,17 @@ pub const Agent = struct {
         // untrusted data to inspect — not as instructions to follow.
         // This mitigates prompt injection from raw user messages.
         const wrapped_content = if (hook_content.len > 0)
-            std.fmt.allocPrint(arena, "<hook_data>\n{s}\n</hook_data>", .{hook_content}) catch hook_content
+            std.fmt.allocPrint(arena, "<hook_data>\n{s}\n</hook_data>", .{hook_content}) catch {
+                log.warn(
+                    "sub-agent error: out of memory wrapping hook content | instructions={s}",
+                    .{skill_instructions},
+                );
+                return .{
+                    .action = .agent_error,
+                    .content = result_allocator.dupe(u8, "sub-agent failed: out of memory wrapping content") catch "",
+                    .content_owned = true,
+                };
+            }
         else
             "(empty content)";
 
