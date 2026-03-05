@@ -1985,7 +1985,7 @@ pub const Agent = struct {
         //   configured == 0 → use compiled default, clamped similarly
         //   max_iterations <= 1 → disable review (review_after = max_iterations)
         const review_after: u32 = blk: {
-            if (max_sub_iterations <= 1) break :blk max_sub_iterations; // no room for review
+            if (max_sub_iterations <= 1) break :blk max_sub_iterations + 1; // no room for review
             const configured = if (self.sub_agent_review_after > 0) self.sub_agent_review_after else skills_mod.SUB_AGENT_DEFAULT_REVIEW_AFTER;
             break :blk @min(configured, max_sub_iterations - 1);
         };
