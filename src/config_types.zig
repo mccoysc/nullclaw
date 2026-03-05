@@ -200,6 +200,11 @@ pub const AgentConfig = struct {
     /// Maximum iterations for the skill sub-agent turn loop (tool calls only).
     /// 0 = use compiled default (10).
     sub_agent_max_iterations: u32 = 0,
+    /// After this many consecutive tool-call iterations in the sub-agent loop,
+    /// trigger an LLM review to decide whether the loop is stuck.
+    /// 0 = use compiled default (5).  Clamped to max_iterations-1 at runtime;
+    /// if max_iterations <= 1 the review is effectively disabled.
+    sub_agent_review_after: u32 = 0,
 };
 
 pub const ToolsConfig = struct {

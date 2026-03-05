@@ -823,6 +823,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (ag.object.get("sub_agent_max_iterations")) |v| {
                 if (v == .integer and v.integer > 0) self.agent.sub_agent_max_iterations = @intCast(v.integer);
             }
+            if (ag.object.get("sub_agent_review_after")) |v| {
+                if (v == .integer and v.integer > 0) self.agent.sub_agent_review_after = @intCast(v.integer);
+            }
             // tool_filter_groups: array of { mode, tools, keywords? }
             if (ag.object.get("tool_filter_groups")) |fg_val| {
                 if (fg_val == .array) {

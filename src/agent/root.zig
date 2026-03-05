@@ -295,6 +295,10 @@ pub const Agent = struct {
     /// 0 = use compiled default (skills_mod.SUB_AGENT_MAX_ITERATIONS).
     sub_agent_max_iterations: u32 = 0,
 
+    /// After this many consecutive tool-call iterations, trigger an LLM review.
+    /// 0 = use compiled default (skills_mod.SUB_AGENT_DEFAULT_REVIEW_AFTER).
+    sub_agent_review_after: u32 = 0,
+
     /// Per-turn MCP tool filter groups (slice into config-owned memory; not freed by Agent).
     /// Empty = no filtering; all tool specs are sent as-is.
     tool_filter_groups: []const config_types.ToolFilterGroup = &.{},
@@ -417,6 +421,7 @@ pub const Agent = struct {
             .compaction_max_source_chars = cfg.agent.compaction_max_source_chars,
             .tool_filter_groups = cfg.agent.tool_filter_groups,
             .sub_agent_max_iterations = cfg.agent.sub_agent_max_iterations,
+            .sub_agent_review_after = cfg.agent.sub_agent_review_after,
             .exec_security = switch (cfg.autonomy.level) {
                 .full => .full,
                 .read_only => .deny,
@@ -1974,6 +1979,19 @@ pub const Agent = struct {
         var total_iterations: u32 = 0;
         const max_sub_iterations = if (self.sub_agent_max_iterations > 0) self.sub_agent_max_iterations else skills_mod.SUB_AGENT_MAX_ITERATIONS;
 
+        // ── Smart review setup ──────────────────────────────────────────
+        // Resolve the effective review_after threshold:
+        //   configured > 0  → use it, but clamp to max_iterations-1
+        //   configured == 0 → use compiled default, clamped similarly
+        //   max_iterations <= 1 → disable review (review_after = max_iterations)
+        const review_after: u32 = blk: {
+            if (max_sub_iterations <= 1) break :blk max_sub_iterations; // no room for review
+            const configured = if (self.sub_agent_review_after > 0) self.sub_agent_review_after else skills_mod.SUB_AGENT_DEFAULT_REVIEW_AFTER;
+            break :blk @min(configured, max_sub_iterations - 1);
+        };
+        var review_done = false; // only review once per invocation
+        var tool_call_summaries = std.ArrayListUnmanaged([]const u8).empty;
+
         while (total_iterations < max_sub_iterations) : (total_iterations += 1) {
             // Call provider with tools
             const response = self.provider.chat(
@@ -2050,6 +2068,20 @@ pub const Agent = struct {
                         },
                     ) catch continue;
                     results_buf.append(arena, formatted) catch continue;
+
+                    // Accumulate a brief summary for the review call
+                    const output_preview = if (result.output.len > 120) result.output[0..120] else result.output;
+                    const summary_line = std.fmt.allocPrint(
+                        arena,
+                        "#{d} {s}: {s}{s}",
+                        .{
+                            total_iterations + 1,
+                            call.name,
+                            if (result.success) "" else "(FAILED) ",
+                            output_preview,
+                        },
+                    ) catch continue;
+                    tool_call_summaries.append(arena, summary_line) catch {};
                 }
 
                 // Format all results and add as user message
@@ -2057,6 +2089,32 @@ pub const Agent = struct {
                 messages.append(arena, ChatMessage.user(
                     if (joined.len > 0) joined else "Tool execution completed with no output.",
                 )) catch break;
+
+                // ── Smart review check ──────────────────────────────
+                // After review_after consecutive tool-call iterations,
+                // ask the LLM whether the loop is making progress.
+                if (!review_done and total_iterations + 1 >= review_after and tool_call_summaries.items.len > 0) {
+                    review_done = true;
+                    const review_result = self.runSubAgentReview(arena, skill_instructions, tool_call_summaries.items);
+                    if (review_result) |stop_reason| {
+                        log.info(
+                            "sub-agent review: LLM recommended stop | reason={s} iterations={d} instructions={s}",
+                            .{ stop_reason, total_iterations + 1, skill_instructions },
+                        );
+                        const user_msg = std.fmt.allocPrint(
+                            result_allocator,
+                            "sub-agent stopped after review ({d} tool calls): {s}",
+                            .{ total_iterations + 1, stop_reason },
+                        ) catch return .{
+                            .action = .agent_error,
+                            .content = result_allocator.dupe(u8, "sub-agent stopped: review determined loop is stuck") catch "",
+                            .content_owned = true,
+                        };
+                        return .{ .action = .agent_error, .content = user_msg, .content_owned = true };
+                    }
+                    // Verdict was continue (or review failed) — keep going until hard limit.
+                    log.info("sub-agent review: LLM recommended continue | iterations={d}", .{total_iterations + 1});
+                }
 
                 // Continue the loop for the next LLM call
                 continue;
@@ -2131,10 +2189,70 @@ pub const Agent = struct {
                 hook_content,
             },
         );
-        return .{
+        const exhaust_msg = std.fmt.allocPrint(
+            result_allocator,
+            "sub-agent exceeded maximum iterations (limit={d}) without producing a result",
+            .{max_sub_iterations},
+        ) catch return .{
             .action = .agent_error,
             .content = result_allocator.dupe(u8, "sub-agent exceeded maximum iterations without producing a result") catch "",
             .content_owned = true,
+        };
+        return .{
+            .action = .agent_error,
+            .content = exhaust_msg,
+            .content_owned = true,
+        };
+    }
+
+    /// Make a lightweight LLM call to review whether the sub-agent tool-call
+    /// loop is making progress.  Returns `null` when the loop should continue,
+    /// or a reason string (arena-allocated) when it should stop.
+    fn runSubAgentReview(
+        self: *Agent,
+        arena: std.mem.Allocator,
+        skill_instructions: []const u8,
+        summaries: []const []const u8,
+    ) ?[]const u8 {
+        const summary_text = std.mem.join(arena, "\n", summaries) catch return null;
+
+        const user_content = std.fmt.allocPrint(
+            arena,
+            "Sub-agent goal:\n{s}\n\nTool call history:\n{s}",
+            .{ skill_instructions, summary_text },
+        ) catch return null;
+
+        var review_msgs = std.ArrayListUnmanaged(ChatMessage).empty;
+        review_msgs.append(arena, ChatMessage.system(skills_mod.sub_agent_review_prompt)) catch return null;
+        review_msgs.append(arena, ChatMessage.user(user_content)) catch return null;
+
+        const review_response = self.provider.chat(
+            arena,
+            .{
+                .messages = review_msgs.items,
+                .model = self.model_name,
+                .temperature = 0.1, // very low for deterministic judgement
+                .max_tokens = 200, // only need a short verdict
+                .tools = null,
+                .timeout_secs = self.message_timeout_secs,
+            },
+            self.model_name,
+            0.1,
+        ) catch |err| {
+            log.warn("sub-agent review: LLM call failed, continuing loop | error={s}", .{@errorName(err)});
+            return null; // on failure, let the loop continue
+        };
+
+        const verdict_text = review_response.contentOrEmpty();
+        const parsed = skills_mod.parseReviewResponse(verdict_text);
+
+        return switch (parsed.verdict) {
+            .stop => if (parsed.reason.len > 0) parsed.reason else "review determined the loop is stuck",
+            .@"continue" => null,
+            .unknown => {
+                log.warn("sub-agent review: could not parse verdict, continuing | response={s}", .{verdict_text});
+                return null;
+            },
         };
     }
 
