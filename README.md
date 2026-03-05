@@ -32,6 +32,7 @@ The smallest fully autonomous AI assistant infrastructure — a static Zig binar
 - [Gateway API](docs/zh/gateway-api.md)
 - [命令参考](docs/zh/commands.md)
 - [开发指南](docs/zh/development.md)
+- [SKILLS用法说明](/SKILLS.md)
 
 ### Features
 
