@@ -147,12 +147,15 @@ pub fn parseXmlToolCalls(
                     if (ch == '>' or ch == ' ' or ch == '\n' or ch == '\r' or ch == '\t') break;
                 }
                 if (ns_tag_start) |ns_s| {
-                    const ns_e = suffix_pos + ns_suffix.len;
-                    if (best_start == null or ns_s < best_start.?) {
-                        best_start = ns_s;
-                        best_end = ns_e;
-                        open_c = '<';
-                        close_c = '>';
+                    // Ensure this is an opening tag, not a closing tag like </minimax:tool_call>
+                    if (ns_s + 1 < remaining.len and remaining[ns_s + 1] != '/') {
+                        const ns_e = suffix_pos + ns_suffix.len;
+                        if (best_start == null or ns_s < best_start.?) {
+                            best_start = ns_s;
+                            best_end = ns_e;
+                            open_c = '<';
+                            close_c = '>';
+                        }
                     }
                 }
             }
