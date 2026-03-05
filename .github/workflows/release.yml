@@ -86,7 +86,7 @@ jobs:
           DATE=$(date -u +'%Y.%m.%d' | sed 's/\.0\([0-9]\)/.\1/g')
           VERSION="${DATE}.${SHORT_SHA:0:7}"
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
-          echo "title=${VERSION}" >> $GITHUB_OUTPUT
+          echo "title=v${VERSION}" >> $GITHUB_OUTPUT
           echo "tag=v${VERSION}" >> $GITHUB_OUTPUT
           if [[ "${{ github.ref_type }}" == "tag" || ( "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ inputs.tag }}" ) ]]; then
             echo "prerelease=false" >> $GITHUB_OUTPUT
