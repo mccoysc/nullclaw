@@ -78,23 +78,15 @@ jobs:
 
       - uses: actions/download-artifact@v4
 
-      - name: Rename binaries
-        run: |
-          mv nullclaw-linux-x86_64/nullclaw nullclaw-linux-x86_64.bin
-          mv nullclaw-linux-aarch64/nullclaw nullclaw-linux-aarch64.bin
-          mv nullclaw-linux-riscv64/nullclaw nullclaw-linux-riscv64.bin
-          mv nullclaw-macos-aarch64/nullclaw nullclaw-macos-aarch64.bin
-          mv nullclaw-macos-x86_64/nullclaw nullclaw-macos-x86_64.bin
-          mv nullclaw-windows-x86_64/nullclaw.exe nullclaw-windows-x86_64.exe
-          mv nullclaw-windows-aarch64/nullclaw.exe nullclaw-windows-aarch64.exe
-
       - name: Determine release info
         id: release_info
         shell: bash
         run: |
           SHORT_SHA="${{ github.sha }}"
           DATE=$(date -u +'%Y.%m.%d' | sed 's/\.0\([0-9]\)/.\1/g')
-          echo "title=${DATE}.${SHORT_SHA:0:7}" >> $GITHUB_OUTPUT
+          VERSION="${DATE}.${SHORT_SHA:0:7}"
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "title=${VERSION}" >> $GITHUB_OUTPUT
           if [[ "${{ github.ref_type }}" == "tag" ]]; then
             echo "tag=${{ github.ref_name }}" >> $GITHUB_OUTPUT
             echo "prerelease=false" >> $GITHUB_OUTPUT
@@ -102,9 +94,21 @@ jobs:
             echo "tag=${{ inputs.tag }}" >> $GITHUB_OUTPUT
             echo "prerelease=false" >> $GITHUB_OUTPUT
           else
-            echo "tag=v${DATE}.${SHORT_SHA:0:7}" >> $GITHUB_OUTPUT
+            echo "tag=v${VERSION}" >> $GITHUB_OUTPUT
             echo "prerelease=true" >> $GITHUB_OUTPUT
           fi
+
+      - name: Rename binaries
+        shell: bash
+        run: |
+          VERSION="${{ steps.release_info.outputs.version }}"
+          mv nullclaw-linux-x86_64/nullclaw   nullclaw-${VERSION}-linux-x86_64.bin
+          mv nullclaw-linux-aarch64/nullclaw  nullclaw-${VERSION}-linux-aarch64.bin
+          mv nullclaw-linux-riscv64/nullclaw  nullclaw-${VERSION}-linux-riscv64.bin
+          mv nullclaw-macos-aarch64/nullclaw  nullclaw-${VERSION}-macos-aarch64.bin
+          mv nullclaw-macos-x86_64/nullclaw   nullclaw-${VERSION}-macos-x86_64.bin
+          mv nullclaw-windows-x86_64/nullclaw.exe  nullclaw-${VERSION}-windows-x86_64.exe
+          mv nullclaw-windows-aarch64/nullclaw.exe nullclaw-${VERSION}-windows-aarch64.exe
 
       - name: Create release
         uses: softprops/action-gh-release@v2
@@ -113,13 +117,13 @@ jobs:
           name: ${{ steps.release_info.outputs.title }}
           prerelease: ${{ steps.release_info.outputs.prerelease }}
           files: |
-            nullclaw-linux-x86_64.bin
-            nullclaw-linux-aarch64.bin
-            nullclaw-linux-riscv64.bin
-            nullclaw-macos-aarch64.bin
-            nullclaw-macos-x86_64.bin
-            nullclaw-windows-x86_64.exe
-            nullclaw-windows-aarch64.exe
+            nullclaw-${{ steps.release_info.outputs.version }}-linux-x86_64.bin
+            nullclaw-${{ steps.release_info.outputs.version }}-linux-aarch64.bin
+            nullclaw-${{ steps.release_info.outputs.version }}-linux-riscv64.bin
+            nullclaw-${{ steps.release_info.outputs.version }}-macos-aarch64.bin
+            nullclaw-${{ steps.release_info.outputs.version }}-macos-x86_64.bin
+            nullclaw-${{ steps.release_info.outputs.version }}-windows-x86_64.exe
+            nullclaw-${{ steps.release_info.outputs.version }}-windows-aarch64.exe
           generate_release_notes: true
 
   docker:
