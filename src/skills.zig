@@ -1061,6 +1061,12 @@ pub const AsyncSkillQueue = struct {
     /// Shut down the worker thread and discard any remaining tasks.
     /// Blocks until the worker has exited.
     pub fn deinit(self: *AsyncSkillQueue) void {
+        if (!self.started) {
+            // Never used — nothing to shut down or free.
+            // (Avoids calling tasks.deinit with an undefined allocator
+            //  when the queue was default-initialised but never bound.)
+            return;
+        }
         {
             self.mutex.lock();
             defer self.mutex.unlock();
@@ -1069,7 +1075,7 @@ pub const AsyncSkillQueue = struct {
         }
         if (self.worker) |w| w.join();
 
-        // Free any remaining queued tasks.
+        // Free any remaining queued tasks (worker exits without draining).
         for (self.tasks.items) |task| {
             self.allocator.free(task.instructions);
             self.allocator.free(task.content);
@@ -1094,7 +1100,10 @@ pub const AsyncSkillQueue = struct {
                 while (self.tasks.items.len == 0 and !self.shutdown) {
                     self.cond.wait(&self.mutex);
                 }
-                if (self.shutdown and self.tasks.items.len == 0) return;
+                if (self.shutdown) {
+                    // Discard remaining tasks — only the in-flight task (if any) completes.
+                    return;
+                }
                 task = self.tasks.orderedRemove(0);
             }
 
@@ -5270,7 +5279,14 @@ test "AsyncSkillQueue enqueue and process tasks" {
     q.enqueue("instr2", "content2");
     q.enqueue("instr3", "content3");
 
-    // Shut down (blocks until worker finishes all tasks)
+    // Give the worker time to process all 3 tasks before shutdown.
+    // (On shutdown the worker discards remaining tasks, so we must
+    //  wait for them to drain naturally.)
+    var waited: u32 = 0;
+    while (@atomicLoad(u32, &Context.processed, .seq_cst) < 3 and waited < 100) : (waited += 1) {
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+    }
+
     q.deinit();
 
     try std.testing.expectEqual(@as(u32, 3), Context.processed);
