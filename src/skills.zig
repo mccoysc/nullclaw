@@ -747,7 +747,12 @@ pub fn consumeReloadSentinel(allocator: std.mem.Allocator, base_dir: []const u8)
     const sentinel_path = std.fmt.allocPrint(allocator, "{s}/skills/" ++ SKILLS_RELOAD_SENTINEL, .{base_dir}) catch return false;
     defer allocator.free(sentinel_path);
 
-    std.fs.cwd().deleteFile(sentinel_path) catch return false;
+    std.fs.cwd().deleteFile(sentinel_path) catch |err| {
+        if (err != error.FileNotFound) {
+            log.warn("Failed to delete skills reload sentinel '{s}': {s}", .{ sentinel_path, @errorName(err) });
+        }
+        return false;
+    };
 
     // File existed and was deleted — a reload was requested.
     log.info("Skills reload sentinel detected and consumed: {s}", .{sentinel_path});
