@@ -1961,9 +1961,15 @@ pub const Agent = struct {
                 .content_owned = true,
             };
         };
-        messages.append(arena, ChatMessage.user(
-            if (hook_content.len > 0) hook_content else "(empty content)",
-        )) catch {
+        // Wrap hook_content in <hook_data> tags so the LLM treats it as
+        // untrusted data to inspect — not as instructions to follow.
+        // This mitigates prompt injection from raw user messages.
+        const wrapped_content = if (hook_content.len > 0)
+            std.fmt.allocPrint(arena, "<hook_data>\n{s}\n</hook_data>", .{hook_content}) catch hook_content
+        else
+            "(empty content)";
+
+        messages.append(arena, ChatMessage.user(wrapped_content)) catch {
             log.warn(
                 "sub-agent error: out of memory building messages | instructions={s}",
                 .{skill_instructions},
