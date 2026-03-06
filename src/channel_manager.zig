@@ -635,7 +635,7 @@ pub const ChannelManager = struct {
             const model_updated = rt.session_mgr.updateModelParamsExcludingPrefixes(global_mo, exclude);
             const cfg_refreshed = rt.session_mgr.refreshNonModelConfig(new_config, exclude);
             if (model_updated > 0 or cfg_refreshed > 0) {
-                log.info("Hot-updated {d} non-endpoint session(s) (model={d}, config={d})", .{ cfg_refreshed, model_updated, cfg_refreshed });
+                log.info("Hot-updated {d} non-endpoint session(s)", .{cfg_refreshed});
             }
         }
 
