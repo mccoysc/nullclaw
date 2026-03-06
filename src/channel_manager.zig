@@ -633,9 +633,9 @@ pub const ChannelManager = struct {
             const global_mo = buildGlobalModelOverride(new_config);
             const exclude = &[_][]const u8{ "mqtt:", "redis_stream:" };
             const model_updated = rt.session_mgr.updateModelParamsExcludingPrefixes(global_mo, exclude);
-            const cfg_refreshed = rt.session_mgr.refreshNonModelConfig(new_config);
+            const cfg_refreshed = rt.session_mgr.refreshNonModelConfig(new_config, exclude);
             if (model_updated > 0 or cfg_refreshed > 0) {
-                log.info("Hot-updated {d} session(s) (model={d}, config={d})", .{ @max(model_updated, cfg_refreshed), model_updated, cfg_refreshed });
+                log.info("Hot-updated {d} non-endpoint session(s) (model={d}, config={d})", .{ cfg_refreshed, model_updated, cfg_refreshed });
             }
         }
 

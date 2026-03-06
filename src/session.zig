@@ -298,16 +298,24 @@ pub const SessionManager = struct {
         agent.max_tokens_override = cfg.max_tokens;
     }
 
-    /// Hot-refresh non-model config-derived fields on all existing sessions.
-    /// Returns the number of sessions refreshed.
-    pub fn refreshNonModelConfig(self: *SessionManager, cfg: *const Config) usize {
+    /// Hot-refresh non-model config-derived fields on sessions whose key does
+    /// NOT start with any of the given prefixes.  MQTT / Redis Stream sessions
+    /// have per-endpoint sub_agent_max_iterations / sub_agent_review_after set
+    /// by applyModelOverride; refreshing them with global values would clobber
+    /// endpoint-specific overrides.  Returns the number of sessions refreshed.
+    pub fn refreshNonModelConfig(self: *SessionManager, cfg: *const Config, exclude_prefixes: []const []const u8) usize {
         self.mutex.lock();
         defer self.mutex.unlock();
         var count: usize = 0;
         var it = self.sessions.iterator();
         while (it.next()) |entry| {
-            applyNonModelConfigRefresh(&entry.value_ptr.*.agent, cfg);
-            count += 1;
+            const excluded = for (exclude_prefixes) |pfx| {
+                if (std.mem.startsWith(u8, entry.key_ptr.*, pfx)) break true;
+            } else false;
+            if (!excluded) {
+                applyNonModelConfigRefresh(&entry.value_ptr.*.agent, cfg);
+                count += 1;
+            }
         }
         return count;
     }
@@ -2571,7 +2579,8 @@ test "refreshNonModelConfig updates config-derived fields on all sessions" {
     new_cfg.agent.status_show_emojis = false;
     new_cfg.autonomy.level = .read_only;
 
-    const refreshed = sm.refreshNonModelConfig(&new_cfg);
+    const exclude = &[_][]const u8{ "mqtt:", "redis_stream:" };
+    const refreshed = sm.refreshNonModelConfig(&new_cfg, exclude);
     try testing.expectEqual(@as(usize, 2), refreshed);
 
     const s1 = try sm.getOrCreate("telegram:default:user1");
@@ -2600,11 +2609,44 @@ test "refreshNonModelConfig does not change model fields" {
     new_cfg.default_model = "other/model";
     new_cfg.reasoning_effort = "low";
 
-    _ = sm.refreshNonModelConfig(&new_cfg);
+    const no_exclude = &[_][]const u8{};
+    _ = sm.refreshNonModelConfig(&new_cfg, no_exclude);
 
     const s = try sm.getOrCreate("telegram:default:user1");
     // model_name should still be the original
     try testing.expectEqualStrings("test/mock-model", s.agent.model_name);
     // but reasoning_effort should be updated
     try testing.expectEqualStrings("low", s.agent.reasoning_effort.?);
+}
+
+test "refreshNonModelConfig excludes mqtt and redis_stream sessions" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    _ = try sm.getOrCreate("telegram:default:user1");
+    _ = try sm.getOrCreate("mqtt:account1:topic1");
+    _ = try sm.getOrCreate("redis_stream:account2:topic2");
+
+    var new_cfg = testConfig();
+    new_cfg.agent.sub_agent_max_iterations = 99;
+    new_cfg.agent.sub_agent_review_after = 77;
+    new_cfg.reasoning_effort = "high";
+
+    const exclude = &[_][]const u8{ "mqtt:", "redis_stream:" };
+    const refreshed = sm.refreshNonModelConfig(&new_cfg, exclude);
+
+    // Only Telegram updated (1), not MQTT/RS (2)
+    try testing.expectEqual(@as(usize, 1), refreshed);
+
+    // Telegram session got the update
+    const s_tg = try sm.getOrCreate("telegram:default:user1");
+    try testing.expectEqual(@as(u32, 99), s_tg.agent.sub_agent_max_iterations);
+    try testing.expectEqualStrings("high", s_tg.agent.reasoning_effort.?);
+
+    // MQTT session was NOT updated (still has default values)
+    const s_mqtt = try sm.getOrCreate("mqtt:account1:topic1");
+    try testing.expect(s_mqtt.agent.sub_agent_max_iterations != 99);
+    try testing.expect(s_mqtt.agent.reasoning_effort == null);
 }
