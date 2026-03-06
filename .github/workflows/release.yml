@@ -43,6 +43,10 @@ jobs:
             target: windows-aarch64
             zig_target: aarch64-windows
             ext: ".exe"
+          - os: ubuntu-latest
+            target: wasm32-wasi
+            zig_target: wasm32-wasi
+            ext: ".wasm"
 
     steps:
       - uses: actions/checkout@v4
@@ -107,6 +111,7 @@ jobs:
           mv nullclaw-macos-x86_64/nullclaw   nullclaw-${VERSION}-macos-x86_64.bin
           mv nullclaw-windows-x86_64/nullclaw.exe  nullclaw-${VERSION}-windows-x86_64.exe
           mv nullclaw-windows-aarch64/nullclaw.exe nullclaw-${VERSION}-windows-aarch64.exe
+          mv nullclaw-wasm32-wasi/nullclaw.wasm    nullclaw-${VERSION}-wasm32-wasi.wasm
 
       - name: Create release
         uses: softprops/action-gh-release@v2
@@ -122,6 +127,7 @@ jobs:
             nullclaw-${{ steps.release_info.outputs.version }}-macos-x86_64.bin
             nullclaw-${{ steps.release_info.outputs.version }}-windows-x86_64.exe
             nullclaw-${{ steps.release_info.outputs.version }}-windows-aarch64.exe
+            nullclaw-${{ steps.release_info.outputs.version }}-wasm32-wasi.wasm
           generate_release_notes: true
 
   docker:
