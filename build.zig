@@ -384,6 +384,12 @@ pub fn build(b: *std.Build) void {
     // Force-disable C-linked backends when targeting WASI (no C library linking in wasm32-wasi).
     const effective_enable_sqlite = enable_sqlite and !is_wasi;
     const effective_enable_postgres = enable_postgres and !is_wasi;
+    if (is_wasi and enable_sqlite) {
+        std.log.warn("SQLite backend disabled: C linking is not supported on wasm32-wasi", .{});
+    }
+    if (is_wasi and enable_postgres) {
+        std.log.warn("PostgreSQL backend disabled: C linking is not supported on wasm32-wasi", .{});
+    }
     const effective_enable_memory_sqlite = effective_enable_sqlite and enable_memory_sqlite;
     const effective_enable_memory_lucid = effective_enable_sqlite and enable_memory_lucid;
     const effective_enable_memory_lancedb = effective_enable_sqlite and enable_memory_lancedb;
