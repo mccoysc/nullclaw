@@ -296,6 +296,10 @@ pub const SessionManager = struct {
         agent.sub_agent_max_iterations = cfg.agent.sub_agent_max_iterations;
         agent.sub_agent_review_after = cfg.agent.sub_agent_review_after;
         agent.max_tokens_override = cfg.max_tokens;
+        // Recompute max_tokens using the same resolution as fromConfigInner
+        const resolved_raw = agent_root.max_tokens_resolver.resolveMaxTokens(cfg.max_tokens, agent.model_name);
+        const token_cap: u32 = @intCast(@min(agent.token_limit, @as(u64, std.math.maxInt(u32))));
+        agent.max_tokens = @min(resolved_raw, token_cap);
     }
 
     /// Hot-refresh non-model config-derived fields on sessions whose key does
@@ -313,7 +317,10 @@ pub const SessionManager = struct {
                 if (std.mem.startsWith(u8, entry.key_ptr.*, pfx)) break true;
             } else false;
             if (!excluded) {
-                applyNonModelConfigRefresh(&entry.value_ptr.*.agent, cfg);
+                const session = entry.value_ptr.*;
+                session.mutex.lock();
+                applyNonModelConfigRefresh(&session.agent, cfg);
+                session.mutex.unlock();
                 count += 1;
             }
         }
