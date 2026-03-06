@@ -12,8 +12,8 @@ NullClaw monitors the `config.json` file for changes and dynamically applies upd
 
 | Change | Effect |
 |--------|--------|
-| Global model params (`provider`, `model`, `max_context_tokens`, `temperature`) | Sessions without per-endpoint overrides are hot-updated in place. Conversation history is preserved. |
-| Global sub-agent / tools-reviewer model (`sub_agent_provider`, `sub_agent_model`, `tools_reviewer_provider`, `tools_reviewer_model`) | Same as global model params — sessions without per-endpoint overrides are hot-updated. |
+| Global model params (`provider`, `model`, `max_context_tokens`, `temperature`) | **All** channel sessions (Telegram, Discord, Slack, Signal, Matrix, IRC, Web, WhatsApp, Mattermost, iMessage, etc.) are hot-updated in place. For MQTT / Redis Stream, only endpoints without their own `model_override` are updated. Conversation history is preserved. |
+| Global sub-agent / tools-reviewer model (`sub_agent_provider`, `sub_agent_model`, `tools_reviewer_provider`, `tools_reviewer_model`) | Same as global model params — all channel sessions are hot-updated. MQTT / Redis Stream endpoints with their own overrides keep their per-endpoint config. |
 | Per-endpoint `model_override` (including `sub_agent_*` / `tools_reviewer_*`) | Only sessions on that endpoint are hot-updated. Conversation history is preserved. |
 | Structural endpoint change (host, port, keys, topic) | Sessions on that endpoint are evicted (reset). The channel is restarted with the new config. |
 | Endpoint removed | Sessions on that endpoint are evicted and resources freed. |

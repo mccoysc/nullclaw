@@ -621,6 +621,20 @@ pub const ChannelManager = struct {
             }
         }
 
+        // ── Global model change: hot-update ALL non-endpoint-based sessions ──
+        // MQTT and Redis Stream sessions are already handled above with
+        // per-endpoint merge logic.  All other channel types (Telegram,
+        // Discord, Slack, Signal, Matrix, IRC, Web, etc.) inherit directly
+        // from global config, so we update them here.
+        if (global_model_changed) {
+            if (self.runtime) |rt| {
+                const global_mo = buildGlobalModelOverride(new_config);
+                const exclude = &[_][]const u8{ "mqtt:", "redis_stream:" };
+                const updated = rt.session_mgr.updateModelParamsExcludingPrefixes(global_mo, exclude);
+                if (updated > 0) log.info("Global model changed, hot-updated {d} non-endpoint session(s)", .{updated});
+            }
+        }
+
         // ── Cleanup removed entries ────────────────────────────────────
         std.mem.sort(usize, entries_to_remove.items, {}, std.sort.desc(usize));
         for (entries_to_remove.items) |idx| {
