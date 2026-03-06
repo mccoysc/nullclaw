@@ -669,13 +669,21 @@ pub const Agent = struct {
             break :blk null;
         };
 
+        // Look up native_tools setting from configured_providers
+        const native_tools = blk_nt: {
+            for (self.configured_providers) |entry| {
+                if (std.mem.eql(u8, entry.name, target)) break :blk_nt entry.native_tools;
+            }
+            break :blk_nt true;
+        };
+
         const holder = arena.create(provider_factory.ProviderHolder) catch return null;
         holder.* = provider_factory.ProviderHolder.fromConfig(
             arena,
             target,
             resolved_key,
             base_url,
-            true, // native_tools
+            native_tools,
             null, // user_agent
         );
         return holder.provider();
