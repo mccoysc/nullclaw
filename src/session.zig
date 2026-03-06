@@ -414,7 +414,8 @@ pub const SessionManager = struct {
     /// Replace the provider used by the session manager AND all existing
     /// sessions.  Called during config hot-reload when API keys or provider
     /// settings change.  Each session's agent.provider is patched in-place
-    /// under its own mutex to avoid racing with in-flight turns.
+    /// under its own mutex to avoid racing with in-flight turns (processMessage
+    /// acquires the same session mutex before calling agent.turn).
     pub fn updateProvider(self: *SessionManager, new_provider: Provider) void {
         self.mutex.lock();
         defer self.mutex.unlock();

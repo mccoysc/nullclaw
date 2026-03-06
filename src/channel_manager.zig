@@ -1144,6 +1144,11 @@ fn globalModelConfigChanged(old: *const Config, new: *const Config) bool {
 /// Check if provider credentials or the default provider changed between
 /// old and new configs.  When true, the RuntimeProviderBundle must be
 /// rebuilt so that existing sessions pick up the new API key.
+///
+/// Note: provider entries are compared positionally (same order as the
+/// JSON array in config.json).  Reordering entries without changing
+/// their content is treated as a change, which is harmless — it simply
+/// triggers a provider rebuild.
 fn providerConfigChanged(old: *const Config, new: *const Config) bool {
     // Default provider name changed → need a new provider.
     if (!std.mem.eql(u8, old.default_provider, new.default_provider)) return true;

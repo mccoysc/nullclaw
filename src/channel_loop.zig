@@ -465,7 +465,7 @@ pub const ChannelRuntime = struct {
     /// ChannelRuntime is torn down.
     pub fn rebuildProvider(self: *ChannelRuntime, new_config: *const Config) void {
         var new_bundle = provider_runtime.RuntimeProviderBundle.init(self.allocator, new_config) catch |err| {
-            log.warn("Failed to rebuild provider bundle: {s}", .{@errorName(err)});
+            log.warn("Provider rebuild failed — sessions still using previous credentials: {s}", .{@errorName(err)});
             return;
         };
 
