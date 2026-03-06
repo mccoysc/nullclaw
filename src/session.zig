@@ -314,6 +314,28 @@ pub const SessionManager = struct {
         return count;
     }
 
+    /// Hot-update model parameters on all sessions whose key does NOT start
+    /// with any of the given prefixes.  Returns the number of sessions updated.
+    /// Used for global model changes: MQTT / Redis Stream sessions are handled
+    /// individually with per-endpoint merge logic, so we exclude them here and
+    /// update every other channel type (Telegram, Discord, Slack, etc.).
+    pub fn updateModelParamsExcludingPrefixes(self: *SessionManager, mo: config_types.ChannelModelOverride, exclude_prefixes: []const []const u8) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var count: usize = 0;
+        var it = self.sessions.iterator();
+        while (it.next()) |entry| {
+            const excluded = for (exclude_prefixes) |pfx| {
+                if (std.mem.startsWith(u8, entry.key_ptr.*, pfx)) break true;
+            } else false;
+            if (!excluded) {
+                applyModelOverride(&entry.value_ptr.*.agent, mo);
+                count += 1;
+            }
+        }
+        return count;
+    }
+
     /// Update the config pointer for all future session creations.
     /// Existing sessions keep their agent state; new sessions will use the new config.
     pub fn updateConfig(self: *SessionManager, new_config: *const Config) void {
@@ -2387,4 +2409,95 @@ test "applyModelOverride full fallback chain: channel sub_agent > channel genera
         try testing.expectEqualStrings("ch/sa-specific", s.agent.sub_agent_model.?);
         try testing.expectEqualStrings("ch-sa-prov", s.agent.sub_agent_provider.?);
     }
+}
+
+test "updateModelParamsExcludingPrefixes skips mqtt and redis_stream sessions" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    // Create sessions across multiple channel types
+    _ = try sm.getOrCreate("telegram:default:user1");
+    _ = try sm.getOrCreate("discord:default:user2");
+    _ = try sm.getOrCreate("slack:default:user3");
+    _ = try sm.getOrCreate("mqtt:account1:topic1");
+    _ = try sm.getOrCreate("redis_stream:account2:topic2");
+
+    const exclude = &[_][]const u8{ "mqtt:", "redis_stream:" };
+    const updated = sm.updateModelParamsExcludingPrefixes(.{ .model = "global-new" }, exclude);
+
+    // Only Telegram, Discord, Slack should be updated (3), not MQTT/RS (2)
+    try testing.expectEqual(@as(usize, 3), updated);
+
+    // Verify non-excluded sessions were updated
+    const s_tg = try sm.getOrCreate("telegram:default:user1");
+    try testing.expectEqualStrings("global-new", s_tg.agent.default_model);
+    const s_dc = try sm.getOrCreate("discord:default:user2");
+    try testing.expectEqualStrings("global-new", s_dc.agent.default_model);
+    const s_sl = try sm.getOrCreate("slack:default:user3");
+    try testing.expectEqualStrings("global-new", s_sl.agent.default_model);
+
+    // Verify excluded sessions were NOT updated
+    const s_mqtt = try sm.getOrCreate("mqtt:account1:topic1");
+    try testing.expectEqualStrings("test/mock-model", s_mqtt.agent.default_model);
+    const s_rs = try sm.getOrCreate("redis_stream:account2:topic2");
+    try testing.expectEqualStrings("test/mock-model", s_rs.agent.default_model);
+}
+
+test "updateModelParamsExcludingPrefixes with empty exclude updates all" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    _ = try sm.getOrCreate("telegram:default:user1");
+    _ = try sm.getOrCreate("mqtt:account1:topic1");
+
+    const exclude = &[_][]const u8{};
+    const updated = sm.updateModelParamsExcludingPrefixes(.{ .model = "all-new" }, exclude);
+    try testing.expectEqual(@as(usize, 2), updated);
+
+    const s1 = try sm.getOrCreate("telegram:default:user1");
+    try testing.expectEqualStrings("all-new", s1.agent.default_model);
+    const s2 = try sm.getOrCreate("mqtt:account1:topic1");
+    try testing.expectEqualStrings("all-new", s2.agent.default_model);
+}
+
+test "updateModelParamsExcludingPrefixes covers all non-endpoint channel types" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    // Create sessions for many different channel types
+    _ = try sm.getOrCreate("telegram:default:u1");
+    _ = try sm.getOrCreate("discord:default:u2");
+    _ = try sm.getOrCreate("slack:default:u3");
+    _ = try sm.getOrCreate("signal:default:u4");
+    _ = try sm.getOrCreate("matrix:default:u5");
+    _ = try sm.getOrCreate("irc:default:u6");
+    _ = try sm.getOrCreate("web:default:u7");
+    _ = try sm.getOrCreate("whatsapp:default:u8");
+    _ = try sm.getOrCreate("mattermost:default:u9");
+    _ = try sm.getOrCreate("imessage:default:u10");
+    _ = try sm.getOrCreate("mqtt:a1:t1");
+    _ = try sm.getOrCreate("redis_stream:a2:t2");
+
+    const exclude = &[_][]const u8{ "mqtt:", "redis_stream:" };
+    const updated = sm.updateModelParamsExcludingPrefixes(.{ .provider = "new-prov" }, exclude);
+
+    // 10 non-endpoint channels updated, 2 endpoint channels skipped
+    try testing.expectEqual(@as(usize, 10), updated);
+
+    // Spot-check a few updated sessions
+    const s_tg = try sm.getOrCreate("telegram:default:u1");
+    try testing.expectEqualStrings("new-prov", s_tg.agent.default_provider);
+    const s_web = try sm.getOrCreate("web:default:u7");
+    try testing.expectEqualStrings("new-prov", s_web.agent.default_provider);
+
+    // Verify MQTT/RS not updated
+    const s_mqtt = try sm.getOrCreate("mqtt:a1:t1");
+    try testing.expect(s_mqtt.agent.default_provider.len > 0);
+    try testing.expect(!std.mem.eql(u8, s_mqtt.agent.default_provider, "new-prov"));
 }
