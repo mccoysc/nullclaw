@@ -48,6 +48,10 @@ jobs:
       - name: Build ReleaseSmall
         run: zig build -Dtarget=${{ matrix.zig_target }} -Doptimize=ReleaseSmall
 
+      - name: Cross-compile wasm32-wasi
+        if: runner.os == 'Linux'
+        run: zig build -Dtarget=wasm32-wasi -Doptimize=ReleaseSmall
+
       - name: Cross-compile linux-aarch64 (Termux/ARM)
         if: runner.os == 'Linux'
         run: zig build -Dtarget=aarch64-linux-musl -Doptimize=ReleaseSmall

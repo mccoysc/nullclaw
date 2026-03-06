@@ -381,18 +381,27 @@ pub fn build(b: *std.Build) void {
     const enable_channel_nostr = channels.enable_channel_nostr;
     const enable_channel_web = channels.enable_channel_web;
 
-    const effective_enable_memory_sqlite = enable_sqlite and enable_memory_sqlite;
-    const effective_enable_memory_lucid = enable_sqlite and enable_memory_lucid;
-    const effective_enable_memory_lancedb = enable_sqlite and enable_memory_lancedb;
+    // Force-disable C-linked backends when targeting WASI (no C library linking in wasm32-wasi).
+    const effective_enable_sqlite = enable_sqlite and !is_wasi;
+    const effective_enable_postgres = enable_postgres and !is_wasi;
+    if (is_wasi and enable_sqlite) {
+        std.log.warn("SQLite backend disabled: C linking is not supported on wasm32-wasi", .{});
+    }
+    if (is_wasi and enable_postgres) {
+        std.log.warn("PostgreSQL backend disabled: C linking is not supported on wasm32-wasi", .{});
+    }
+    const effective_enable_memory_sqlite = effective_enable_sqlite and enable_memory_sqlite;
+    const effective_enable_memory_lucid = effective_enable_sqlite and enable_memory_lucid;
+    const effective_enable_memory_lancedb = effective_enable_sqlite and enable_memory_lancedb;
 
-    if (enable_sqlite) {
+    if (effective_enable_sqlite) {
         verifyVendoredSqliteHashes(b) catch {
             std.log.err("vendored sqlite integrity check failed", .{});
             std.process.exit(1);
         };
     }
 
-    const sqlite3 = if (enable_sqlite) blk: {
+    const sqlite3 = if (effective_enable_sqlite) blk: {
         const sqlite3_dep = b.dependency("sqlite3", .{
             .target = target,
             .optimize = optimize,
@@ -408,8 +417,8 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "enable_memory_markdown", enable_memory_markdown);
     build_options.addOption(bool, "enable_memory_memory", enable_memory_memory);
     build_options.addOption(bool, "enable_memory_api", enable_memory_api);
-    build_options.addOption(bool, "enable_sqlite", enable_sqlite);
-    build_options.addOption(bool, "enable_postgres", enable_postgres);
+    build_options.addOption(bool, "enable_sqlite", effective_enable_sqlite);
+    build_options.addOption(bool, "enable_postgres", effective_enable_postgres);
     build_options.addOption(bool, "enable_memory_sqlite", effective_enable_memory_sqlite);
     build_options.addOption(bool, "enable_memory_lucid", effective_enable_memory_lucid);
     build_options.addOption(bool, "enable_memory_redis", enable_memory_redis);
@@ -448,7 +457,7 @@ pub fn build(b: *std.Build) void {
         if (sqlite3) |lib| {
             module.linkLibrary(lib);
         }
-        if (enable_postgres) {
+        if (effective_enable_postgres) {
             module.linkSystemLibrary("pq", .{});
         }
         if (enable_channel_web) {
@@ -491,7 +500,7 @@ pub fn build(b: *std.Build) void {
         if (sqlite3) |lib| {
             exe.linkLibrary(lib);
         }
-        if (enable_postgres) {
+        if (effective_enable_postgres) {
             exe.root_module.linkSystemLibrary("pq", .{});
         }
     }
@@ -531,7 +540,7 @@ pub fn build(b: *std.Build) void {
         if (sqlite3) |lib| {
             lib_tests.linkLibrary(lib);
         }
-        if (enable_postgres) {
+        if (effective_enable_postgres) {
             lib_tests.root_module.linkSystemLibrary("pq", .{});
         }
 
