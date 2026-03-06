@@ -252,7 +252,12 @@ pub const ChannelManager = struct {
     }
 
     /// Scan config, create channel instances, register in registry.
+    /// When no global default_model is configured, only channels/endpoints
+    /// that have their own model_override.model are accepted; others are
+    /// skipped with a warning.
     pub fn collectConfiguredChannels(self: *ChannelManager) !void {
+        const has_global_model = if (self.config.default_model) |m| m.len > 0 else false;
+
         inline for (std.meta.fields(config_types.ChannelsConfig)) |field| {
             if (comptime std.mem.eql(u8, field.name, "cli") or std.mem.eql(u8, field.name, "webhook")) {
                 continue;
@@ -264,24 +269,46 @@ pub const ChannelManager = struct {
                 @compileError("channels/root.zig is missing module export for channel: " ++ field.name);
             }
 
+            // MQTT and Redis Stream have per-endpoint model_override — validate
+            // each endpoint individually.  All other channel types lack
+            // per-channel model config, so they require a global model.
+            const is_endpoint_channel = comptime (std.mem.eql(u8, field.name, "mqtt") or
+                std.mem.eql(u8, field.name, "redis_stream"));
+
             switch (@typeInfo(field.type)) {
                 .pointer => |ptr| {
                     if (ptr.size != .slice) continue;
                     const items = @field(self.config.channels, field.name);
                     for (items) |cfg| {
+                        if (!has_global_model) {
+                            if (is_endpoint_channel) {
+                                // Validate each endpoint has a model override
+                                if (!channelConfigHasAllEndpointModels(cfg)) {
+                                    log.warn("No global model configured and channel '{s}' (account '{s}') has endpoints without model_override.model — skipping", .{ field.name, accountIdFromConfig(cfg) });
+                                    continue;
+                                }
+                            } else {
+                                log.warn("No global model configured and channel '{s}' has no per-channel model support — skipping", .{field.name});
+                                continue;
+                            }
+                        }
                         try self.appendChannelFromConfig(field.name, cfg);
                     }
                 },
                 .optional => |opt| {
                     if (@field(self.config.channels, field.name)) |cfg| {
-                        const inner = comptime blk: {
-                            const info = @typeInfo(opt.child);
-                            break :blk info == .pointer and info.pointer.size == .one;
-                        };
-                        if (inner) {
-                            try self.appendChannelFromConfig(field.name, cfg.*);
+                        if (!has_global_model) {
+                            log.warn("No global model configured and channel '{s}' has no per-channel model support — skipping", .{field.name});
                         } else {
-                            try self.appendChannelFromConfig(field.name, cfg);
+                            const inner = comptime blk: {
+                                const info = @typeInfo(opt.child);
+                                break :blk info == .pointer and info.pointer.size == .one;
+                            };
+                            if (inner) {
+                                try self.appendChannelFromConfig(field.name, cfg.*);
+                            } else {
+                                try self.appendChannelFromConfig(field.name, cfg);
+                            }
                         }
                     }
                 },
@@ -494,12 +521,16 @@ pub const ChannelManager = struct {
                 }
 
                 // Global model change: hot-update sessions on endpoints WITHOUT
-                // their own model override (they inherit global config).
+                // their own general model override (they inherit global config).
+                // Merge endpoint overrides on top of global so per-endpoint
+                // sub_agent/tools_reviewer fields aren't clobbered.
                 if (global_model_changed and !topology_changed) {
+                    const global_mo = buildGlobalModelOverride(new_config);
                     for (new_mqtt.endpoints) |ep| {
-                        if (!hasModelOverride(ep.model_override)) {
+                        if (!hasGeneralModelOverride(ep.model_override)) {
                             log.info("Global model changed, hot-updating MQTT endpoint '{s}'", .{endpointLabel(ep.endpoint_id, ep.listen_topic)});
-                            self.hotUpdateSessionByEndpointGlobal("mqtt", new_mqtt.account_id, ep, new_config);
+                            const merged = mergeGlobalWithEndpoint(global_mo, ep.model_override);
+                            self.hotUpdateSessionByEndpoint("mqtt", new_mqtt.account_id, ep, merged);
                         }
                     }
                 }
@@ -566,10 +597,12 @@ pub const ChannelManager = struct {
                 }
 
                 if (global_model_changed and !topology_changed) {
+                    const global_mo_rs = buildGlobalModelOverride(new_config);
                     for (new_rs.endpoints) |ep| {
-                        if (!hasModelOverride(ep.model_override)) {
+                        if (!hasGeneralModelOverride(ep.model_override)) {
                             log.info("Global model changed, hot-updating Redis Stream endpoint '{s}'", .{endpointLabel(ep.endpoint_id, ep.listen_topic)});
-                            self.hotUpdateSessionByRsEndpointGlobal("redis_stream", new_rs.account_id, ep, new_config);
+                            const merged_rs = mergeGlobalWithEndpoint(global_mo_rs, ep.model_override);
+                            self.hotUpdateSessionByRsEndpoint("redis_stream", new_rs.account_id, ep, merged_rs);
                         }
                     }
                 }
@@ -901,9 +934,20 @@ fn findRsEndpointById(endpoints: []const config_types.RedisStreamEndpointConfig,
     return null;
 }
 
-/// Check if a ChannelModelOverride has any explicit overrides set.
-fn hasModelOverride(mo: config_types.ChannelModelOverride) bool {
+/// Check if a ChannelModelOverride has any general (provider/model/temperature/tokens)
+/// overrides set.  Used by hot-reload guards so that endpoints which only
+/// override sub-agent / tools-reviewer fields still inherit global general-model
+/// changes.
+fn hasGeneralModelOverride(mo: config_types.ChannelModelOverride) bool {
     return mo.provider != null or mo.model != null or mo.max_context_tokens != 0 or mo.temperature != null;
+}
+
+/// Check if a ChannelModelOverride has *any* explicit overrides set (general
+/// + sub-agent + tools-reviewer).  Useful for serialisation / equality checks.
+fn hasModelOverride(mo: config_types.ChannelModelOverride) bool {
+    return hasGeneralModelOverride(mo) or
+        mo.sub_agent_provider != null or mo.sub_agent_model != null or
+        mo.tools_reviewer_provider != null or mo.tools_reviewer_model != null;
 }
 
 /// Build the session key prefix for an endpoint: uses endpoint_id when set,
@@ -959,6 +1003,16 @@ fn buildGlobalModelOverride(cfg: *const Config) config_types.ChannelModelOverrid
         .model = if (cfg.default_model) |m| (if (m.len > 0) m else null) else null,
         .max_context_tokens = cfg.agent.max_context_tokens,
         .temperature = cfg.default_temperature,
+        .sub_agent_provider = if (cfg.sub_agent_provider) |p| (if (p.len > 0) p else null) else null,
+        .sub_agent_model = if (cfg.sub_agent_model) |m| (if (m.len > 0) m else null) else null,
+        .sub_agent_temperature = cfg.sub_agent_temperature,
+        .sub_agent_max_context_tokens = cfg.sub_agent_max_context_tokens,
+        .sub_agent_base_url = if (cfg.sub_agent_base_url) |u| (if (u.len > 0) u else null) else null,
+        .tools_reviewer_provider = if (cfg.tools_reviewer_provider) |p| (if (p.len > 0) p else null) else null,
+        .tools_reviewer_model = if (cfg.tools_reviewer_model) |m| (if (m.len > 0) m else null) else null,
+        .tools_reviewer_temperature = cfg.tools_reviewer_temperature,
+        .tools_reviewer_max_context_tokens = cfg.tools_reviewer_max_context_tokens,
+        .tools_reviewer_base_url = if (cfg.tools_reviewer_base_url) |u| (if (u.len > 0) u else null) else null,
     };
 }
 
@@ -967,15 +1021,64 @@ fn modelOverrideEqual(a: config_types.ChannelModelOverride, b: config_types.Chan
     if (a.max_context_tokens != b.max_context_tokens) return false;
     if (!optionalStrEql(a.provider, b.provider)) return false;
     if (!optionalStrEql(a.model, b.model)) return false;
-    // Compare temperature with tolerance
-    if (a.temperature == null and b.temperature == null) {
-        // both null, equal
-    } else if (a.temperature != null and b.temperature != null) {
-        if (@abs(a.temperature.? - b.temperature.?) > 0.001) return false;
-    } else {
-        return false; // one null, one not
-    }
+    if (!optionalF64Eql(a.temperature, b.temperature)) return false;
+    if (!optionalStrEql(a.sub_agent_provider, b.sub_agent_provider)) return false;
+    if (!optionalStrEql(a.sub_agent_model, b.sub_agent_model)) return false;
+    if (!optionalF64Eql(a.sub_agent_temperature, b.sub_agent_temperature)) return false;
+    if (a.sub_agent_max_context_tokens != b.sub_agent_max_context_tokens) return false;
+    if (!optionalStrEql(a.sub_agent_base_url, b.sub_agent_base_url)) return false;
+    if (!optionalStrEql(a.tools_reviewer_provider, b.tools_reviewer_provider)) return false;
+    if (!optionalStrEql(a.tools_reviewer_model, b.tools_reviewer_model)) return false;
+    if (!optionalF64Eql(a.tools_reviewer_temperature, b.tools_reviewer_temperature)) return false;
+    if (a.tools_reviewer_max_context_tokens != b.tools_reviewer_max_context_tokens) return false;
+    if (!optionalStrEql(a.tools_reviewer_base_url, b.tools_reviewer_base_url)) return false;
+    if (a.sub_agent_max_iterations != b.sub_agent_max_iterations) return false;
+    if (a.sub_agent_review_after != b.sub_agent_review_after) return false;
     return true;
+}
+
+fn optionalF64Eql(a: ?f64, b: ?f64) bool {
+    if (a == null and b == null) return true;
+    if (a != null and b != null) return @abs(a.? - b.?) <= 0.001;
+    return false;
+}
+
+/// Check if a channel config (MQTT or Redis Stream) has model_override.model
+/// set on ALL of its endpoints.  Used to validate that every endpoint can
+/// resolve an LLM model when no global default_model is configured.
+fn channelConfigHasAllEndpointModels(cfg: anytype) bool {
+    if (@hasField(@TypeOf(cfg), "endpoints")) {
+        for (cfg.endpoints) |ep| {
+            if (ep.model_override.model == null) return false;
+        }
+        return cfg.endpoints.len > 0;
+    }
+    return false;
+}
+
+/// Merge a global ChannelModelOverride with an endpoint's own override.
+/// Endpoint-level fields take priority; global fields fill in the gaps.
+/// This prevents hot-reload of global config from clobbering per-endpoint
+/// sub_agent/tools_reviewer overrides.
+fn mergeGlobalWithEndpoint(global: config_types.ChannelModelOverride, endpoint: config_types.ChannelModelOverride) config_types.ChannelModelOverride {
+    return .{
+        .provider = endpoint.provider orelse global.provider,
+        .model = endpoint.model orelse global.model,
+        .max_context_tokens = if (endpoint.max_context_tokens > 0) endpoint.max_context_tokens else global.max_context_tokens,
+        .temperature = endpoint.temperature orelse global.temperature,
+        .sub_agent_provider = endpoint.sub_agent_provider orelse global.sub_agent_provider,
+        .sub_agent_model = endpoint.sub_agent_model orelse global.sub_agent_model,
+        .sub_agent_temperature = endpoint.sub_agent_temperature orelse global.sub_agent_temperature,
+        .sub_agent_max_context_tokens = if (endpoint.sub_agent_max_context_tokens > 0) endpoint.sub_agent_max_context_tokens else global.sub_agent_max_context_tokens,
+        .sub_agent_base_url = endpoint.sub_agent_base_url orelse global.sub_agent_base_url,
+        .tools_reviewer_provider = endpoint.tools_reviewer_provider orelse global.tools_reviewer_provider,
+        .tools_reviewer_model = endpoint.tools_reviewer_model orelse global.tools_reviewer_model,
+        .tools_reviewer_temperature = endpoint.tools_reviewer_temperature orelse global.tools_reviewer_temperature,
+        .tools_reviewer_max_context_tokens = if (endpoint.tools_reviewer_max_context_tokens > 0) endpoint.tools_reviewer_max_context_tokens else global.tools_reviewer_max_context_tokens,
+        .tools_reviewer_base_url = endpoint.tools_reviewer_base_url orelse global.tools_reviewer_base_url,
+        .sub_agent_max_iterations = if (endpoint.sub_agent_max_iterations > 0) endpoint.sub_agent_max_iterations else global.sub_agent_max_iterations,
+        .sub_agent_review_after = if (endpoint.sub_agent_review_after > 0) endpoint.sub_agent_review_after else global.sub_agent_review_after,
+    };
 }
 
 fn optionalStrEql(a: ?[]const u8, b: ?[]const u8) bool {
@@ -991,12 +1094,380 @@ fn globalModelConfigChanged(old: *const Config, new: *const Config) bool {
     if (@abs(old.default_temperature - new.default_temperature) > 0.001) return true;
     if (old.agent.max_context_tokens != new.agent.max_context_tokens) return true;
     if (old.agent.token_limit != new.agent.token_limit) return true;
+    if (!optionalStrEql(old.sub_agent_provider, new.sub_agent_provider)) return true;
+    if (!optionalStrEql(old.sub_agent_model, new.sub_agent_model)) return true;
+    if (!optionalStrEql(old.tools_reviewer_provider, new.tools_reviewer_provider)) return true;
+    if (!optionalStrEql(old.tools_reviewer_model, new.tools_reviewer_model)) return true;
+    if (!optionalF64Eql(old.sub_agent_temperature, new.sub_agent_temperature)) return true;
+    if (old.sub_agent_max_context_tokens != new.sub_agent_max_context_tokens) return true;
+    if (!optionalStrEql(old.sub_agent_base_url, new.sub_agent_base_url)) return true;
+    if (!optionalF64Eql(old.tools_reviewer_temperature, new.tools_reviewer_temperature)) return true;
+    if (old.tools_reviewer_max_context_tokens != new.tools_reviewer_max_context_tokens) return true;
+    if (!optionalStrEql(old.tools_reviewer_base_url, new.tools_reviewer_base_url)) return true;
     return false;
 }
 
 // ════════════════════════════════════════════════════════════════════════════
 // Tests
 // ════════════════════════════════════════════════════════════════════════════
+
+test "hasGeneralModelOverride only checks general fields" {
+    try std.testing.expect(!hasGeneralModelOverride(.{}));
+    try std.testing.expect(hasGeneralModelOverride(.{ .provider = "p" }));
+    try std.testing.expect(hasGeneralModelOverride(.{ .model = "m" }));
+    try std.testing.expect(hasGeneralModelOverride(.{ .max_context_tokens = 1024 }));
+    try std.testing.expect(hasGeneralModelOverride(.{ .temperature = 0.5 }));
+    // sub-agent / tools-reviewer only → should NOT count as general override
+    try std.testing.expect(!hasGeneralModelOverride(.{ .sub_agent_model = "m" }));
+    try std.testing.expect(!hasGeneralModelOverride(.{ .sub_agent_provider = "p" }));
+    try std.testing.expect(!hasGeneralModelOverride(.{ .tools_reviewer_model = "m" }));
+    try std.testing.expect(!hasGeneralModelOverride(.{ .tools_reviewer_provider = "p" }));
+}
+
+test "hasModelOverride detects all fields including sub_agent" {
+    try std.testing.expect(!hasModelOverride(.{}));
+    try std.testing.expect(hasModelOverride(.{ .sub_agent_model = "m" }));
+    try std.testing.expect(hasModelOverride(.{ .sub_agent_provider = "p" }));
+    try std.testing.expect(hasModelOverride(.{ .tools_reviewer_model = "m" }));
+    try std.testing.expect(hasModelOverride(.{ .tools_reviewer_provider = "p" }));
+    // existing fields still work
+    try std.testing.expect(hasModelOverride(.{ .provider = "p" }));
+    try std.testing.expect(hasModelOverride(.{ .model = "m" }));
+    try std.testing.expect(hasModelOverride(.{ .max_context_tokens = 1024 }));
+    try std.testing.expect(hasModelOverride(.{ .temperature = 0.5 }));
+}
+
+test "modelOverrideEqual compares sub_agent and tools_reviewer fields" {
+    const a = config_types.ChannelModelOverride{
+        .sub_agent_provider = "prov-a",
+        .sub_agent_model = "model-a",
+        .tools_reviewer_provider = "prov-b",
+        .tools_reviewer_model = "model-b",
+    };
+    // Same values
+    try std.testing.expect(modelOverrideEqual(a, .{
+        .sub_agent_provider = "prov-a",
+        .sub_agent_model = "model-a",
+        .tools_reviewer_provider = "prov-b",
+        .tools_reviewer_model = "model-b",
+    }));
+    // Different sub_agent_model
+    try std.testing.expect(!modelOverrideEqual(a, .{
+        .sub_agent_provider = "prov-a",
+        .sub_agent_model = "model-x",
+        .tools_reviewer_provider = "prov-b",
+        .tools_reviewer_model = "model-b",
+    }));
+    // Different tools_reviewer_provider
+    try std.testing.expect(!modelOverrideEqual(a, .{
+        .sub_agent_provider = "prov-a",
+        .sub_agent_model = "model-a",
+        .tools_reviewer_provider = "prov-x",
+        .tools_reviewer_model = "model-b",
+    }));
+    // null vs set
+    try std.testing.expect(!modelOverrideEqual(a, .{
+        .sub_agent_provider = null,
+        .sub_agent_model = "model-a",
+    }));
+    // Both null
+    try std.testing.expect(modelOverrideEqual(.{}, .{}));
+}
+
+test "globalModelConfigChanged detects sub_agent and tools_reviewer changes" {
+    const base = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .default_model = "test/model",
+        .sub_agent_model = "sa-model",
+        .tools_reviewer_model = "tr-model",
+    };
+    // No change
+    try std.testing.expect(!globalModelConfigChanged(&base, &base));
+
+    // sub_agent_model changed
+    var changed_sa = base;
+    changed_sa.sub_agent_model = "sa-model-new";
+    try std.testing.expect(globalModelConfigChanged(&base, &changed_sa));
+
+    // tools_reviewer_model changed
+    var changed_tr = base;
+    changed_tr.tools_reviewer_model = "tr-model-new";
+    try std.testing.expect(globalModelConfigChanged(&base, &changed_tr));
+
+    // sub_agent_provider changed
+    var changed_sap = base;
+    changed_sap.sub_agent_provider = "new-prov";
+    try std.testing.expect(globalModelConfigChanged(&base, &changed_sap));
+
+    // tools_reviewer_provider changed
+    var changed_trp = base;
+    changed_trp.tools_reviewer_provider = "new-prov";
+    try std.testing.expect(globalModelConfigChanged(&base, &changed_trp));
+}
+
+test "buildGlobalModelOverride includes sub_agent and tools_reviewer fields" {
+    const cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .default_model = "test/model",
+        .sub_agent_provider = "sa-prov",
+        .sub_agent_model = "sa-model",
+        .tools_reviewer_provider = "tr-prov",
+        .tools_reviewer_model = "tr-model",
+    };
+    const mo = buildGlobalModelOverride(&cfg);
+    try std.testing.expectEqualStrings("sa-prov", mo.sub_agent_provider.?);
+    try std.testing.expectEqualStrings("sa-model", mo.sub_agent_model.?);
+    try std.testing.expectEqualStrings("tr-prov", mo.tools_reviewer_provider.?);
+    try std.testing.expectEqualStrings("tr-model", mo.tools_reviewer_model.?);
+}
+
+test "buildGlobalModelOverride null when not configured" {
+    const cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+    };
+    const mo = buildGlobalModelOverride(&cfg);
+    try std.testing.expect(mo.sub_agent_provider == null);
+    try std.testing.expect(mo.sub_agent_model == null);
+    try std.testing.expect(mo.tools_reviewer_provider == null);
+    try std.testing.expect(mo.tools_reviewer_model == null);
+}
+
+// ---------------------------------------------------------------------------
+// Unified model config fields tests
+// ---------------------------------------------------------------------------
+
+test "buildGlobalModelOverride includes temperature, max_context_tokens, base_url for sub_agent and tools_reviewer" {
+    const cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .default_model = "test/model",
+        .sub_agent_provider = "sa-prov",
+        .sub_agent_model = "sa-model",
+        .sub_agent_temperature = 0.3,
+        .sub_agent_max_context_tokens = 4096,
+        .sub_agent_base_url = "https://sa.example.com",
+        .tools_reviewer_provider = "tr-prov",
+        .tools_reviewer_model = "tr-model",
+        .tools_reviewer_temperature = 0.1,
+        .tools_reviewer_max_context_tokens = 2048,
+        .tools_reviewer_base_url = "https://tr.example.com",
+    };
+    const mo = buildGlobalModelOverride(&cfg);
+    try std.testing.expectEqualStrings("sa-prov", mo.sub_agent_provider.?);
+    try std.testing.expectEqualStrings("sa-model", mo.sub_agent_model.?);
+    try std.testing.expect(@abs(mo.sub_agent_temperature.? - 0.3) < 0.001);
+    try std.testing.expectEqual(@as(u64, 4096), mo.sub_agent_max_context_tokens);
+    try std.testing.expectEqualStrings("https://sa.example.com", mo.sub_agent_base_url.?);
+    try std.testing.expectEqualStrings("tr-prov", mo.tools_reviewer_provider.?);
+    try std.testing.expectEqualStrings("tr-model", mo.tools_reviewer_model.?);
+    try std.testing.expect(@abs(mo.tools_reviewer_temperature.? - 0.1) < 0.001);
+    try std.testing.expectEqual(@as(u64, 2048), mo.tools_reviewer_max_context_tokens);
+    try std.testing.expectEqualStrings("https://tr.example.com", mo.tools_reviewer_base_url.?);
+}
+
+test "buildGlobalModelOverride normalizes empty base_url to null" {
+    const cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .sub_agent_base_url = "",
+        .tools_reviewer_base_url = "",
+    };
+    const mo = buildGlobalModelOverride(&cfg);
+    try std.testing.expect(mo.sub_agent_base_url == null);
+    try std.testing.expect(mo.tools_reviewer_base_url == null);
+}
+
+test "modelOverrideEqual compares temperature, max_context_tokens, base_url fields" {
+    const a = config_types.ChannelModelOverride{
+        .sub_agent_temperature = 0.3,
+        .sub_agent_max_context_tokens = 4096,
+        .sub_agent_base_url = "https://sa.example.com",
+        .tools_reviewer_temperature = 0.1,
+        .tools_reviewer_max_context_tokens = 2048,
+        .tools_reviewer_base_url = "https://tr.example.com",
+    };
+    // Same values
+    try std.testing.expect(modelOverrideEqual(a, .{
+        .sub_agent_temperature = 0.3,
+        .sub_agent_max_context_tokens = 4096,
+        .sub_agent_base_url = "https://sa.example.com",
+        .tools_reviewer_temperature = 0.1,
+        .tools_reviewer_max_context_tokens = 2048,
+        .tools_reviewer_base_url = "https://tr.example.com",
+    }));
+    // Different sub_agent_temperature
+    try std.testing.expect(!modelOverrideEqual(a, .{
+        .sub_agent_temperature = 0.5,
+        .sub_agent_max_context_tokens = 4096,
+        .sub_agent_base_url = "https://sa.example.com",
+        .tools_reviewer_temperature = 0.1,
+        .tools_reviewer_max_context_tokens = 2048,
+        .tools_reviewer_base_url = "https://tr.example.com",
+    }));
+    // Different sub_agent_max_context_tokens
+    try std.testing.expect(!modelOverrideEqual(a, .{
+        .sub_agent_temperature = 0.3,
+        .sub_agent_max_context_tokens = 8192,
+        .sub_agent_base_url = "https://sa.example.com",
+        .tools_reviewer_temperature = 0.1,
+        .tools_reviewer_max_context_tokens = 2048,
+        .tools_reviewer_base_url = "https://tr.example.com",
+    }));
+    // Different sub_agent_base_url
+    try std.testing.expect(!modelOverrideEqual(a, .{
+        .sub_agent_temperature = 0.3,
+        .sub_agent_max_context_tokens = 4096,
+        .sub_agent_base_url = "https://other.example.com",
+        .tools_reviewer_temperature = 0.1,
+        .tools_reviewer_max_context_tokens = 2048,
+        .tools_reviewer_base_url = "https://tr.example.com",
+    }));
+    // Different tools_reviewer_temperature
+    try std.testing.expect(!modelOverrideEqual(a, .{
+        .sub_agent_temperature = 0.3,
+        .sub_agent_max_context_tokens = 4096,
+        .sub_agent_base_url = "https://sa.example.com",
+        .tools_reviewer_temperature = 0.9,
+        .tools_reviewer_max_context_tokens = 2048,
+        .tools_reviewer_base_url = "https://tr.example.com",
+    }));
+    // null vs set temperature
+    try std.testing.expect(!modelOverrideEqual(a, .{
+        .sub_agent_temperature = null,
+        .sub_agent_max_context_tokens = 4096,
+        .sub_agent_base_url = "https://sa.example.com",
+        .tools_reviewer_temperature = 0.1,
+        .tools_reviewer_max_context_tokens = 2048,
+        .tools_reviewer_base_url = "https://tr.example.com",
+    }));
+}
+
+test "modelOverrideEqual compares sub_agent_max_iterations and review_after" {
+    const a = config_types.ChannelModelOverride{
+        .sub_agent_max_iterations = 5,
+        .sub_agent_review_after = 3,
+    };
+    try std.testing.expect(modelOverrideEqual(a, .{
+        .sub_agent_max_iterations = 5,
+        .sub_agent_review_after = 3,
+    }));
+    try std.testing.expect(!modelOverrideEqual(a, .{
+        .sub_agent_max_iterations = 10,
+        .sub_agent_review_after = 3,
+    }));
+    try std.testing.expect(!modelOverrideEqual(a, .{
+        .sub_agent_max_iterations = 5,
+        .sub_agent_review_after = 7,
+    }));
+}
+
+test "mergeGlobalWithEndpoint merges temperature, max_context_tokens, base_url" {
+    const global = config_types.ChannelModelOverride{
+        .provider = "global-prov",
+        .model = "global-model",
+        .sub_agent_temperature = 0.3,
+        .sub_agent_max_context_tokens = 4096,
+        .sub_agent_base_url = "https://global-sa.example.com",
+        .tools_reviewer_temperature = 0.1,
+        .tools_reviewer_max_context_tokens = 2048,
+        .tools_reviewer_base_url = "https://global-tr.example.com",
+        .sub_agent_max_iterations = 5,
+        .sub_agent_review_after = 3,
+    };
+
+    // Endpoint with no overrides → uses global values
+    {
+        const merged = mergeGlobalWithEndpoint(global, .{});
+        try std.testing.expect(@abs(merged.sub_agent_temperature.? - 0.3) < 0.001);
+        try std.testing.expectEqual(@as(u64, 4096), merged.sub_agent_max_context_tokens);
+        try std.testing.expectEqualStrings("https://global-sa.example.com", merged.sub_agent_base_url.?);
+        try std.testing.expect(@abs(merged.tools_reviewer_temperature.? - 0.1) < 0.001);
+        try std.testing.expectEqual(@as(u64, 2048), merged.tools_reviewer_max_context_tokens);
+        try std.testing.expectEqualStrings("https://global-tr.example.com", merged.tools_reviewer_base_url.?);
+        try std.testing.expectEqual(@as(u32, 5), merged.sub_agent_max_iterations);
+        try std.testing.expectEqual(@as(u32, 3), merged.sub_agent_review_after);
+    }
+
+    // Endpoint overrides specific fields → endpoint wins
+    {
+        const endpoint = config_types.ChannelModelOverride{
+            .sub_agent_temperature = 0.8,
+            .sub_agent_max_context_tokens = 16384,
+            .sub_agent_base_url = "https://ep-sa.example.com",
+            .tools_reviewer_temperature = 0.5,
+            .sub_agent_max_iterations = 10,
+        };
+        const merged = mergeGlobalWithEndpoint(global, endpoint);
+        try std.testing.expect(@abs(merged.sub_agent_temperature.? - 0.8) < 0.001);
+        try std.testing.expectEqual(@as(u64, 16384), merged.sub_agent_max_context_tokens);
+        try std.testing.expectEqualStrings("https://ep-sa.example.com", merged.sub_agent_base_url.?);
+        try std.testing.expect(@abs(merged.tools_reviewer_temperature.? - 0.5) < 0.001);
+        // tools_reviewer_max_context_tokens and base_url fall back to global
+        try std.testing.expectEqual(@as(u64, 2048), merged.tools_reviewer_max_context_tokens);
+        try std.testing.expectEqualStrings("https://global-tr.example.com", merged.tools_reviewer_base_url.?);
+        try std.testing.expectEqual(@as(u32, 10), merged.sub_agent_max_iterations);
+        try std.testing.expectEqual(@as(u32, 3), merged.sub_agent_review_after); // from global
+    }
+}
+
+test "mergeGlobalWithEndpoint does not cascade general temperature to sub_agent" {
+    // Global has general temperature but NO sub_agent_temperature
+    const global = config_types.ChannelModelOverride{
+        .temperature = 0.7,
+        .model = "global-model",
+    };
+    // Endpoint also has no sub_agent_temperature
+    const endpoint = config_types.ChannelModelOverride{};
+    const merged = mergeGlobalWithEndpoint(global, endpoint);
+    // sub_agent_temperature should remain null (not cascaded from general 0.7)
+    try std.testing.expect(merged.sub_agent_temperature == null);
+    try std.testing.expect(merged.tools_reviewer_temperature == null);
+    // But general temperature IS preserved
+    try std.testing.expect(@abs(merged.temperature.? - 0.7) < 0.001);
+}
+
+test "globalModelConfigChanged detects temperature and base_url changes" {
+    const base = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .default_model = "test/model",
+        .sub_agent_temperature = 0.3,
+        .tools_reviewer_temperature = 0.1,
+        .sub_agent_base_url = "https://sa.example.com",
+        .tools_reviewer_base_url = "https://tr.example.com",
+    };
+    // No change
+    try std.testing.expect(!globalModelConfigChanged(&base, &base));
+
+    // sub_agent_temperature changed
+    var changed_sat = base;
+    changed_sat.sub_agent_temperature = 0.5;
+    try std.testing.expect(globalModelConfigChanged(&base, &changed_sat));
+
+    // tools_reviewer_temperature changed
+    var changed_trt = base;
+    changed_trt.tools_reviewer_temperature = 0.9;
+    try std.testing.expect(globalModelConfigChanged(&base, &changed_trt));
+
+    // sub_agent_base_url changed
+    var changed_sabu = base;
+    changed_sabu.sub_agent_base_url = "https://new.example.com";
+    try std.testing.expect(globalModelConfigChanged(&base, &changed_sabu));
+
+    // tools_reviewer_base_url changed
+    var changed_trbu = base;
+    changed_trbu.tools_reviewer_base_url = "https://new.example.com";
+    try std.testing.expect(globalModelConfigChanged(&base, &changed_trbu));
+}
 
 test "PollingState has telegram signal and matrix variants" {
     try std.testing.expect(@intFromEnum(@as(std.meta.Tag(PollingState), .telegram)) !=
@@ -1312,6 +1783,7 @@ test "ChannelManager collectConfiguredChannels wires listener types accounts and
     const config = Config{
         .workspace_dir = "/tmp",
         .config_path = "/tmp/config.json",
+        .default_model = "test-model",
         .allocator = allocator,
         .channels = .{
             .telegram = &telegram_accounts,
@@ -1575,6 +2047,7 @@ test "ChannelManager marks qq webhook receive_mode as webhook_only" {
     const config = Config{
         .workspace_dir = "/tmp",
         .config_path = "/tmp/config.json",
+        .default_model = "test-model",
         .allocator = allocator,
         .channels = .{
             .qq = &qq_accounts,
@@ -1612,6 +2085,7 @@ test "ChannelManager collects web channel from config" {
     const config = Config{
         .workspace_dir = "/tmp",
         .config_path = "/tmp/config.json",
+        .default_model = "test-model",
         .allocator = allocator,
         .channels = .{
             .web = &web_accounts,

@@ -13,7 +13,8 @@ NullClaw monitors the `config.json` file for changes and dynamically applies upd
 | Change | Effect |
 |--------|--------|
 | Global model params (`provider`, `model`, `max_context_tokens`, `temperature`) | Sessions without per-endpoint overrides are hot-updated in place. Conversation history is preserved. |
-| Per-endpoint `model_override` | Only sessions on that endpoint are hot-updated. Conversation history is preserved. |
+| Global sub-agent / tools-reviewer model (`sub_agent_provider`, `sub_agent_model`, `tools_reviewer_provider`, `tools_reviewer_model`) | Same as global model params — sessions without per-endpoint overrides are hot-updated. |
+| Per-endpoint `model_override` (including `sub_agent_*` / `tools_reviewer_*`) | Only sessions on that endpoint are hot-updated. Conversation history is preserved. |
 | Structural endpoint change (host, port, keys, topic) | Sessions on that endpoint are evicted (reset). The channel is restarted with the new config. |
 | Endpoint removed | Sessions on that endpoint are evicted and resources freed. |
 | Endpoint added | A new channel listener is started. No existing sessions are affected. |
@@ -198,6 +199,76 @@ MQTT account 'staging' added, starting channel
 Global model changed, hot-updating MQTT endpoint 'ddd...'
 Config reload complete
 ```
+
+## Sub-Agent and Tools-Reviewer Model Configuration
+
+NullClaw supports dedicated LLM model overrides for the **sub-agent** (background task execution) and the **tools reviewer** (the lightweight LLM call that periodically reviews whether a sub-agent tool-call loop is making progress). These overrides exist at two levels and follow a multi-tier fallback chain.
+
+### Global Sub-Agent / Tools-Reviewer Model
+
+Set at the top level of `config.json`:
+
+```jsonc
+{
+  "sub_agent_provider": "anthropic",
+  "sub_agent_model": "claude-sonnet-4-20250514",
+  "tools_reviewer_provider": "openrouter",
+  "tools_reviewer_model": "google/gemini-2.5-flash"
+}
+```
+
+When set, sub-agent LLM calls use `sub_agent_provider` / `sub_agent_model` instead of the global `provider` / `model`. Similarly, tools-reviewer LLM calls use `tools_reviewer_provider` / `tools_reviewer_model`. If not set, both fall back to the global default provider/model.
+
+### Per-Endpoint Sub-Agent / Tools-Reviewer Model
+
+Set within an endpoint's `model_override`:
+
+```jsonc
+{
+  "endpoints": [
+    {
+      "endpoint_id": "abc123...",
+      "listen_topic": "support",
+      "model_override": {
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-20250514",
+        "sub_agent_provider": "openrouter",
+        "sub_agent_model": "google/gemini-2.5-flash",
+        "tools_reviewer_provider": "openrouter",
+        "tools_reviewer_model": "google/gemini-2.5-flash"
+      }
+    }
+  ]
+}
+```
+
+### Fallback Chain
+
+The resolution order for sub-agent model (tools-reviewer follows the same pattern):
+
+1. **Channel `model_override.sub_agent_model`** — if the endpoint explicitly sets it, use it.
+2. **Channel `model_override.model`** (general) — if the endpoint has its own general model but no sub-agent-specific one, use the channel's general model.
+3. **Global `sub_agent_model`** — if the channel has no model override at all, use the global sub-agent model.
+4. **Global `model`** (default) — ultimate fallback to the global default model.
+
+The same chain applies to `sub_agent_provider`, `tools_reviewer_model`, and `tools_reviewer_provider`.
+
+### Hot-Reload Behavior
+
+All four fields (`sub_agent_provider`, `sub_agent_model`, `tools_reviewer_provider`, `tools_reviewer_model`) are hot-reloadable at both the global and per-endpoint level:
+
+- **Global change + endpoint has override**: No effect — the endpoint keeps its own override.
+- **Global change + endpoint has no override**: Session is hot-updated with the new global settings.
+- **Endpoint override change**: Only that endpoint's session is hot-updated.
+
+New sub-agent / tools-reviewer invocations after the reload will use the updated model. Running sub-agent calls are not interrupted.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `sub_agent_provider` | string (optional) | *(global default_provider)* | LLM provider for sub-agent calls. |
+| `sub_agent_model` | string (optional) | *(global default_model)* | LLM model for sub-agent calls. |
+| `tools_reviewer_provider` | string (optional) | *(global default_provider)* | LLM provider for tools-reviewer calls. |
+| `tools_reviewer_model` | string (optional) | *(global default_model)* | LLM model for tools-reviewer calls. |
 
 ## Sub-Agent Configuration
 

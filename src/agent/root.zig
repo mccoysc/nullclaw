@@ -28,6 +28,8 @@ const ObserverEvent = observability.ObserverEvent;
 const SecurityPolicy = @import("../security/policy.zig").SecurityPolicy;
 
 const skills_mod = @import("../skills.zig");
+const provider_factory = @import("../providers/factory.zig");
+const api_key_mod = @import("../providers/api_key.zig");
 const cache = memory_mod.cache;
 pub const dispatcher = @import("dispatcher.zig");
 pub const compaction = @import("compaction.zig");
@@ -299,6 +301,21 @@ pub const Agent = struct {
     /// 0 = use compiled default (skills_mod.SUB_AGENT_DEFAULT_REVIEW_AFTER).
     sub_agent_review_after: u32 = 0,
 
+    /// Provider/model/temperature/max_context_tokens/base_url for sub-agent LLM calls.
+    /// null = use the agent's own defaults.  Defaults: temperature=0.3.
+    sub_agent_provider: ?[]const u8 = null,
+    sub_agent_model: ?[]const u8 = null,
+    sub_agent_temperature: ?f64 = null,
+    sub_agent_max_context_tokens: u64 = 0,
+    sub_agent_base_url: ?[]const u8 = null,
+    /// Provider/model/temperature/max_context_tokens/base_url for tools-reviewer LLM calls.
+    /// null = use the agent's own defaults.  Defaults: temperature=0.1.
+    tools_reviewer_provider: ?[]const u8 = null,
+    tools_reviewer_model: ?[]const u8 = null,
+    tools_reviewer_temperature: ?f64 = null,
+    tools_reviewer_max_context_tokens: u64 = 0,
+    tools_reviewer_base_url: ?[]const u8 = null,
+
     /// Per-turn MCP tool filter groups (slice into config-owned memory; not freed by Agent).
     /// Empty = no filtering; all tool specs are sent as-is.
     tool_filter_groups: []const config_types.ToolFilterGroup = &.{},
@@ -355,6 +372,21 @@ pub const Agent = struct {
     };
 
     /// Initialize agent from a loaded Config.
+    /// Create an Agent from config, optionally using a channel-level model
+    /// override when no global default_model is set.
+    pub fn fromConfigWithChannelModel(
+        allocator: std.mem.Allocator,
+        cfg: *const Config,
+        provider_i: Provider,
+        tools: []const Tool,
+        mem: ?Memory,
+        observer_i: Observer,
+        channel_model: ?[]const u8,
+    ) !Agent {
+        const default_model = channel_model orelse cfg.default_model orelse return error.NoDefaultModel;
+        return fromConfigInner(allocator, cfg, provider_i, tools, mem, observer_i, default_model);
+    }
+
     pub fn fromConfig(
         allocator: std.mem.Allocator,
         cfg: *const Config,
@@ -364,6 +396,18 @@ pub const Agent = struct {
         observer_i: Observer,
     ) !Agent {
         const default_model = cfg.default_model orelse return error.NoDefaultModel;
+        return fromConfigInner(allocator, cfg, provider_i, tools, mem, observer_i, default_model);
+    }
+
+    fn fromConfigInner(
+        allocator: std.mem.Allocator,
+        cfg: *const Config,
+        provider_i: Provider,
+        tools: []const Tool,
+        mem: ?Memory,
+        observer_i: Observer,
+        default_model: []const u8,
+    ) !Agent {
         const token_limit_override = if (cfg.agent.token_limit_explicit) cfg.agent.token_limit else null;
         var resolved_token_limit = context_tokens.resolveContextTokens(token_limit_override, default_model);
         // Apply global max_context_tokens cap if configured (0 = no cap)
@@ -426,6 +470,16 @@ pub const Agent = struct {
             .tool_filter_groups = cfg.agent.tool_filter_groups,
             .sub_agent_max_iterations = cfg.agent.sub_agent_max_iterations,
             .sub_agent_review_after = cfg.agent.sub_agent_review_after,
+            .sub_agent_provider = cfg.sub_agent_provider,
+            .sub_agent_model = cfg.sub_agent_model,
+            .sub_agent_temperature = cfg.sub_agent_temperature,
+            .sub_agent_max_context_tokens = cfg.sub_agent_max_context_tokens,
+            .sub_agent_base_url = cfg.sub_agent_base_url,
+            .tools_reviewer_provider = cfg.tools_reviewer_provider,
+            .tools_reviewer_model = cfg.tools_reviewer_model,
+            .tools_reviewer_temperature = cfg.tools_reviewer_temperature,
+            .tools_reviewer_max_context_tokens = cfg.tools_reviewer_max_context_tokens,
+            .tools_reviewer_base_url = cfg.tools_reviewer_base_url,
             .exec_security = switch (cfg.autonomy.level) {
                 .full => .full,
                 .read_only => .deny,
@@ -583,6 +637,56 @@ pub const Agent = struct {
                 skills_mod.listSkills(self.allocator, self.workspace_dir) catch null;
         }
         return skills_mod.listSkills(self.allocator, self.workspace_dir) catch null;
+    }
+
+    /// Resolve a provider for sub-agent or tools-reviewer LLM calls.
+    /// If `override_provider` names a provider different from `default_provider`,
+    /// create a temporary ProviderHolder on the arena, resolve its API key from
+    /// configured_providers, and return its vtable.  Otherwise return the agent's
+    /// own provider (no allocation).
+    fn resolveOverrideProvider(
+        self: *const Agent,
+        arena: std.mem.Allocator,
+        override_provider: ?[]const u8,
+        override_base_url: ?[]const u8,
+    ) ?Provider {
+        const target = override_provider orelse return null;
+        if (target.len == 0) return null;
+        if (std.mem.eql(u8, target, self.default_provider) and override_base_url == null) return null;
+
+        // Resolve API key for the target provider
+        const resolved_key = api_key_mod.resolveApiKeyFromConfig(
+            arena,
+            target,
+            self.configured_providers,
+        ) catch null;
+
+        // Use explicit base_url if provided; otherwise look up from configured_providers
+        const base_url = override_base_url orelse blk: {
+            for (self.configured_providers) |entry| {
+                if (std.mem.eql(u8, entry.name, target)) break :blk entry.base_url;
+            }
+            break :blk null;
+        };
+
+        // Look up native_tools setting from configured_providers
+        const native_tools = blk_nt: {
+            for (self.configured_providers) |entry| {
+                if (std.mem.eql(u8, entry.name, target)) break :blk_nt entry.native_tools;
+            }
+            break :blk_nt true;
+        };
+
+        const holder = arena.create(provider_factory.ProviderHolder) catch return null;
+        holder.* = provider_factory.ProviderHolder.fromConfig(
+            arena,
+            target,
+            resolved_key,
+            base_url,
+            native_tools,
+            null, // user_agent
+        );
+        return holder.provider();
     }
 
     fn appendUniqueString(
@@ -2121,7 +2225,15 @@ pub const Agent = struct {
             };
         };
 
-        const native_tools_enabled = self.provider.supportsNativeTools();
+        // Resolve sub-agent model: sub_agent_model → model_name (fallback already
+        // applied by session layer via applyModelOverride).
+        const sa_model = self.sub_agent_model orelse self.model_name;
+
+        // Resolve sub-agent provider: if sub_agent_provider differs from the
+        // agent's default provider, create a temporary provider for this call.
+        const sa_provider = self.resolveOverrideProvider(arena, self.sub_agent_provider, self.sub_agent_base_url) orelse self.provider;
+
+        const native_tools_enabled = sa_provider.supportsNativeTools();
         var total_iterations: u32 = 0;
         const max_sub_iterations = if (self.sub_agent_max_iterations > 0) self.sub_agent_max_iterations else skills_mod.SUB_AGENT_MAX_ITERATIONS;
 
@@ -2139,25 +2251,25 @@ pub const Agent = struct {
         var tool_call_summaries = std.ArrayListUnmanaged([]const u8).empty;
 
         while (total_iterations < max_sub_iterations) : (total_iterations += 1) {
-            // Call provider with tools
-            const response = self.provider.chat(
+            // Call provider with tools (use resolved sub-agent model/provider)
+            const response = sa_provider.chat(
                 arena,
                 .{
                     .messages = messages.items,
-                    .model = self.model_name,
-                    .temperature = 0.3, // low temperature for deterministic behavior
+                    .model = sa_model,
+                    .temperature = self.sub_agent_temperature orelse 0.3,
                     .max_tokens = self.max_tokens,
                     .tools = if (native_tools_enabled) self.tool_specs else null,
                     .timeout_secs = self.message_timeout_secs,
                 },
-                self.model_name,
-                0.3,
+                sa_model,
+                self.sub_agent_temperature orelse 0.3,
             ) catch |err| {
                 log.warn(
                     "sub-agent error: LLM call failed | error={s} model={s} instructions={s} hook_content={s} iteration={d}",
                     .{
                         @errorName(err),
-                        self.model_name,
+                        sa_model,
                         skill_instructions,
                         hook_content,
                         total_iterations + 1,
@@ -2372,18 +2484,22 @@ pub const Agent = struct {
         review_msgs.append(arena, ChatMessage.system(skills_mod.sub_agent_review_prompt)) catch return null;
         review_msgs.append(arena, ChatMessage.user(user_content)) catch return null;
 
-        const review_response = self.provider.chat(
+        // Resolve tools-reviewer model and provider
+        const tr_model = self.tools_reviewer_model orelse self.model_name;
+        const tr_provider = self.resolveOverrideProvider(arena, self.tools_reviewer_provider, self.tools_reviewer_base_url) orelse self.provider;
+
+        const review_response = tr_provider.chat(
             arena,
             .{
                 .messages = review_msgs.items,
-                .model = self.model_name,
-                .temperature = 0.1, // very low for deterministic judgement
+                .model = tr_model,
+                .temperature = self.tools_reviewer_temperature orelse 0.1,
                 .max_tokens = 200, // only need a short verdict
                 .tools = null,
                 .timeout_secs = self.message_timeout_secs,
             },
-            self.model_name,
-            0.1,
+            tr_model,
+            self.tools_reviewer_temperature orelse 0.1,
         ) catch |err| {
             log.warn("sub-agent review: LLM call failed, continuing loop | error={s}", .{@errorName(err)});
             return null; // on failure, let the loop continue

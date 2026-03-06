@@ -207,6 +207,13 @@ pub const SessionManager = struct {
 
     /// Apply per-channel model overrides to an agent.
     /// Only overrides fields that are explicitly set in the override config.
+    ///
+    /// Fallback chains for sub-agent / tools-reviewer model resolution:
+    ///   channel sub_agent_* → channel general (provider/model) → global sub_agent_* → global default
+    ///   channel tools_reviewer_* → channel general (provider/model) → global tools_reviewer_* → global default
+    /// The global sub_agent_*/tools_reviewer_* values are already set on the Agent
+    /// from Config via fromConfig().  This function layers the channel-level
+    /// overrides on top.
     fn applyModelOverride(agent: *Agent, mo: config_types.ChannelModelOverride) void {
         if (mo.provider) |prov| {
             agent.default_provider = prov;
@@ -230,6 +237,27 @@ pub const SessionManager = struct {
         if (mo.temperature) |temp| {
             agent.temperature = temp;
         }
+
+        // ── Sub-agent fallback chain ─────────────────────────────────────
+        // model/provider: fall back to channel general, then preserve existing (from global init).
+        // temperature/max_context_tokens/base_url: only override when the type-specific
+        // field is explicitly configured — the general config's values must NOT cascade
+        // into specialized types (each type has its own compiled default, e.g. 0.3 for
+        // sub-agent vs 0.7 for general).
+        agent.sub_agent_model = mo.sub_agent_model orelse mo.model orelse agent.sub_agent_model;
+        agent.sub_agent_provider = mo.sub_agent_provider orelse mo.provider orelse agent.sub_agent_provider;
+        if (mo.sub_agent_temperature) |t| agent.sub_agent_temperature = t;
+        if (mo.sub_agent_max_context_tokens > 0) agent.sub_agent_max_context_tokens = mo.sub_agent_max_context_tokens;
+        if (mo.sub_agent_base_url) |u| agent.sub_agent_base_url = u;
+        if (mo.sub_agent_max_iterations > 0) agent.sub_agent_max_iterations = mo.sub_agent_max_iterations;
+        if (mo.sub_agent_review_after > 0) agent.sub_agent_review_after = mo.sub_agent_review_after;
+
+        // ── Tools-reviewer fallback chain ────────────────────────────────
+        agent.tools_reviewer_model = mo.tools_reviewer_model orelse mo.model orelse agent.tools_reviewer_model;
+        agent.tools_reviewer_provider = mo.tools_reviewer_provider orelse mo.provider orelse agent.tools_reviewer_provider;
+        if (mo.tools_reviewer_temperature) |t| agent.tools_reviewer_temperature = t;
+        if (mo.tools_reviewer_max_context_tokens > 0) agent.tools_reviewer_max_context_tokens = mo.tools_reviewer_max_context_tokens;
+        if (mo.tools_reviewer_base_url) |u| agent.tools_reviewer_base_url = u;
     }
 
     /// Evict all sessions whose key starts with the given prefix.
@@ -311,13 +339,18 @@ pub const SessionManager = struct {
         const session = try self.allocator.create(Session);
         errdefer self.allocator.destroy(session);
 
-        var agent = try Agent.fromConfig(
+        // Look up per-channel model overrides BEFORE creating the agent so that
+        // channels with their own model work even when no global model is set.
+        const mo = lookupChannelModelOverride(self.config, session_key);
+
+        var agent = try Agent.fromConfigWithChannelModel(
             self.allocator,
             self.config,
             self.provider,
             self.tools,
             self.mem,
             self.observer,
+            mo.model,
         );
         agent.policy = self.policy;
         agent.session_store = self.session_store;
@@ -329,8 +362,8 @@ pub const SessionManager = struct {
             agent.usage_record_ctx = @ptrCast(self);
         }
 
-        // Apply per-channel model overrides (MQTT / Redis Stream)
-        const mo = lookupChannelModelOverride(self.config, session_key);
+        // Apply remaining per-channel model overrides (provider, temperature,
+        // sub_agent/tools_reviewer fields, etc.)
         applyModelOverride(&agent, mo);
 
         session.* = .{
@@ -1993,4 +2026,365 @@ test "reloadSkillsAll does not affect session count" {
 
     _ = sm.reloadSkillsAll();
     try testing.expectEqual(@as(usize, 2), sm.sessionCount());
+}
+
+// ---------------------------------------------------------------------------
+// 7. applyModelOverride sub-agent / tools-reviewer fallback tests
+// ---------------------------------------------------------------------------
+
+test "applyModelOverride sets sub_agent_model from channel override" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const s = try sm.getOrCreate("override:sa1");
+    // Simulate global sub_agent_model already set on agent
+    s.agent.sub_agent_model = "global/sub-agent-model";
+
+    // Channel override explicitly sets sub_agent_model
+    SessionManager.applyModelOverride(&s.agent, .{
+        .sub_agent_model = "channel/sub-agent-model",
+    });
+    try testing.expectEqualStrings("channel/sub-agent-model", s.agent.sub_agent_model.?);
+}
+
+test "applyModelOverride sub_agent_model falls back to channel general model" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const s = try sm.getOrCreate("override:sa2");
+    s.agent.sub_agent_model = "global/sub-agent-model";
+
+    // Channel has general model but no sub_agent_model
+    SessionManager.applyModelOverride(&s.agent, .{
+        .model = "channel/general-model",
+    });
+    // sub_agent_model should use channel's general model
+    try testing.expectEqualStrings("channel/general-model", s.agent.sub_agent_model.?);
+}
+
+test "applyModelOverride sub_agent_model keeps global when no channel override" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const s = try sm.getOrCreate("override:sa3");
+    s.agent.sub_agent_model = "global/sub-agent-model";
+
+    // Channel override has no model and no sub_agent_model
+    SessionManager.applyModelOverride(&s.agent, .{
+        .temperature = 0.5,
+    });
+    // sub_agent_model should stay as global
+    try testing.expectEqualStrings("global/sub-agent-model", s.agent.sub_agent_model.?);
+}
+
+test "applyModelOverride sub_agent_model channel-specific beats channel general" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const s = try sm.getOrCreate("override:sa4");
+    s.agent.sub_agent_model = "global/sub-agent-model";
+
+    // Channel has both general model and sub_agent_model
+    SessionManager.applyModelOverride(&s.agent, .{
+        .model = "channel/general-model",
+        .sub_agent_model = "channel/sub-agent-specific",
+    });
+    // sub_agent_model should use the channel-specific one, not general
+    try testing.expectEqualStrings("channel/sub-agent-specific", s.agent.sub_agent_model.?);
+}
+
+test "applyModelOverride tools_reviewer_model from channel override" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const s = try sm.getOrCreate("override:tr1");
+    s.agent.tools_reviewer_model = "global/tools-reviewer-model";
+
+    SessionManager.applyModelOverride(&s.agent, .{
+        .tools_reviewer_model = "channel/tools-reviewer-model",
+    });
+    try testing.expectEqualStrings("channel/tools-reviewer-model", s.agent.tools_reviewer_model.?);
+}
+
+test "applyModelOverride tools_reviewer_model falls back to channel general model" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const s = try sm.getOrCreate("override:tr2");
+    s.agent.tools_reviewer_model = "global/tools-reviewer-model";
+
+    SessionManager.applyModelOverride(&s.agent, .{
+        .model = "channel/general-model",
+    });
+    try testing.expectEqualStrings("channel/general-model", s.agent.tools_reviewer_model.?);
+}
+
+test "applyModelOverride tools_reviewer_model keeps global when no channel override" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const s = try sm.getOrCreate("override:tr3");
+    s.agent.tools_reviewer_model = "global/tools-reviewer-model";
+
+    SessionManager.applyModelOverride(&s.agent, .{
+        .temperature = 0.5,
+    });
+    try testing.expectEqualStrings("global/tools-reviewer-model", s.agent.tools_reviewer_model.?);
+}
+
+test "applyModelOverride sub_agent_provider from channel override" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const s = try sm.getOrCreate("override:sap1");
+    s.agent.sub_agent_provider = null;
+
+    SessionManager.applyModelOverride(&s.agent, .{
+        .sub_agent_provider = "anthropic",
+    });
+    try testing.expectEqualStrings("anthropic", s.agent.sub_agent_provider.?);
+}
+
+test "applyModelOverride sub_agent_provider falls back to channel general provider" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const s = try sm.getOrCreate("override:sap2");
+    s.agent.sub_agent_provider = null;
+
+    SessionManager.applyModelOverride(&s.agent, .{
+        .provider = "openrouter",
+    });
+    try testing.expectEqualStrings("openrouter", s.agent.sub_agent_provider.?);
+}
+
+test "applyModelOverride tools_reviewer_provider from channel override" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const s = try sm.getOrCreate("override:trp1");
+    s.agent.tools_reviewer_provider = null;
+
+    SessionManager.applyModelOverride(&s.agent, .{
+        .tools_reviewer_provider = "gemini",
+    });
+    try testing.expectEqualStrings("gemini", s.agent.tools_reviewer_provider.?);
+}
+
+test "applyModelOverride tools_reviewer_provider falls back to channel general provider" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const s = try sm.getOrCreate("override:trp2");
+    s.agent.tools_reviewer_provider = null;
+
+    SessionManager.applyModelOverride(&s.agent, .{
+        .provider = "openai",
+    });
+    try testing.expectEqualStrings("openai", s.agent.tools_reviewer_provider.?);
+}
+
+// ---------------------------------------------------------------------------
+// 8. applyModelOverride unified fields: temperature no-cascade, base_url, max_context_tokens
+// ---------------------------------------------------------------------------
+
+test "applyModelOverride: general temperature does NOT cascade to sub_agent" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const s = try sm.getOrCreate("override:temp_nocascade1");
+    // Agent starts with sub_agent_temperature from global init (null = use compiled default 0.3)
+    s.agent.sub_agent_temperature = null;
+    s.agent.tools_reviewer_temperature = null;
+
+    // Channel override sets general temperature but NOT sub_agent/tools_reviewer temperature
+    SessionManager.applyModelOverride(&s.agent, .{
+        .temperature = 0.9,
+    });
+    // General temperature IS applied
+    try testing.expectEqual(@as(f64, 0.9), s.agent.temperature);
+    // sub_agent_temperature must remain null (compiled default 0.3 will be used at call time)
+    try testing.expect(s.agent.sub_agent_temperature == null);
+    // tools_reviewer_temperature must remain null (compiled default 0.1 will be used at call time)
+    try testing.expect(s.agent.tools_reviewer_temperature == null);
+}
+
+test "applyModelOverride: explicit sub_agent_temperature overrides agent value" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const s = try sm.getOrCreate("override:temp_explicit1");
+    s.agent.sub_agent_temperature = null;
+
+    SessionManager.applyModelOverride(&s.agent, .{
+        .sub_agent_temperature = 0.5,
+    });
+    try testing.expect(@abs(s.agent.sub_agent_temperature.? - 0.5) < 0.001);
+}
+
+test "applyModelOverride: explicit tools_reviewer_temperature overrides agent value" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const s = try sm.getOrCreate("override:temp_explicit2");
+    s.agent.tools_reviewer_temperature = null;
+
+    SessionManager.applyModelOverride(&s.agent, .{
+        .tools_reviewer_temperature = 0.2,
+    });
+    try testing.expect(@abs(s.agent.tools_reviewer_temperature.? - 0.2) < 0.001);
+}
+
+test "applyModelOverride: sub_agent_max_context_tokens only set when > 0" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const s = try sm.getOrCreate("override:sa_ctx1");
+    s.agent.sub_agent_max_context_tokens = 8192;
+
+    // Override with 0 → keeps existing
+    SessionManager.applyModelOverride(&s.agent, .{
+        .sub_agent_max_context_tokens = 0,
+    });
+    try testing.expectEqual(@as(u64, 8192), s.agent.sub_agent_max_context_tokens);
+
+    // Override with > 0 → applies
+    SessionManager.applyModelOverride(&s.agent, .{
+        .sub_agent_max_context_tokens = 16384,
+    });
+    try testing.expectEqual(@as(u64, 16384), s.agent.sub_agent_max_context_tokens);
+}
+
+test "applyModelOverride: sub_agent_base_url only set when non-null" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const s = try sm.getOrCreate("override:sa_url1");
+    s.agent.sub_agent_base_url = "https://existing.example.com";
+
+    // Override with null → keeps existing
+    SessionManager.applyModelOverride(&s.agent, .{
+        .sub_agent_base_url = null,
+    });
+    try testing.expectEqualStrings("https://existing.example.com", s.agent.sub_agent_base_url.?);
+
+    // Override with value → applies
+    SessionManager.applyModelOverride(&s.agent, .{
+        .sub_agent_base_url = "https://new.example.com",
+    });
+    try testing.expectEqualStrings("https://new.example.com", s.agent.sub_agent_base_url.?);
+}
+
+test "applyModelOverride: sub_agent_max_iterations and review_after per-channel" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const s = try sm.getOrCreate("override:sa_iters1");
+    s.agent.sub_agent_max_iterations = 5;
+    s.agent.sub_agent_review_after = 3;
+
+    // Override with 0 → keeps existing
+    SessionManager.applyModelOverride(&s.agent, .{
+        .sub_agent_max_iterations = 0,
+        .sub_agent_review_after = 0,
+    });
+    try testing.expectEqual(@as(u32, 5), s.agent.sub_agent_max_iterations);
+    try testing.expectEqual(@as(u32, 3), s.agent.sub_agent_review_after);
+
+    // Override with > 0 → applies
+    SessionManager.applyModelOverride(&s.agent, .{
+        .sub_agent_max_iterations = 10,
+        .sub_agent_review_after = 7,
+    });
+    try testing.expectEqual(@as(u32, 10), s.agent.sub_agent_max_iterations);
+    try testing.expectEqual(@as(u32, 7), s.agent.sub_agent_review_after);
+}
+
+test "applyModelOverride full fallback chain: channel sub_agent > channel general > global sub_agent" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    // Test 1: global sub_agent_model set, no channel override → keeps global
+    {
+        const s = try sm.getOrCreate("override:chain1");
+        s.agent.sub_agent_model = "global/sa";
+        s.agent.sub_agent_provider = "global-prov";
+        s.agent.tools_reviewer_model = "global/tr";
+        s.agent.tools_reviewer_provider = "global-prov";
+
+        SessionManager.applyModelOverride(&s.agent, .{});
+
+        try testing.expectEqualStrings("global/sa", s.agent.sub_agent_model.?);
+        try testing.expectEqualStrings("global-prov", s.agent.sub_agent_provider.?);
+        try testing.expectEqualStrings("global/tr", s.agent.tools_reviewer_model.?);
+        try testing.expectEqualStrings("global-prov", s.agent.tools_reviewer_provider.?);
+    }
+
+    // Test 2: global sub_agent_model set, channel has general model → channel general wins
+    {
+        const s = try sm.getOrCreate("override:chain2");
+        s.agent.sub_agent_model = "global/sa";
+        s.agent.sub_agent_provider = "global-prov";
+
+        SessionManager.applyModelOverride(&s.agent, .{
+            .provider = "ch-prov",
+            .model = "ch/general",
+        });
+
+        try testing.expectEqualStrings("ch/general", s.agent.sub_agent_model.?);
+        try testing.expectEqualStrings("ch-prov", s.agent.sub_agent_provider.?);
+    }
+
+    // Test 3: global + channel general + channel specific → channel specific wins
+    {
+        const s = try sm.getOrCreate("override:chain3");
+        s.agent.sub_agent_model = "global/sa";
+        s.agent.sub_agent_provider = "global-prov";
+
+        SessionManager.applyModelOverride(&s.agent, .{
+            .provider = "ch-prov",
+            .model = "ch/general",
+            .sub_agent_provider = "ch-sa-prov",
+            .sub_agent_model = "ch/sa-specific",
+        });
+
+        try testing.expectEqualStrings("ch/sa-specific", s.agent.sub_agent_model.?);
+        try testing.expectEqualStrings("ch-sa-prov", s.agent.sub_agent_provider.?);
+    }
 }

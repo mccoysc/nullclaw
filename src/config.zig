@@ -120,6 +120,21 @@ pub const Config = struct {
     default_temperature: f64 = 0.7,
     reasoning_effort: ?[]const u8 = null,
 
+    // Global sub-agent and tools reviewer model overrides.
+    // When set, sub-agent / tools-reviewer LLM calls use these instead of the
+    // general default_provider / default_model.  Per-channel overrides take
+    // precedence over these global overrides.
+    sub_agent_provider: ?[]const u8 = null,
+    sub_agent_model: ?[]const u8 = null,
+    sub_agent_temperature: ?f64 = null,
+    sub_agent_max_context_tokens: u64 = 0,
+    sub_agent_base_url: ?[]const u8 = null,
+    tools_reviewer_provider: ?[]const u8 = null,
+    tools_reviewer_model: ?[]const u8 = null,
+    tools_reviewer_temperature: ?f64 = null,
+    tools_reviewer_max_context_tokens: u64 = 0,
+    tools_reviewer_base_url: ?[]const u8 = null,
+
     // Model routing and delegate agents
     model_routes: []const ModelRouteConfig = &.{},
     agents: []const NamedAgentConfig = &.{},
@@ -587,6 +602,49 @@ pub const Config = struct {
         try w.print("  \"default_temperature\": {d:.1},\n", .{self.default_temperature});
         if (self.reasoning_effort) |value| {
             try w.print("  \"reasoning_effort\": \"{s}\",\n", .{value});
+        }
+        // Global sub-agent / tools-reviewer model overrides
+        if (self.sub_agent_provider) |v| {
+            try w.print("  \"sub_agent_provider\": ", .{});
+            try writeJsonStr(w, v);
+            try w.print(",\n", .{});
+        }
+        if (self.sub_agent_model) |v| {
+            try w.print("  \"sub_agent_model\": ", .{});
+            try writeJsonStr(w, v);
+            try w.print(",\n", .{});
+        }
+        if (self.sub_agent_temperature) |t| {
+            try w.print("  \"sub_agent_temperature\": {d:.1},\n", .{t});
+        }
+        if (self.sub_agent_max_context_tokens > 0) {
+            try w.print("  \"sub_agent_max_context_tokens\": {d},\n", .{self.sub_agent_max_context_tokens});
+        }
+        if (self.sub_agent_base_url) |v| {
+            try w.print("  \"sub_agent_base_url\": ", .{});
+            try writeJsonStr(w, v);
+            try w.print(",\n", .{});
+        }
+        if (self.tools_reviewer_provider) |v| {
+            try w.print("  \"tools_reviewer_provider\": ", .{});
+            try writeJsonStr(w, v);
+            try w.print(",\n", .{});
+        }
+        if (self.tools_reviewer_model) |v| {
+            try w.print("  \"tools_reviewer_model\": ", .{});
+            try writeJsonStr(w, v);
+            try w.print(",\n", .{});
+        }
+        if (self.tools_reviewer_temperature) |t| {
+            try w.print("  \"tools_reviewer_temperature\": {d:.1},\n", .{t});
+        }
+        if (self.tools_reviewer_max_context_tokens > 0) {
+            try w.print("  \"tools_reviewer_max_context_tokens\": {d},\n", .{self.tools_reviewer_max_context_tokens});
+        }
+        if (self.tools_reviewer_base_url) |v| {
+            try w.print("  \"tools_reviewer_base_url\": ", .{});
+            try writeJsonStr(w, v);
+            try w.print(",\n", .{});
         }
 
         // models.providers
@@ -4409,4 +4467,60 @@ test "NostrConfig dm_relays default is auth.nostr1.com" {
     };
     try std.testing.expectEqual(@as(usize, 1), cfg.dm_relays.len);
     try std.testing.expectEqualStrings("wss://auth.nostr1.com", cfg.dm_relays[0]);
+}
+
+test "parseJson parses global sub_agent and tools_reviewer fields" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const json =
+        \\{
+        \\  "sub_agent_provider": "anthropic",
+        \\  "sub_agent_model": "claude-sonnet-4-20250514",
+        \\  "tools_reviewer_provider": "openrouter",
+        \\  "tools_reviewer_model": "openrouter/google/gemini-2.5-flash"
+        \\}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+
+    try std.testing.expectEqualStrings("anthropic", cfg.sub_agent_provider.?);
+    try std.testing.expectEqualStrings("claude-sonnet-4-20250514", cfg.sub_agent_model.?);
+    try std.testing.expectEqualStrings("openrouter", cfg.tools_reviewer_provider.?);
+    try std.testing.expectEqualStrings("openrouter/google/gemini-2.5-flash", cfg.tools_reviewer_model.?);
+}
+
+test "parseJson sub_agent and tools_reviewer fields default to null" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const json =
+        \\{"default_temperature": 0.5}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+
+    try std.testing.expect(cfg.sub_agent_provider == null);
+    try std.testing.expect(cfg.sub_agent_model == null);
+    try std.testing.expect(cfg.tools_reviewer_provider == null);
+    try std.testing.expect(cfg.tools_reviewer_model == null);
+}
+
+test "parseJson partial sub_agent fields" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const json =
+        \\{"sub_agent_model": "my-model"}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+
+    try std.testing.expect(cfg.sub_agent_provider == null);
+    try std.testing.expectEqualStrings("my-model", cfg.sub_agent_model.?);
+    try std.testing.expect(cfg.tools_reviewer_provider == null);
+    try std.testing.expect(cfg.tools_reviewer_model == null);
 }
