@@ -439,6 +439,9 @@ pub const ChannelManager = struct {
         // Diff and apply changes
         self.applyConfigReload(new_config, state);
 
+        // Save old config pointer before overwriting — needed for provider change detection.
+        const old_config = self.config;
+
         // Store the old config (don't free — running channels may still reference it)
         self.prev_configs.append(self.allocator, @constCast(self.config)) catch {};
 
@@ -452,7 +455,7 @@ pub const ChannelManager = struct {
 
             // If provider credentials or default_provider changed, rebuild the
             // provider bundle so existing sessions pick up the new API key.
-            if (providerConfigChanged(self.config, new_config)) {
+            if (providerConfigChanged(old_config, new_config)) {
                 rt.rebuildProvider(new_config);
             }
         }
