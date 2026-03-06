@@ -364,6 +364,20 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
         }
     }
 
+    // Global sub-agent / tools-reviewer model overrides
+    if (root.get("sub_agent_provider")) |v| {
+        if (v == .string) self.sub_agent_provider = try self.allocator.dupe(u8, v.string);
+    }
+    if (root.get("sub_agent_model")) |v| {
+        if (v == .string) self.sub_agent_model = try self.allocator.dupe(u8, v.string);
+    }
+    if (root.get("tools_reviewer_provider")) |v| {
+        if (v == .string) self.tools_reviewer_provider = try self.allocator.dupe(u8, v.string);
+    }
+    if (root.get("tools_reviewer_model")) |v| {
+        if (v == .string) self.tools_reviewer_model = try self.allocator.dupe(u8, v.string);
+    }
+
     // Model routes
     if (root.get("model_routes")) |v| {
         if (v == .array) {

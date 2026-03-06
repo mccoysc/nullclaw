@@ -90,6 +90,10 @@ pub const SubagentManager = struct {
     api_key: ?[]const u8,
     default_provider: []const u8,
     default_model: ?[]const u8,
+    /// Global sub-agent provider/model overrides (from config).
+    /// When set, subagent threads use these instead of default_provider/default_model.
+    sub_agent_provider: ?[]const u8,
+    sub_agent_model: ?[]const u8,
     workspace_dir: []const u8,
     allowed_paths: []const []const u8,
     agents: []const config_mod.NamedAgentConfig,
@@ -124,6 +128,8 @@ pub const SubagentManager = struct {
             .api_key = cfg.defaultProviderKey(),
             .default_provider = cfg.default_provider,
             .default_model = cfg.default_model,
+            .sub_agent_provider = cfg.sub_agent_provider,
+            .sub_agent_model = cfg.sub_agent_model,
             .workspace_dir = cfg.workspace_dir,
             .allowed_paths = cfg.autonomy.allowed_paths,
             .agents = cfg.agents,
@@ -348,8 +354,9 @@ fn subagentThreadFn(ctx: *ThreadContext) void {
     else
         "You are a background subagent. Complete the assigned task concisely and accurately. You have no access to interactive tools — focus on reasoning and analysis.";
     var api_key = ctx.manager.api_key;
-    var default_provider = ctx.manager.default_provider;
-    var default_model = ctx.manager.default_model;
+    // Resolve sub-agent provider/model: sub_agent_* → default_*
+    var default_provider = ctx.manager.sub_agent_provider orelse ctx.manager.default_provider;
+    var default_model = ctx.manager.sub_agent_model orelse ctx.manager.default_model;
     var temperature: f64 = 0.7;
 
     if (ctx.agent_name) |agent_name| {

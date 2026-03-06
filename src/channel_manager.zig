@@ -903,7 +903,9 @@ fn findRsEndpointById(endpoints: []const config_types.RedisStreamEndpointConfig,
 
 /// Check if a ChannelModelOverride has any explicit overrides set.
 fn hasModelOverride(mo: config_types.ChannelModelOverride) bool {
-    return mo.provider != null or mo.model != null or mo.max_context_tokens != 0 or mo.temperature != null;
+    return mo.provider != null or mo.model != null or mo.max_context_tokens != 0 or mo.temperature != null or
+        mo.sub_agent_provider != null or mo.sub_agent_model != null or
+        mo.tools_reviewer_provider != null or mo.tools_reviewer_model != null;
 }
 
 /// Build the session key prefix for an endpoint: uses endpoint_id when set,
@@ -959,6 +961,10 @@ fn buildGlobalModelOverride(cfg: *const Config) config_types.ChannelModelOverrid
         .model = if (cfg.default_model) |m| (if (m.len > 0) m else null) else null,
         .max_context_tokens = cfg.agent.max_context_tokens,
         .temperature = cfg.default_temperature,
+        .sub_agent_provider = cfg.sub_agent_provider,
+        .sub_agent_model = cfg.sub_agent_model,
+        .tools_reviewer_provider = cfg.tools_reviewer_provider,
+        .tools_reviewer_model = cfg.tools_reviewer_model,
     };
 }
 
@@ -967,6 +973,10 @@ fn modelOverrideEqual(a: config_types.ChannelModelOverride, b: config_types.Chan
     if (a.max_context_tokens != b.max_context_tokens) return false;
     if (!optionalStrEql(a.provider, b.provider)) return false;
     if (!optionalStrEql(a.model, b.model)) return false;
+    if (!optionalStrEql(a.sub_agent_provider, b.sub_agent_provider)) return false;
+    if (!optionalStrEql(a.sub_agent_model, b.sub_agent_model)) return false;
+    if (!optionalStrEql(a.tools_reviewer_provider, b.tools_reviewer_provider)) return false;
+    if (!optionalStrEql(a.tools_reviewer_model, b.tools_reviewer_model)) return false;
     // Compare temperature with tolerance
     if (a.temperature == null and b.temperature == null) {
         // both null, equal
@@ -991,6 +1001,10 @@ fn globalModelConfigChanged(old: *const Config, new: *const Config) bool {
     if (@abs(old.default_temperature - new.default_temperature) > 0.001) return true;
     if (old.agent.max_context_tokens != new.agent.max_context_tokens) return true;
     if (old.agent.token_limit != new.agent.token_limit) return true;
+    if (!optionalStrEql(old.sub_agent_provider, new.sub_agent_provider)) return true;
+    if (!optionalStrEql(old.sub_agent_model, new.sub_agent_model)) return true;
+    if (!optionalStrEql(old.tools_reviewer_provider, new.tools_reviewer_provider)) return true;
+    if (!optionalStrEql(old.tools_reviewer_model, new.tools_reviewer_model)) return true;
     return false;
 }
 

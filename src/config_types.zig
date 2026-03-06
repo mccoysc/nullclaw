@@ -618,6 +618,18 @@ pub const ChannelModelOverride = struct {
     max_context_tokens: u64 = 0,
     /// Override the temperature for this channel.
     temperature: ?f64 = null,
+    /// Override the sub-agent LLM provider for this channel.
+    /// Fallback: channel general provider → global sub_agent_provider → global default_provider.
+    sub_agent_provider: ?[]const u8 = null,
+    /// Override the sub-agent LLM model for this channel.
+    /// Fallback: channel general model → global sub_agent_model → global default_model.
+    sub_agent_model: ?[]const u8 = null,
+    /// Override the tools reviewer LLM provider for this channel.
+    /// Fallback: channel general provider → global tools_reviewer_provider → global default_provider.
+    tools_reviewer_provider: ?[]const u8 = null,
+    /// Override the tools reviewer LLM model for this channel.
+    /// Fallback: channel general model → global tools_reviewer_model → global default_model.
+    tools_reviewer_model: ?[]const u8 = null,
 };
 
 pub const MqttEndpointConfig = struct {

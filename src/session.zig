@@ -207,6 +207,13 @@ pub const SessionManager = struct {
 
     /// Apply per-channel model overrides to an agent.
     /// Only overrides fields that are explicitly set in the override config.
+    ///
+    /// Fallback chains for sub-agent / tools-reviewer model resolution:
+    ///   channel sub_agent_* → channel general (provider/model) → global sub_agent_* → global default
+    ///   channel tools_reviewer_* → channel general (provider/model) → global tools_reviewer_* → global default
+    /// The global sub_agent_*/tools_reviewer_* values are already set on the Agent
+    /// from Config via fromConfig().  This function layers the channel-level
+    /// overrides on top.
     fn applyModelOverride(agent: *Agent, mo: config_types.ChannelModelOverride) void {
         if (mo.provider) |prov| {
             agent.default_provider = prov;
@@ -229,6 +236,36 @@ pub const SessionManager = struct {
         }
         if (mo.temperature) |temp| {
             agent.temperature = temp;
+        }
+
+        // ── Sub-agent model fallback chain ──────────────────────────────
+        // Priority: channel sub_agent_model → channel general model → (global sub_agent_model already on agent)
+        if (mo.sub_agent_model) |m| {
+            agent.sub_agent_model = m;
+        } else if (mo.model) |m| {
+            // Channel has its own general model — use it as fallback for sub-agent
+            // (overrides the global sub_agent_model that was set from Config).
+            agent.sub_agent_model = m;
+        }
+        // else: keep agent.sub_agent_model as set from Config (global sub_agent_model or null→default)
+
+        if (mo.sub_agent_provider) |p| {
+            agent.sub_agent_provider = p;
+        } else if (mo.provider) |p| {
+            agent.sub_agent_provider = p;
+        }
+
+        // ── Tools-reviewer model fallback chain ─────────────────────────
+        if (mo.tools_reviewer_model) |m| {
+            agent.tools_reviewer_model = m;
+        } else if (mo.model) |m| {
+            agent.tools_reviewer_model = m;
+        }
+
+        if (mo.tools_reviewer_provider) |p| {
+            agent.tools_reviewer_provider = p;
+        } else if (mo.provider) |p| {
+            agent.tools_reviewer_provider = p;
         }
     }
 

@@ -120,6 +120,15 @@ pub const Config = struct {
     default_temperature: f64 = 0.7,
     reasoning_effort: ?[]const u8 = null,
 
+    // Global sub-agent and tools reviewer model overrides.
+    // When set, sub-agent / tools-reviewer LLM calls use these instead of the
+    // general default_provider / default_model.  Per-channel overrides take
+    // precedence over these global overrides.
+    sub_agent_provider: ?[]const u8 = null,
+    sub_agent_model: ?[]const u8 = null,
+    tools_reviewer_provider: ?[]const u8 = null,
+    tools_reviewer_model: ?[]const u8 = null,
+
     // Model routing and delegate agents
     model_routes: []const ModelRouteConfig = &.{},
     agents: []const NamedAgentConfig = &.{},
@@ -587,6 +596,19 @@ pub const Config = struct {
         try w.print("  \"default_temperature\": {d:.1},\n", .{self.default_temperature});
         if (self.reasoning_effort) |value| {
             try w.print("  \"reasoning_effort\": \"{s}\",\n", .{value});
+        }
+        // Global sub-agent / tools-reviewer model overrides
+        if (self.sub_agent_provider) |v| {
+            try w.print("  \"sub_agent_provider\": \"{s}\",\n", .{v});
+        }
+        if (self.sub_agent_model) |v| {
+            try w.print("  \"sub_agent_model\": \"{s}\",\n", .{v});
+        }
+        if (self.tools_reviewer_provider) |v| {
+            try w.print("  \"tools_reviewer_provider\": \"{s}\",\n", .{v});
+        }
+        if (self.tools_reviewer_model) |v| {
+            try w.print("  \"tools_reviewer_model\": \"{s}\",\n", .{v});
         }
 
         // models.providers

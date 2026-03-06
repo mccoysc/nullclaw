@@ -299,6 +299,15 @@ pub const Agent = struct {
     /// 0 = use compiled default (skills_mod.SUB_AGENT_DEFAULT_REVIEW_AFTER).
     sub_agent_review_after: u32 = 0,
 
+    /// Provider/model for sub-agent LLM calls (resolved via fallback chain).
+    /// null = use the agent's own default_provider / model_name.
+    sub_agent_provider: ?[]const u8 = null,
+    sub_agent_model: ?[]const u8 = null,
+    /// Provider/model for tools-reviewer LLM calls (resolved via fallback chain).
+    /// null = use the agent's own default_provider / model_name.
+    tools_reviewer_provider: ?[]const u8 = null,
+    tools_reviewer_model: ?[]const u8 = null,
+
     /// Per-turn MCP tool filter groups (slice into config-owned memory; not freed by Agent).
     /// Empty = no filtering; all tool specs are sent as-is.
     tool_filter_groups: []const config_types.ToolFilterGroup = &.{},
@@ -426,6 +435,10 @@ pub const Agent = struct {
             .tool_filter_groups = cfg.agent.tool_filter_groups,
             .sub_agent_max_iterations = cfg.agent.sub_agent_max_iterations,
             .sub_agent_review_after = cfg.agent.sub_agent_review_after,
+            .sub_agent_provider = cfg.sub_agent_provider,
+            .sub_agent_model = cfg.sub_agent_model,
+            .tools_reviewer_provider = cfg.tools_reviewer_provider,
+            .tools_reviewer_model = cfg.tools_reviewer_model,
             .exec_security = switch (cfg.autonomy.level) {
                 .full => .full,
                 .read_only => .deny,
@@ -2121,6 +2134,10 @@ pub const Agent = struct {
             };
         };
 
+        // Resolve sub-agent model: sub_agent_model → model_name (fallback already
+        // applied by session layer via applyModelOverride).
+        const sa_model = self.sub_agent_model orelse self.model_name;
+
         const native_tools_enabled = self.provider.supportsNativeTools();
         var total_iterations: u32 = 0;
         const max_sub_iterations = if (self.sub_agent_max_iterations > 0) self.sub_agent_max_iterations else skills_mod.SUB_AGENT_MAX_ITERATIONS;
@@ -2139,25 +2156,25 @@ pub const Agent = struct {
         var tool_call_summaries = std.ArrayListUnmanaged([]const u8).empty;
 
         while (total_iterations < max_sub_iterations) : (total_iterations += 1) {
-            // Call provider with tools
+            // Call provider with tools (use resolved sub-agent model)
             const response = self.provider.chat(
                 arena,
                 .{
                     .messages = messages.items,
-                    .model = self.model_name,
+                    .model = sa_model,
                     .temperature = 0.3, // low temperature for deterministic behavior
                     .max_tokens = self.max_tokens,
                     .tools = if (native_tools_enabled) self.tool_specs else null,
                     .timeout_secs = self.message_timeout_secs,
                 },
-                self.model_name,
+                sa_model,
                 0.3,
             ) catch |err| {
                 log.warn(
                     "sub-agent error: LLM call failed | error={s} model={s} instructions={s} hook_content={s} iteration={d}",
                     .{
                         @errorName(err),
-                        self.model_name,
+                        sa_model,
                         skill_instructions,
                         hook_content,
                         total_iterations + 1,
@@ -2372,17 +2389,21 @@ pub const Agent = struct {
         review_msgs.append(arena, ChatMessage.system(skills_mod.sub_agent_review_prompt)) catch return null;
         review_msgs.append(arena, ChatMessage.user(user_content)) catch return null;
 
+        // Resolve tools-reviewer model: tools_reviewer_model → model_name
+        // (fallback already applied by session layer via applyModelOverride).
+        const tr_model = self.tools_reviewer_model orelse self.model_name;
+
         const review_response = self.provider.chat(
             arena,
             .{
                 .messages = review_msgs.items,
-                .model = self.model_name,
+                .model = tr_model,
                 .temperature = 0.1, // very low for deterministic judgement
                 .max_tokens = 200, // only need a short verdict
                 .tools = null,
                 .timeout_secs = self.message_timeout_secs,
             },
-            self.model_name,
+            tr_model,
             0.1,
         ) catch |err| {
             log.warn("sub-agent review: LLM call failed, continuing loop | error={s}", .{@errorName(err)});
