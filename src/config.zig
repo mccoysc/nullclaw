@@ -126,8 +126,14 @@ pub const Config = struct {
     // precedence over these global overrides.
     sub_agent_provider: ?[]const u8 = null,
     sub_agent_model: ?[]const u8 = null,
+    sub_agent_temperature: ?f64 = null,
+    sub_agent_max_context_tokens: u64 = 0,
+    sub_agent_base_url: ?[]const u8 = null,
     tools_reviewer_provider: ?[]const u8 = null,
     tools_reviewer_model: ?[]const u8 = null,
+    tools_reviewer_temperature: ?f64 = null,
+    tools_reviewer_max_context_tokens: u64 = 0,
+    tools_reviewer_base_url: ?[]const u8 = null,
 
     // Model routing and delegate agents
     model_routes: []const ModelRouteConfig = &.{},
@@ -599,16 +605,46 @@ pub const Config = struct {
         }
         // Global sub-agent / tools-reviewer model overrides
         if (self.sub_agent_provider) |v| {
-            try w.print("  \"sub_agent_provider\": \"{s}\",\n", .{v});
+            try w.print("  \"sub_agent_provider\": ", .{});
+            try writeJsonStr(w, v);
+            try w.print(",\n", .{});
         }
         if (self.sub_agent_model) |v| {
-            try w.print("  \"sub_agent_model\": \"{s}\",\n", .{v});
+            try w.print("  \"sub_agent_model\": ", .{});
+            try writeJsonStr(w, v);
+            try w.print(",\n", .{});
+        }
+        if (self.sub_agent_temperature) |t| {
+            try w.print("  \"sub_agent_temperature\": {d:.1},\n", .{t});
+        }
+        if (self.sub_agent_max_context_tokens > 0) {
+            try w.print("  \"sub_agent_max_context_tokens\": {d},\n", .{self.sub_agent_max_context_tokens});
+        }
+        if (self.sub_agent_base_url) |v| {
+            try w.print("  \"sub_agent_base_url\": ", .{});
+            try writeJsonStr(w, v);
+            try w.print(",\n", .{});
         }
         if (self.tools_reviewer_provider) |v| {
-            try w.print("  \"tools_reviewer_provider\": \"{s}\",\n", .{v});
+            try w.print("  \"tools_reviewer_provider\": ", .{});
+            try writeJsonStr(w, v);
+            try w.print(",\n", .{});
         }
         if (self.tools_reviewer_model) |v| {
-            try w.print("  \"tools_reviewer_model\": \"{s}\",\n", .{v});
+            try w.print("  \"tools_reviewer_model\": ", .{});
+            try writeJsonStr(w, v);
+            try w.print(",\n", .{});
+        }
+        if (self.tools_reviewer_temperature) |t| {
+            try w.print("  \"tools_reviewer_temperature\": {d:.1},\n", .{t});
+        }
+        if (self.tools_reviewer_max_context_tokens > 0) {
+            try w.print("  \"tools_reviewer_max_context_tokens\": {d},\n", .{self.tools_reviewer_max_context_tokens});
+        }
+        if (self.tools_reviewer_base_url) |v| {
+            try w.print("  \"tools_reviewer_base_url\": ", .{});
+            try writeJsonStr(w, v);
+            try w.print(",\n", .{});
         }
 
         // models.providers

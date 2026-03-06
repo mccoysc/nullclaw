@@ -10,6 +10,7 @@ const bus_mod = @import("bus.zig");
 const config_mod = @import("config.zig");
 const config_types = @import("config_types.zig");
 const providers = @import("providers/root.zig");
+const api_key_mod = @import("providers/api_key.zig");
 
 const log = std.log.scoped(.subagent);
 
@@ -353,10 +354,24 @@ fn subagentThreadFn(ctx: *ThreadContext) void {
         "You are a background subagent. Complete the assigned task concisely and accurately. Use available tools when they materially improve correctness."
     else
         "You are a background subagent. Complete the assigned task concisely and accurately. You have no access to interactive tools — focus on reasoning and analysis.";
-    var api_key = ctx.manager.api_key;
     // Resolve sub-agent provider/model: sub_agent_* → default_*
     var default_provider = ctx.manager.sub_agent_provider orelse ctx.manager.default_provider;
     var default_model = ctx.manager.sub_agent_model orelse ctx.manager.default_model;
+    // Resolve API key: if sub_agent_provider differs, look up its key from
+    // configured_providers; otherwise use the default key.
+    var api_key = ctx.manager.api_key;
+    var resolved_sa_key: ?[]u8 = null;
+    if (ctx.manager.sub_agent_provider) |sa_prov| {
+        if (!std.mem.eql(u8, sa_prov, ctx.manager.default_provider)) {
+            resolved_sa_key = api_key_mod.resolveApiKeyFromConfig(
+                ctx.manager.allocator,
+                sa_prov,
+                ctx.manager.configured_providers,
+            ) catch null;
+            if (resolved_sa_key) |k| api_key = k;
+        }
+    }
+    defer if (resolved_sa_key) |k| ctx.manager.allocator.free(k);
     var temperature: f64 = 0.7;
 
     if (ctx.agent_name) |agent_name| {

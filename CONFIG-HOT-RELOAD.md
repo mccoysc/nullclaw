@@ -213,7 +213,7 @@ Set at the top level of `config.json`:
   "sub_agent_provider": "anthropic",
   "sub_agent_model": "claude-sonnet-4-20250514",
   "tools_reviewer_provider": "openrouter",
-  "tools_reviewer_model": "openrouter/google/gemini-2.5-flash"
+  "tools_reviewer_model": "google/gemini-2.5-flash"
 }
 ```
 
@@ -233,9 +233,9 @@ Set within an endpoint's `model_override`:
         "provider": "anthropic",
         "model": "claude-sonnet-4-20250514",
         "sub_agent_provider": "openrouter",
-        "sub_agent_model": "openrouter/google/gemini-2.5-flash",
+        "sub_agent_model": "google/gemini-2.5-flash",
         "tools_reviewer_provider": "openrouter",
-        "tools_reviewer_model": "openrouter/google/gemini-2.5-flash"
+        "tools_reviewer_model": "google/gemini-2.5-flash"
       }
     }
   ]

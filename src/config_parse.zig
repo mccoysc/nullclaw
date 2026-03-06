@@ -371,11 +371,31 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
     if (root.get("sub_agent_model")) |v| {
         if (v == .string) self.sub_agent_model = try self.allocator.dupe(u8, v.string);
     }
+    if (root.get("sub_agent_temperature")) |v| {
+        if (v == .float) self.sub_agent_temperature = v.float;
+        if (v == .integer) self.sub_agent_temperature = @floatFromInt(v.integer);
+    }
+    if (root.get("sub_agent_max_context_tokens")) |v| {
+        if (v == .integer and v.integer >= 0) self.sub_agent_max_context_tokens = @intCast(v.integer);
+    }
+    if (root.get("sub_agent_base_url")) |v| {
+        if (v == .string) self.sub_agent_base_url = try self.allocator.dupe(u8, v.string);
+    }
     if (root.get("tools_reviewer_provider")) |v| {
         if (v == .string) self.tools_reviewer_provider = try self.allocator.dupe(u8, v.string);
     }
     if (root.get("tools_reviewer_model")) |v| {
         if (v == .string) self.tools_reviewer_model = try self.allocator.dupe(u8, v.string);
+    }
+    if (root.get("tools_reviewer_temperature")) |v| {
+        if (v == .float) self.tools_reviewer_temperature = v.float;
+        if (v == .integer) self.tools_reviewer_temperature = @floatFromInt(v.integer);
+    }
+    if (root.get("tools_reviewer_max_context_tokens")) |v| {
+        if (v == .integer and v.integer >= 0) self.tools_reviewer_max_context_tokens = @intCast(v.integer);
+    }
+    if (root.get("tools_reviewer_base_url")) |v| {
+        if (v == .string) self.tools_reviewer_base_url = try self.allocator.dupe(u8, v.string);
     }
 
     // Model routes

@@ -624,12 +624,30 @@ pub const ChannelModelOverride = struct {
     /// Override the sub-agent LLM model for this channel.
     /// Fallback: channel general model → global sub_agent_model → global default_model.
     sub_agent_model: ?[]const u8 = null,
+    /// Override the sub-agent temperature for this channel.
+    sub_agent_temperature: ?f64 = null,
+    /// Override the sub-agent max context tokens for this channel.
+    sub_agent_max_context_tokens: u64 = 0,
+    /// Override the sub-agent provider base URL for this channel.
+    sub_agent_base_url: ?[]const u8 = null,
     /// Override the tools reviewer LLM provider for this channel.
     /// Fallback: channel general provider → global tools_reviewer_provider → global default_provider.
     tools_reviewer_provider: ?[]const u8 = null,
     /// Override the tools reviewer LLM model for this channel.
     /// Fallback: channel general model → global tools_reviewer_model → global default_model.
     tools_reviewer_model: ?[]const u8 = null,
+    /// Override the tools reviewer temperature for this channel.
+    tools_reviewer_temperature: ?f64 = null,
+    /// Override the tools reviewer max context tokens for this channel.
+    tools_reviewer_max_context_tokens: u64 = 0,
+    /// Override the tools reviewer provider base URL for this channel.
+    tools_reviewer_base_url: ?[]const u8 = null,
+    /// Override the sub-agent max iterations for this channel.
+    /// 0 = use global agent.sub_agent_max_iterations or compiled default.
+    sub_agent_max_iterations: u32 = 0,
+    /// Override the sub-agent review_after for this channel.
+    /// 0 = use global agent.sub_agent_review_after or compiled default.
+    sub_agent_review_after: u32 = 0,
 };
 
 pub const MqttEndpointConfig = struct {
