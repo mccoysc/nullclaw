@@ -520,18 +520,17 @@ pub const ChannelManager = struct {
                     self.addMqttChannelFromConfig(new_mqtt);
                 }
 
-                // Global model change: hot-update sessions on endpoints WITHOUT
-                // their own general model override (they inherit global config).
-                // Merge endpoint overrides on top of global so per-endpoint
-                // sub_agent/tools_reviewer fields aren't clobbered.
+                // Global model change: hot-update ALL endpoints.
+                // mergeGlobalWithEndpoint gives per-endpoint fields priority, so
+                // endpoints with explicit model/provider/temperature keep their
+                // own general settings while still receiving updated sub_agent
+                // and tools_reviewer fields from global config.
                 if (global_model_changed and !topology_changed) {
                     const global_mo = buildGlobalModelOverride(new_config);
                     for (new_mqtt.endpoints) |ep| {
-                        if (!hasGeneralModelOverride(ep.model_override)) {
-                            log.info("Global model changed, hot-updating MQTT endpoint '{s}'", .{endpointLabel(ep.endpoint_id, ep.listen_topic)});
-                            const merged = mergeGlobalWithEndpoint(global_mo, ep.model_override);
-                            self.hotUpdateSessionByEndpoint("mqtt", new_mqtt.account_id, ep, merged);
-                        }
+                        log.info("Global model changed, hot-updating MQTT endpoint '{s}'", .{endpointLabel(ep.endpoint_id, ep.listen_topic)});
+                        const merged = mergeGlobalWithEndpoint(global_mo, ep.model_override);
+                        self.hotUpdateSessionByEndpoint("mqtt", new_mqtt.account_id, ep, merged);
                     }
                 }
                 break;
@@ -599,11 +598,9 @@ pub const ChannelManager = struct {
                 if (global_model_changed and !topology_changed) {
                     const global_mo_rs = buildGlobalModelOverride(new_config);
                     for (new_rs.endpoints) |ep| {
-                        if (!hasGeneralModelOverride(ep.model_override)) {
-                            log.info("Global model changed, hot-updating Redis Stream endpoint '{s}'", .{endpointLabel(ep.endpoint_id, ep.listen_topic)});
-                            const merged_rs = mergeGlobalWithEndpoint(global_mo_rs, ep.model_override);
-                            self.hotUpdateSessionByRsEndpoint("redis_stream", new_rs.account_id, ep, merged_rs);
-                        }
+                        log.info("Global model changed, hot-updating Redis Stream endpoint '{s}'", .{endpointLabel(ep.endpoint_id, ep.listen_topic)});
+                        const merged_rs = mergeGlobalWithEndpoint(global_mo_rs, ep.model_override);
+                        self.hotUpdateSessionByRsEndpoint("redis_stream", new_rs.account_id, ep, merged_rs);
                     }
                 }
                 break;
@@ -1012,10 +1009,19 @@ fn rsEndpointStructuralChanged(old: config_types.RedisStreamEndpointConfig, new:
 /// Build a ChannelModelOverride from the global config for hot-updating sessions
 /// that don't have per-channel overrides.
 fn buildGlobalModelOverride(cfg: *const Config) config_types.ChannelModelOverride {
+    // Prefer max_context_tokens (auto-resolve cap) when configured.  When it is
+    // unset (0) but the user explicitly pinned token_limit in config, use that
+    // value so hot-reload propagates the explicit cap to existing sessions.
+    const max_ctx = if (cfg.agent.max_context_tokens > 0)
+        cfg.agent.max_context_tokens
+    else if (cfg.agent.token_limit_explicit)
+        cfg.agent.token_limit
+    else
+        0;
     return .{
         .provider = if (cfg.default_provider.len > 0) cfg.default_provider else null,
         .model = if (cfg.default_model) |m| (if (m.len > 0) m else null) else null,
-        .max_context_tokens = cfg.agent.max_context_tokens,
+        .max_context_tokens = max_ctx,
         .temperature = cfg.default_temperature,
         .sub_agent_provider = if (cfg.sub_agent_provider) |p| (if (p.len > 0) p else null) else null,
         .sub_agent_model = if (cfg.sub_agent_model) |m| (if (m.len > 0) m else null) else null,
@@ -1297,6 +1303,73 @@ test "buildGlobalModelOverride normalizes empty base_url to null" {
     const mo = buildGlobalModelOverride(&cfg);
     try std.testing.expect(mo.sub_agent_base_url == null);
     try std.testing.expect(mo.tools_reviewer_base_url == null);
+}
+
+test "buildGlobalModelOverride propagates token_limit when explicit and max_context_tokens unset" {
+    const cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .agent = .{ .token_limit = 64000, .token_limit_explicit = true },
+    };
+    const mo = buildGlobalModelOverride(&cfg);
+    // token_limit_explicit=true and max_context_tokens=0 → token_limit used as cap
+    try std.testing.expectEqual(@as(u64, 64000), mo.max_context_tokens);
+}
+
+test "buildGlobalModelOverride prefers max_context_tokens over token_limit when both set" {
+    const cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .agent = .{ .max_context_tokens = 32000, .token_limit = 64000, .token_limit_explicit = true },
+    };
+    const mo = buildGlobalModelOverride(&cfg);
+    // max_context_tokens wins over token_limit
+    try std.testing.expectEqual(@as(u64, 32000), mo.max_context_tokens);
+}
+
+test "buildGlobalModelOverride max_context_tokens zero when neither explicitly set" {
+    const cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+    };
+    const mo = buildGlobalModelOverride(&cfg);
+    try std.testing.expectEqual(@as(u64, 0), mo.max_context_tokens);
+}
+
+test "mergeGlobalWithEndpoint propagates global sub_agent to endpoint with general override" {
+    // Endpoint has explicit model (general override) but no sub_agent override.
+    // When global sub_agent_model changes, the merged result should carry the
+    // global sub_agent into the endpoint.
+    const global = config_types.ChannelModelOverride{
+        .model = "claude-3-5",
+        .sub_agent_model = "gpt-4o-mini",
+        .sub_agent_provider = "openai",
+    };
+    const endpoint = config_types.ChannelModelOverride{
+        .model = "gpt-4",  // endpoint has its own general model
+    };
+    const merged = mergeGlobalWithEndpoint(global, endpoint);
+    // Endpoint model wins over global
+    try std.testing.expectEqualStrings("gpt-4", merged.model.?);
+    // Global sub_agent propagates because endpoint has no sub_agent override
+    try std.testing.expectEqualStrings("gpt-4o-mini", merged.sub_agent_model.?);
+    try std.testing.expectEqualStrings("openai", merged.sub_agent_provider.?);
+}
+
+test "mergeGlobalWithEndpoint endpoint sub_agent wins over global" {
+    const global = config_types.ChannelModelOverride{
+        .sub_agent_model = "gpt-4o-mini",
+    };
+    const endpoint = config_types.ChannelModelOverride{
+        .model = "gpt-4",
+        .sub_agent_model = "claude-3-haiku",  // endpoint has its own sub_agent
+    };
+    const merged = mergeGlobalWithEndpoint(global, endpoint);
+    // Endpoint sub_agent wins
+    try std.testing.expectEqualStrings("claude-3-haiku", merged.sub_agent_model.?);
 }
 
 test "modelOverrideEqual compares temperature, max_context_tokens, base_url fields" {
