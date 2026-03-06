@@ -2,14 +2,8 @@ name: Release
 
 on:
   push:
-    tags: ['v*']
     branches: [main]
   workflow_dispatch:
-    inputs:
-      tag:
-        description: 'Release tag (e.g. v2026.3.5). Leave empty for a dev pre-release build.'
-        required: false
-        default: ''
 
 jobs:
   build:
@@ -80,19 +74,27 @@ jobs:
 
       - name: Determine release info
         id: release_info
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
-          SHORT_SHA="${{ github.sha }}"
           DATE=$(date -u +'%Y.%m.%d' | sed 's/\.0\([0-9]\)/.\1/g')
-          VERSION="${DATE}.${SHORT_SHA:0:7}"
+          DATE_ESCAPED="${DATE//./\\.}"
+          EXISTING=$(gh release list --repo "${{ github.repository }}" --limit 200 --json tagName -q '.[].tagName' 2>/dev/null || true)
+          SEQ=0
+          while IFS= read -r tag; do
+            if [[ "$tag" =~ ^v${DATE_ESCAPED}\.([0-9]+)$ ]]; then
+              N="${BASH_REMATCH[1]}"
+              if (( N >= SEQ )); then
+                SEQ=$((N + 1))
+              fi
+            fi
+          done <<< "$EXISTING"
+          VERSION="${DATE}.${SEQ}"
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
           echo "title=v${VERSION}" >> $GITHUB_OUTPUT
           echo "tag=v${VERSION}" >> $GITHUB_OUTPUT
-          if [[ "${{ github.ref_type }}" == "tag" || ( "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ inputs.tag }}" ) ]]; then
-            echo "prerelease=false" >> $GITHUB_OUTPUT
-          else
-            echo "prerelease=true" >> $GITHUB_OUTPUT
-          fi
+          echo "prerelease=false" >> $GITHUB_OUTPUT
 
       - name: Rename binaries
         shell: bash
@@ -124,7 +126,6 @@ jobs:
 
   docker:
     needs: release
-    if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     permissions:
       contents: read
