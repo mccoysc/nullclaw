@@ -21,6 +21,11 @@ The smallest fully autonomous AI assistant infrastructure — a static Zig binar
 678 KB binary · <2 ms startup · 3,230+ tests · 23+ providers · 18 channels · Pluggable everything
 ```
 
+## Documentation
+
+- [Skill Authoring Guide](docs/skills.md)
+- [Configuration Hot-Reload](docs/config-hot-reload.md)
+
 ## 中文文档
 
 - [中文文档总览](docs/zh/README.md)
@@ -32,7 +37,8 @@ The smallest fully autonomous AI assistant infrastructure — a static Zig binar
 - [Gateway API](docs/zh/gateway-api.md)
 - [命令参考](docs/zh/commands.md)
 - [开发指南](docs/zh/development.md)
-- [SKILLS用法说明](/SKILLS.md)
+- [Skills 使用指南](docs/zh/skills.md)
+- [配置热重载](docs/zh/config-hot-reload.md)
 
 ### Features
 
