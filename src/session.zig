@@ -314,20 +314,6 @@ pub const SessionManager = struct {
         return count;
     }
 
-    /// Hot-update model parameters on ALL sessions.  Returns the number updated.
-    /// Used when global model config changes to propagate to every channel type.
-    pub fn updateAllModelParams(self: *SessionManager, mo: config_types.ChannelModelOverride) usize {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        var count: usize = 0;
-        var it = self.sessions.iterator();
-        while (it.next()) |entry| {
-            applyModelOverride(&entry.value_ptr.*.agent, mo);
-            count += 1;
-        }
-        return count;
-    }
-
     /// Hot-update model parameters on all sessions whose key does NOT start
     /// with any of the given prefixes.  Returns the number of sessions updated.
     /// Used for global model changes: MQTT / Redis Stream sessions are handled
@@ -2423,29 +2409,6 @@ test "applyModelOverride full fallback chain: channel sub_agent > channel genera
         try testing.expectEqualStrings("ch/sa-specific", s.agent.sub_agent_model.?);
         try testing.expectEqualStrings("ch-sa-prov", s.agent.sub_agent_provider.?);
     }
-}
-
-test "updateAllModelParams updates every session" {
-    var mock = MockProvider{ .response = "ok" };
-    const cfg = testConfig();
-    var sm = testSessionManager(testing.allocator, &mock, &cfg);
-    defer sm.deinit();
-
-    // Create sessions for different channel types
-    _ = try sm.getOrCreate("telegram:default:user1");
-    _ = try sm.getOrCreate("discord:default:user2");
-    _ = try sm.getOrCreate("mqtt:account1:topic1");
-
-    const updated = sm.updateAllModelParams(.{ .model = "new-model" });
-    try testing.expectEqual(@as(usize, 3), updated);
-
-    // Verify all sessions were updated
-    const s1 = try sm.getOrCreate("telegram:default:user1");
-    try testing.expectEqualStrings("new-model", s1.agent.default_model);
-    const s2 = try sm.getOrCreate("discord:default:user2");
-    try testing.expectEqualStrings("new-model", s2.agent.default_model);
-    const s3 = try sm.getOrCreate("mqtt:account1:topic1");
-    try testing.expectEqualStrings("new-model", s3.agent.default_model);
 }
 
 test "updateModelParamsExcludingPrefixes skips mqtt and redis_stream sessions" {
