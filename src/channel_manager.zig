@@ -497,7 +497,7 @@ pub const ChannelManager = struct {
                 // their own model override (they inherit global config).
                 if (global_model_changed and !topology_changed) {
                     for (new_mqtt.endpoints) |ep| {
-                        if (!hasModelOverride(ep.model_override)) {
+                        if (!hasGeneralModelOverride(ep.model_override)) {
                             log.info("Global model changed, hot-updating MQTT endpoint '{s}'", .{endpointLabel(ep.endpoint_id, ep.listen_topic)});
                             self.hotUpdateSessionByEndpointGlobal("mqtt", new_mqtt.account_id, ep, new_config);
                         }
@@ -567,7 +567,7 @@ pub const ChannelManager = struct {
 
                 if (global_model_changed and !topology_changed) {
                     for (new_rs.endpoints) |ep| {
-                        if (!hasModelOverride(ep.model_override)) {
+                        if (!hasGeneralModelOverride(ep.model_override)) {
                             log.info("Global model changed, hot-updating Redis Stream endpoint '{s}'", .{endpointLabel(ep.endpoint_id, ep.listen_topic)});
                             self.hotUpdateSessionByRsEndpointGlobal("redis_stream", new_rs.account_id, ep, new_config);
                         }
@@ -901,9 +901,18 @@ fn findRsEndpointById(endpoints: []const config_types.RedisStreamEndpointConfig,
     return null;
 }
 
-/// Check if a ChannelModelOverride has any explicit overrides set.
+/// Check if a ChannelModelOverride has any general (provider/model/temperature/tokens)
+/// overrides set.  Used by hot-reload guards so that endpoints which only
+/// override sub-agent / tools-reviewer fields still inherit global general-model
+/// changes.
+fn hasGeneralModelOverride(mo: config_types.ChannelModelOverride) bool {
+    return mo.provider != null or mo.model != null or mo.max_context_tokens != 0 or mo.temperature != null;
+}
+
+/// Check if a ChannelModelOverride has *any* explicit overrides set (general
+/// + sub-agent + tools-reviewer).  Useful for serialisation / equality checks.
 fn hasModelOverride(mo: config_types.ChannelModelOverride) bool {
-    return mo.provider != null or mo.model != null or mo.max_context_tokens != 0 or mo.temperature != null or
+    return hasGeneralModelOverride(mo) or
         mo.sub_agent_provider != null or mo.sub_agent_model != null or
         mo.tools_reviewer_provider != null or mo.tools_reviewer_model != null;
 }
@@ -1011,6 +1020,133 @@ fn globalModelConfigChanged(old: *const Config, new: *const Config) bool {
 // ════════════════════════════════════════════════════════════════════════════
 // Tests
 // ════════════════════════════════════════════════════════════════════════════
+
+test "hasGeneralModelOverride only checks general fields" {
+    try std.testing.expect(!hasGeneralModelOverride(.{}));
+    try std.testing.expect(hasGeneralModelOverride(.{ .provider = "p" }));
+    try std.testing.expect(hasGeneralModelOverride(.{ .model = "m" }));
+    try std.testing.expect(hasGeneralModelOverride(.{ .max_context_tokens = 1024 }));
+    try std.testing.expect(hasGeneralModelOverride(.{ .temperature = 0.5 }));
+    // sub-agent / tools-reviewer only → should NOT count as general override
+    try std.testing.expect(!hasGeneralModelOverride(.{ .sub_agent_model = "m" }));
+    try std.testing.expect(!hasGeneralModelOverride(.{ .sub_agent_provider = "p" }));
+    try std.testing.expect(!hasGeneralModelOverride(.{ .tools_reviewer_model = "m" }));
+    try std.testing.expect(!hasGeneralModelOverride(.{ .tools_reviewer_provider = "p" }));
+}
+
+test "hasModelOverride detects all fields including sub_agent" {
+    try std.testing.expect(!hasModelOverride(.{}));
+    try std.testing.expect(hasModelOverride(.{ .sub_agent_model = "m" }));
+    try std.testing.expect(hasModelOverride(.{ .sub_agent_provider = "p" }));
+    try std.testing.expect(hasModelOverride(.{ .tools_reviewer_model = "m" }));
+    try std.testing.expect(hasModelOverride(.{ .tools_reviewer_provider = "p" }));
+    // existing fields still work
+    try std.testing.expect(hasModelOverride(.{ .provider = "p" }));
+    try std.testing.expect(hasModelOverride(.{ .model = "m" }));
+    try std.testing.expect(hasModelOverride(.{ .max_context_tokens = 1024 }));
+    try std.testing.expect(hasModelOverride(.{ .temperature = 0.5 }));
+}
+
+test "modelOverrideEqual compares sub_agent and tools_reviewer fields" {
+    const a = config_types.ChannelModelOverride{
+        .sub_agent_provider = "prov-a",
+        .sub_agent_model = "model-a",
+        .tools_reviewer_provider = "prov-b",
+        .tools_reviewer_model = "model-b",
+    };
+    // Same values
+    try std.testing.expect(modelOverrideEqual(a, .{
+        .sub_agent_provider = "prov-a",
+        .sub_agent_model = "model-a",
+        .tools_reviewer_provider = "prov-b",
+        .tools_reviewer_model = "model-b",
+    }));
+    // Different sub_agent_model
+    try std.testing.expect(!modelOverrideEqual(a, .{
+        .sub_agent_provider = "prov-a",
+        .sub_agent_model = "model-x",
+        .tools_reviewer_provider = "prov-b",
+        .tools_reviewer_model = "model-b",
+    }));
+    // Different tools_reviewer_provider
+    try std.testing.expect(!modelOverrideEqual(a, .{
+        .sub_agent_provider = "prov-a",
+        .sub_agent_model = "model-a",
+        .tools_reviewer_provider = "prov-x",
+        .tools_reviewer_model = "model-b",
+    }));
+    // null vs set
+    try std.testing.expect(!modelOverrideEqual(a, .{
+        .sub_agent_provider = null,
+        .sub_agent_model = "model-a",
+    }));
+    // Both null
+    try std.testing.expect(modelOverrideEqual(.{}, .{}));
+}
+
+test "globalModelConfigChanged detects sub_agent and tools_reviewer changes" {
+    const base = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .default_model = "test/model",
+        .sub_agent_model = "sa-model",
+        .tools_reviewer_model = "tr-model",
+    };
+    // No change
+    try std.testing.expect(!globalModelConfigChanged(&base, &base));
+
+    // sub_agent_model changed
+    var changed_sa = base;
+    changed_sa.sub_agent_model = "sa-model-new";
+    try std.testing.expect(globalModelConfigChanged(&base, &changed_sa));
+
+    // tools_reviewer_model changed
+    var changed_tr = base;
+    changed_tr.tools_reviewer_model = "tr-model-new";
+    try std.testing.expect(globalModelConfigChanged(&base, &changed_tr));
+
+    // sub_agent_provider changed
+    var changed_sap = base;
+    changed_sap.sub_agent_provider = "new-prov";
+    try std.testing.expect(globalModelConfigChanged(&base, &changed_sap));
+
+    // tools_reviewer_provider changed
+    var changed_trp = base;
+    changed_trp.tools_reviewer_provider = "new-prov";
+    try std.testing.expect(globalModelConfigChanged(&base, &changed_trp));
+}
+
+test "buildGlobalModelOverride includes sub_agent and tools_reviewer fields" {
+    const cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .default_model = "test/model",
+        .sub_agent_provider = "sa-prov",
+        .sub_agent_model = "sa-model",
+        .tools_reviewer_provider = "tr-prov",
+        .tools_reviewer_model = "tr-model",
+    };
+    const mo = buildGlobalModelOverride(&cfg);
+    try std.testing.expectEqualStrings("sa-prov", mo.sub_agent_provider.?);
+    try std.testing.expectEqualStrings("sa-model", mo.sub_agent_model.?);
+    try std.testing.expectEqualStrings("tr-prov", mo.tools_reviewer_provider.?);
+    try std.testing.expectEqualStrings("tr-model", mo.tools_reviewer_model.?);
+}
+
+test "buildGlobalModelOverride null when not configured" {
+    const cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+    };
+    const mo = buildGlobalModelOverride(&cfg);
+    try std.testing.expect(mo.sub_agent_provider == null);
+    try std.testing.expect(mo.sub_agent_model == null);
+    try std.testing.expect(mo.tools_reviewer_provider == null);
+    try std.testing.expect(mo.tools_reviewer_model == null);
+}
 
 test "PollingState has telegram signal and matrix variants" {
     try std.testing.expect(@intFromEnum(@as(std.meta.Tag(PollingState), .telegram)) !=

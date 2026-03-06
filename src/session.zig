@@ -2031,3 +2031,236 @@ test "reloadSkillsAll does not affect session count" {
     _ = sm.reloadSkillsAll();
     try testing.expectEqual(@as(usize, 2), sm.sessionCount());
 }
+
+// ---------------------------------------------------------------------------
+// 7. applyModelOverride sub-agent / tools-reviewer fallback tests
+// ---------------------------------------------------------------------------
+
+test "applyModelOverride sets sub_agent_model from channel override" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const s = try sm.getOrCreate("override:sa1");
+    // Simulate global sub_agent_model already set on agent
+    s.agent.sub_agent_model = "global/sub-agent-model";
+
+    // Channel override explicitly sets sub_agent_model
+    SessionManager.applyModelOverride(&s.agent, .{
+        .sub_agent_model = "channel/sub-agent-model",
+    });
+    try testing.expectEqualStrings("channel/sub-agent-model", s.agent.sub_agent_model.?);
+}
+
+test "applyModelOverride sub_agent_model falls back to channel general model" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const s = try sm.getOrCreate("override:sa2");
+    s.agent.sub_agent_model = "global/sub-agent-model";
+
+    // Channel has general model but no sub_agent_model
+    SessionManager.applyModelOverride(&s.agent, .{
+        .model = "channel/general-model",
+    });
+    // sub_agent_model should use channel's general model
+    try testing.expectEqualStrings("channel/general-model", s.agent.sub_agent_model.?);
+}
+
+test "applyModelOverride sub_agent_model keeps global when no channel override" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const s = try sm.getOrCreate("override:sa3");
+    s.agent.sub_agent_model = "global/sub-agent-model";
+
+    // Channel override has no model and no sub_agent_model
+    SessionManager.applyModelOverride(&s.agent, .{
+        .temperature = 0.5,
+    });
+    // sub_agent_model should stay as global
+    try testing.expectEqualStrings("global/sub-agent-model", s.agent.sub_agent_model.?);
+}
+
+test "applyModelOverride sub_agent_model channel-specific beats channel general" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const s = try sm.getOrCreate("override:sa4");
+    s.agent.sub_agent_model = "global/sub-agent-model";
+
+    // Channel has both general model and sub_agent_model
+    SessionManager.applyModelOverride(&s.agent, .{
+        .model = "channel/general-model",
+        .sub_agent_model = "channel/sub-agent-specific",
+    });
+    // sub_agent_model should use the channel-specific one, not general
+    try testing.expectEqualStrings("channel/sub-agent-specific", s.agent.sub_agent_model.?);
+}
+
+test "applyModelOverride tools_reviewer_model from channel override" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const s = try sm.getOrCreate("override:tr1");
+    s.agent.tools_reviewer_model = "global/tools-reviewer-model";
+
+    SessionManager.applyModelOverride(&s.agent, .{
+        .tools_reviewer_model = "channel/tools-reviewer-model",
+    });
+    try testing.expectEqualStrings("channel/tools-reviewer-model", s.agent.tools_reviewer_model.?);
+}
+
+test "applyModelOverride tools_reviewer_model falls back to channel general model" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const s = try sm.getOrCreate("override:tr2");
+    s.agent.tools_reviewer_model = "global/tools-reviewer-model";
+
+    SessionManager.applyModelOverride(&s.agent, .{
+        .model = "channel/general-model",
+    });
+    try testing.expectEqualStrings("channel/general-model", s.agent.tools_reviewer_model.?);
+}
+
+test "applyModelOverride tools_reviewer_model keeps global when no channel override" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const s = try sm.getOrCreate("override:tr3");
+    s.agent.tools_reviewer_model = "global/tools-reviewer-model";
+
+    SessionManager.applyModelOverride(&s.agent, .{
+        .temperature = 0.5,
+    });
+    try testing.expectEqualStrings("global/tools-reviewer-model", s.agent.tools_reviewer_model.?);
+}
+
+test "applyModelOverride sub_agent_provider from channel override" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const s = try sm.getOrCreate("override:sap1");
+    s.agent.sub_agent_provider = null;
+
+    SessionManager.applyModelOverride(&s.agent, .{
+        .sub_agent_provider = "anthropic",
+    });
+    try testing.expectEqualStrings("anthropic", s.agent.sub_agent_provider.?);
+}
+
+test "applyModelOverride sub_agent_provider falls back to channel general provider" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const s = try sm.getOrCreate("override:sap2");
+    s.agent.sub_agent_provider = null;
+
+    SessionManager.applyModelOverride(&s.agent, .{
+        .provider = "openrouter",
+    });
+    try testing.expectEqualStrings("openrouter", s.agent.sub_agent_provider.?);
+}
+
+test "applyModelOverride tools_reviewer_provider from channel override" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const s = try sm.getOrCreate("override:trp1");
+    s.agent.tools_reviewer_provider = null;
+
+    SessionManager.applyModelOverride(&s.agent, .{
+        .tools_reviewer_provider = "gemini",
+    });
+    try testing.expectEqualStrings("gemini", s.agent.tools_reviewer_provider.?);
+}
+
+test "applyModelOverride tools_reviewer_provider falls back to channel general provider" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const s = try sm.getOrCreate("override:trp2");
+    s.agent.tools_reviewer_provider = null;
+
+    SessionManager.applyModelOverride(&s.agent, .{
+        .provider = "openai",
+    });
+    try testing.expectEqualStrings("openai", s.agent.tools_reviewer_provider.?);
+}
+
+test "applyModelOverride full fallback chain: channel sub_agent > channel general > global sub_agent" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    // Test 1: global sub_agent_model set, no channel override → keeps global
+    {
+        const s = try sm.getOrCreate("override:chain1");
+        s.agent.sub_agent_model = "global/sa";
+        s.agent.sub_agent_provider = "global-prov";
+        s.agent.tools_reviewer_model = "global/tr";
+        s.agent.tools_reviewer_provider = "global-prov";
+
+        SessionManager.applyModelOverride(&s.agent, .{});
+
+        try testing.expectEqualStrings("global/sa", s.agent.sub_agent_model.?);
+        try testing.expectEqualStrings("global-prov", s.agent.sub_agent_provider.?);
+        try testing.expectEqualStrings("global/tr", s.agent.tools_reviewer_model.?);
+        try testing.expectEqualStrings("global-prov", s.agent.tools_reviewer_provider.?);
+    }
+
+    // Test 2: global sub_agent_model set, channel has general model → channel general wins
+    {
+        const s = try sm.getOrCreate("override:chain2");
+        s.agent.sub_agent_model = "global/sa";
+        s.agent.sub_agent_provider = "global-prov";
+
+        SessionManager.applyModelOverride(&s.agent, .{
+            .provider = "ch-prov",
+            .model = "ch/general",
+        });
+
+        try testing.expectEqualStrings("ch/general", s.agent.sub_agent_model.?);
+        try testing.expectEqualStrings("ch-prov", s.agent.sub_agent_provider.?);
+    }
+
+    // Test 3: global + channel general + channel specific → channel specific wins
+    {
+        const s = try sm.getOrCreate("override:chain3");
+        s.agent.sub_agent_model = "global/sa";
+        s.agent.sub_agent_provider = "global-prov";
+
+        SessionManager.applyModelOverride(&s.agent, .{
+            .provider = "ch-prov",
+            .model = "ch/general",
+            .sub_agent_provider = "ch-sa-prov",
+            .sub_agent_model = "ch/sa-specific",
+        });
+
+        try testing.expectEqualStrings("ch/sa-specific", s.agent.sub_agent_model.?);
+        try testing.expectEqualStrings("ch-sa-prov", s.agent.sub_agent_provider.?);
+    }
+}

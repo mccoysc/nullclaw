@@ -688,6 +688,32 @@ test "SubagentManager stores runner callback error" {
     try std.testing.expect(std.mem.indexOf(u8, state.error_msg.?, "TestTaskRunnerFailure") != null);
 }
 
+test "SubagentManager init propagates sub_agent model config" {
+    const cfg = config_mod.Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+        .sub_agent_provider = "sa-provider",
+        .sub_agent_model = "sa-model",
+    };
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    defer mgr.deinit();
+    try std.testing.expectEqualStrings("sa-provider", mgr.sub_agent_provider.?);
+    try std.testing.expectEqualStrings("sa-model", mgr.sub_agent_model.?);
+}
+
+test "SubagentManager init with null sub_agent config" {
+    const cfg = config_mod.Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    defer mgr.deinit();
+    try std.testing.expect(mgr.sub_agent_provider == null);
+    try std.testing.expect(mgr.sub_agent_model == null);
+}
+
 test "SubagentManager spawn rollback removes task on out-of-memory" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     const alloc = failing.allocator();

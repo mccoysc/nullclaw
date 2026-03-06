@@ -4432,3 +4432,59 @@ test "NostrConfig dm_relays default is auth.nostr1.com" {
     try std.testing.expectEqual(@as(usize, 1), cfg.dm_relays.len);
     try std.testing.expectEqualStrings("wss://auth.nostr1.com", cfg.dm_relays[0]);
 }
+
+test "parseJson parses global sub_agent and tools_reviewer fields" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const json =
+        \\{
+        \\  "sub_agent_provider": "anthropic",
+        \\  "sub_agent_model": "claude-sonnet-4-20250514",
+        \\  "tools_reviewer_provider": "openrouter",
+        \\  "tools_reviewer_model": "openrouter/google/gemini-2.5-flash"
+        \\}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+
+    try std.testing.expectEqualStrings("anthropic", cfg.sub_agent_provider.?);
+    try std.testing.expectEqualStrings("claude-sonnet-4-20250514", cfg.sub_agent_model.?);
+    try std.testing.expectEqualStrings("openrouter", cfg.tools_reviewer_provider.?);
+    try std.testing.expectEqualStrings("openrouter/google/gemini-2.5-flash", cfg.tools_reviewer_model.?);
+}
+
+test "parseJson sub_agent and tools_reviewer fields default to null" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const json =
+        \\{"default_temperature": 0.5}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+
+    try std.testing.expect(cfg.sub_agent_provider == null);
+    try std.testing.expect(cfg.sub_agent_model == null);
+    try std.testing.expect(cfg.tools_reviewer_provider == null);
+    try std.testing.expect(cfg.tools_reviewer_model == null);
+}
+
+test "parseJson partial sub_agent fields" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const json =
+        \\{"sub_agent_model": "my-model"}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+
+    try std.testing.expect(cfg.sub_agent_provider == null);
+    try std.testing.expectEqualStrings("my-model", cfg.sub_agent_model.?);
+    try std.testing.expect(cfg.tools_reviewer_provider == null);
+    try std.testing.expect(cfg.tools_reviewer_model == null);
+}
