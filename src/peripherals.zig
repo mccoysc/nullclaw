@@ -1334,11 +1334,16 @@ test "gpioRead returns result with state" {
     rpi.connected = true;
     const p = rpi.peripheral();
     if (comptime builtin.os.tag == .linux) {
-        // Only run on real RPi hardware — requires NULLCLAW_GPIO_TEST=1
-        if (platform.getEnvOrNull(std.testing.allocator, "NULLCLAW_GPIO_TEST")) |v| std.testing.allocator.free(v) else return error.SkipZigTest;
-        const result = try gpioRead(p, 17);
-        try std.testing.expectEqual(@as(u32, 17), result.pin);
-        try std.testing.expectEqualStrings("LOW", result.stateString());
+        // On real RPi hardware (NULLCLAW_GPIO_TEST=1), verify the full read path.
+        // Otherwise the sysfs GPIO files don't exist → IoError.
+        if (platform.getEnvOrNull(std.testing.allocator, "NULLCLAW_GPIO_TEST")) |v| {
+            std.testing.allocator.free(v);
+            const result = try gpioRead(p, 17);
+            try std.testing.expectEqual(@as(u32, 17), result.pin);
+            try std.testing.expectEqualStrings("LOW", result.stateString());
+        } else {
+            try std.testing.expectError(Peripheral.PeripheralError.IoError, gpioRead(p, 17));
+        }
     } else {
         try std.testing.expectError(Peripheral.PeripheralError.UnsupportedOperation, gpioRead(p, 17));
     }
@@ -1349,12 +1354,17 @@ test "gpioWrite returns success" {
     rpi.connected = true;
     const p = rpi.peripheral();
     if (comptime builtin.os.tag == .linux) {
-        // Only run on real RPi hardware — requires NULLCLAW_GPIO_TEST=1
-        if (platform.getEnvOrNull(std.testing.allocator, "NULLCLAW_GPIO_TEST")) |v| std.testing.allocator.free(v) else return error.SkipZigTest;
-        const result = try gpioWrite(p, 17, true);
-        try std.testing.expectEqual(@as(u32, 17), result.pin);
-        try std.testing.expectEqual(@as(u8, 1), result.value);
-        try std.testing.expect(result.success);
+        // On real RPi hardware (NULLCLAW_GPIO_TEST=1), verify the full write path.
+        // Otherwise the sysfs GPIO files don't exist → IoError.
+        if (platform.getEnvOrNull(std.testing.allocator, "NULLCLAW_GPIO_TEST")) |v| {
+            std.testing.allocator.free(v);
+            const result = try gpioWrite(p, 17, true);
+            try std.testing.expectEqual(@as(u32, 17), result.pin);
+            try std.testing.expectEqual(@as(u8, 1), result.value);
+            try std.testing.expect(result.success);
+        } else {
+            try std.testing.expectError(Peripheral.PeripheralError.IoError, gpioWrite(p, 17, true));
+        }
     } else {
         try std.testing.expectError(Peripheral.PeripheralError.UnsupportedOperation, gpioWrite(p, 17, true));
     }

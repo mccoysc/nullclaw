@@ -307,52 +307,74 @@ test "i2c tool schema has action" {
     try std.testing.expect(std.mem.indexOf(u8, schema, "register") != null);
 }
 
-test "i2c detect on non-linux returns platform error" {
-    if (comptime builtin.os.tag == .linux) return error.SkipZigTest;
+test "i2c detect graceful on every platform" {
     var it: I2cTool = .{};
     const t = it.tool();
     const parsed = try root.parseTestArgs("{\"action\":\"detect\"}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
-    defer if (result.error_msg) |e| std.testing.allocator.free(e);
-    try std.testing.expect(!result.success);
-    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "not supported") != null);
+    if (comptime builtin.os.tag != .linux) {
+        // Non-Linux: platformError() returns a heap-allocated error_msg.
+        defer std.testing.allocator.free(result.error_msg.?);
+        try std.testing.expect(!result.success);
+        try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "not supported") != null);
+    } else {
+        // Linux: succeeds with heap-allocated output (may find 0 buses without hardware).
+        defer std.testing.allocator.free(result.output);
+        try std.testing.expect(result.success);
+        try std.testing.expect(std.mem.indexOf(u8, result.output, "buses") != null);
+    }
 }
 
-test "i2c scan on non-linux returns platform error" {
-    if (comptime builtin.os.tag == .linux) return error.SkipZigTest;
+test "i2c scan graceful on every platform" {
     var it: I2cTool = .{};
     const t = it.tool();
-    const parsed = try root.parseTestArgs("{\"action\":\"scan\",\"bus\":1}");
+    const parsed = try root.parseTestArgs("{\"action\":\"scan\",\"bus\":99}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
-    defer if (result.error_msg) |e| std.testing.allocator.free(e);
     try std.testing.expect(!result.success);
-    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "not supported") != null);
+    if (comptime builtin.os.tag != .linux) {
+        // Non-Linux: platformError() returns a heap-allocated error_msg.
+        defer std.testing.allocator.free(result.error_msg.?);
+        try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "not supported") != null);
+    } else {
+        // Linux: ToolResult.fail() returns a static error_msg — no free needed.
+        try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "Cannot open") != null);
+    }
 }
 
-test "i2c read on non-linux returns platform error" {
-    if (comptime builtin.os.tag == .linux) return error.SkipZigTest;
+test "i2c read graceful on every platform" {
     var it: I2cTool = .{};
     const t = it.tool();
-    const parsed = try root.parseTestArgs("{\"action\":\"read\",\"bus\":1,\"address\":\"0x48\",\"register\":0}");
+    const parsed = try root.parseTestArgs("{\"action\":\"read\",\"bus\":99,\"address\":\"0x48\",\"register\":0}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
-    defer if (result.error_msg) |e| std.testing.allocator.free(e);
     try std.testing.expect(!result.success);
-    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "not supported") != null);
+    if (comptime builtin.os.tag != .linux) {
+        // Non-Linux: platformError() returns a heap-allocated error_msg.
+        defer std.testing.allocator.free(result.error_msg.?);
+        try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "not supported") != null);
+    } else {
+        // Linux: ToolResult.fail() returns a static error_msg — no free needed.
+        try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "Cannot open") != null);
+    }
 }
 
-test "i2c write on non-linux returns platform error" {
-    if (comptime builtin.os.tag == .linux) return error.SkipZigTest;
+test "i2c write graceful on every platform" {
     var it: I2cTool = .{};
     const t = it.tool();
-    const parsed = try root.parseTestArgs("{\"action\":\"write\",\"bus\":1,\"address\":\"0x48\",\"register\":0,\"value\":42}");
+    const parsed = try root.parseTestArgs("{\"action\":\"write\",\"bus\":99,\"address\":\"0x48\",\"register\":0,\"value\":42}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
-    defer if (result.error_msg) |e| std.testing.allocator.free(e);
     try std.testing.expect(!result.success);
-    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "not supported") != null);
+    if (comptime builtin.os.tag != .linux) {
+        // Non-Linux: platformError() returns a heap-allocated error_msg.
+        defer std.testing.allocator.free(result.error_msg.?);
+        try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "not supported") != null);
+    } else {
+        // Linux: ToolResult.fail() returns a static error_msg — no free needed.
+        try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "Cannot open") != null);
+    }
 }
 
 test "i2c missing action parameter" {
@@ -424,14 +446,17 @@ test "parseAddress rejects invalid" {
 }
 
 test "i2c scan missing bus parameter" {
-    if (comptime builtin.os.tag == .linux) return error.SkipZigTest;
     var it: I2cTool = .{};
     const t = it.tool();
-    // On non-Linux, the platform error fires before bus check (comptime).
-    // Test that it doesn't crash.
     const parsed = try root.parseTestArgs("{\"action\":\"scan\"}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
-    defer if (result.error_msg) |e| std.testing.allocator.free(e);
     try std.testing.expect(!result.success);
+    if (comptime builtin.os.tag != .linux) {
+        // Non-Linux: platformError() fires before bus check — heap-allocated msg.
+        defer std.testing.allocator.free(result.error_msg.?);
+    } else {
+        // Linux: ToolResult.fail("Missing 'bus' ...") — static msg.
+        try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "bus") != null);
+    }
 }
