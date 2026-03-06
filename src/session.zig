@@ -260,6 +260,73 @@ pub const SessionManager = struct {
         if (mo.tools_reviewer_base_url) |u| agent.tools_reviewer_base_url = u;
     }
 
+    /// Refresh non-model config-derived fields on an agent from the given config.
+    /// Called during config hot-reload to ensure fields displayed by /debug
+    /// (and used at runtime) reflect the latest config.  Model-related fields
+    /// are handled separately by applyModelOverride.
+    fn applyNonModelConfigRefresh(agent: *Agent, cfg: *const Config) void {
+        // Fields visible in /debug (formatStatus)
+        agent.reasoning_effort = cfg.reasoning_effort;
+        agent.status_show_emojis = cfg.agent.status_show_emojis;
+        agent.exec_security = switch (cfg.autonomy.level) {
+            .full => .full,
+            .read_only => .deny,
+            .supervised => .allowlist,
+        };
+        agent.exec_ask = switch (cfg.autonomy.level) {
+            .full, .read_only => .off,
+            .supervised => .on_miss,
+        };
+        // Agent-loop settings
+        agent.max_tool_iterations = cfg.agent.max_tool_iterations;
+        agent.max_history_messages = cfg.agent.max_history_messages;
+        agent.auto_save = cfg.memory.auto_save;
+        agent.message_timeout_secs = cfg.agent.message_timeout_secs;
+        agent.compaction_keep_recent = cfg.agent.compaction_keep_recent;
+        agent.compaction_max_summary_chars = cfg.agent.compaction_max_summary_chars;
+        agent.compaction_max_source_chars = cfg.agent.compaction_max_source_chars;
+        agent.log_tool_calls = cfg.diagnostics.log_tool_calls;
+        agent.log_llm_io = cfg.diagnostics.log_llm_io;
+        // Provider fallbacks (slices point into config arena, kept alive via prev_configs)
+        agent.configured_providers = cfg.providers;
+        agent.fallback_providers = cfg.reliability.fallback_providers;
+        agent.model_fallbacks = cfg.reliability.model_fallbacks;
+        agent.allowed_paths = cfg.autonomy.allowed_paths;
+        agent.tool_filter_groups = cfg.agent.tool_filter_groups;
+        agent.sub_agent_max_iterations = cfg.agent.sub_agent_max_iterations;
+        agent.sub_agent_review_after = cfg.agent.sub_agent_review_after;
+        agent.max_tokens_override = cfg.max_tokens;
+        // Recompute max_tokens using the same resolution as fromConfigInner
+        const resolved_raw = agent_root.max_tokens_resolver.resolveMaxTokens(cfg.max_tokens, agent.model_name);
+        const token_cap: u32 = @intCast(@min(agent.token_limit, @as(u64, std.math.maxInt(u32))));
+        agent.max_tokens = @min(resolved_raw, token_cap);
+    }
+
+    /// Hot-refresh non-model config-derived fields on sessions whose key does
+    /// NOT start with any of the given prefixes.  MQTT / Redis Stream sessions
+    /// have per-endpoint sub_agent_max_iterations / sub_agent_review_after set
+    /// by applyModelOverride; refreshing them with global values would clobber
+    /// endpoint-specific overrides.  Returns the number of sessions refreshed.
+    pub fn refreshNonModelConfig(self: *SessionManager, cfg: *const Config, exclude_prefixes: []const []const u8) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var count: usize = 0;
+        var it = self.sessions.iterator();
+        while (it.next()) |entry| {
+            const excluded = for (exclude_prefixes) |pfx| {
+                if (std.mem.startsWith(u8, entry.key_ptr.*, pfx)) break true;
+            } else false;
+            if (!excluded) {
+                const session = entry.value_ptr.*;
+                session.mutex.lock();
+                applyNonModelConfigRefresh(&session.agent, cfg);
+                session.mutex.unlock();
+                count += 1;
+            }
+        }
+        return count;
+    }
+
     /// Evict all sessions whose key starts with the given prefix.
     /// Used during config hot-reload to clean up sessions for removed channels.
     /// Returns the number of sessions evicted.
@@ -2500,4 +2567,93 @@ test "updateModelParamsExcludingPrefixes covers all non-endpoint channel types" 
     const s_mqtt = try sm.getOrCreate("mqtt:a1:t1");
     try testing.expect(s_mqtt.agent.default_provider.len > 0);
     try testing.expect(!std.mem.eql(u8, s_mqtt.agent.default_provider, "new-prov"));
+}
+
+test "refreshNonModelConfig updates config-derived fields on all sessions" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    _ = try sm.getOrCreate("telegram:default:user1");
+    _ = try sm.getOrCreate("discord:default:user2");
+
+    // Build a new config with different non-model settings
+    var new_cfg = testConfig();
+    new_cfg.reasoning_effort = "high";
+    new_cfg.agent.max_tool_iterations = 42;
+    new_cfg.agent.max_history_messages = 200;
+    new_cfg.agent.status_show_emojis = false;
+    new_cfg.autonomy.level = .read_only;
+
+    const exclude = &[_][]const u8{ "mqtt:", "redis_stream:" };
+    const refreshed = sm.refreshNonModelConfig(&new_cfg, exclude);
+    try testing.expectEqual(@as(usize, 2), refreshed);
+
+    const s1 = try sm.getOrCreate("telegram:default:user1");
+    try testing.expectEqualStrings("high", s1.agent.reasoning_effort.?);
+    try testing.expectEqual(@as(u32, 42), s1.agent.max_tool_iterations);
+    try testing.expectEqual(@as(u32, 200), s1.agent.max_history_messages);
+    try testing.expect(!s1.agent.status_show_emojis);
+    try testing.expectEqualStrings("deny", s1.agent.exec_security.toSlice());
+    try testing.expectEqualStrings("off", s1.agent.exec_ask.toSlice());
+
+    const s2 = try sm.getOrCreate("discord:default:user2");
+    try testing.expectEqualStrings("high", s2.agent.reasoning_effort.?);
+    try testing.expectEqual(@as(u32, 42), s2.agent.max_tool_iterations);
+}
+
+test "refreshNonModelConfig does not change model fields" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    _ = try sm.getOrCreate("telegram:default:user1");
+
+    // Change the default_model in the new config — refreshNonModelConfig should NOT touch it
+    var new_cfg = testConfig();
+    new_cfg.default_model = "other/model";
+    new_cfg.reasoning_effort = "low";
+
+    const no_exclude = &[_][]const u8{};
+    _ = sm.refreshNonModelConfig(&new_cfg, no_exclude);
+
+    const s = try sm.getOrCreate("telegram:default:user1");
+    // model_name should still be the original
+    try testing.expectEqualStrings("test/mock-model", s.agent.model_name);
+    // but reasoning_effort should be updated
+    try testing.expectEqualStrings("low", s.agent.reasoning_effort.?);
+}
+
+test "refreshNonModelConfig excludes mqtt and redis_stream sessions" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    _ = try sm.getOrCreate("telegram:default:user1");
+    _ = try sm.getOrCreate("mqtt:account1:topic1");
+    _ = try sm.getOrCreate("redis_stream:account2:topic2");
+
+    var new_cfg = testConfig();
+    new_cfg.agent.sub_agent_max_iterations = 99;
+    new_cfg.agent.sub_agent_review_after = 77;
+    new_cfg.reasoning_effort = "high";
+
+    const exclude = &[_][]const u8{ "mqtt:", "redis_stream:" };
+    const refreshed = sm.refreshNonModelConfig(&new_cfg, exclude);
+
+    // Only Telegram updated (1), not MQTT/RS (2)
+    try testing.expectEqual(@as(usize, 1), refreshed);
+
+    // Telegram session got the update
+    const s_tg = try sm.getOrCreate("telegram:default:user1");
+    try testing.expectEqual(@as(u32, 99), s_tg.agent.sub_agent_max_iterations);
+    try testing.expectEqualStrings("high", s_tg.agent.reasoning_effort.?);
+
+    // MQTT session was NOT updated (still has default values)
+    const s_mqtt = try sm.getOrCreate("mqtt:account1:topic1");
+    try testing.expect(s_mqtt.agent.sub_agent_max_iterations != 99);
+    try testing.expect(s_mqtt.agent.reasoning_effort == null);
 }
