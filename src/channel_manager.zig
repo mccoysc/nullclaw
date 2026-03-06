@@ -439,6 +439,9 @@ pub const ChannelManager = struct {
         // Diff and apply changes
         self.applyConfigReload(new_config, state);
 
+        // Save old config pointer before overwriting — needed for provider change detection.
+        const old_config = self.config;
+
         // Store the old config (don't free — running channels may still reference it)
         self.prev_configs.append(self.allocator, @constCast(self.config)) catch {};
 
@@ -449,6 +452,12 @@ pub const ChannelManager = struct {
         if (self.runtime) |rt| {
             rt.session_mgr.updateConfig(new_config);
             rt.config = new_config;
+
+            // If provider credentials or default_provider changed, rebuild the
+            // provider bundle so existing sessions pick up the new API key.
+            if (providerConfigChanged(old_config, new_config)) {
+                rt.rebuildProvider(new_config);
+            }
         }
 
         log.info("Config reload complete", .{});
@@ -1135,6 +1144,47 @@ fn globalModelConfigChanged(old: *const Config, new: *const Config) bool {
     return false;
 }
 
+/// Check if provider credentials or the default provider changed between
+/// old and new configs.  When true, the RuntimeProviderBundle must be
+/// rebuilt so that existing sessions pick up the new API key.
+///
+/// Note: provider entries are compared positionally (same order as the
+/// JSON array in config.json).  Reordering entries without changing
+/// their content is treated as a change, which is harmless — it simply
+/// triggers a provider rebuild.
+fn providerConfigChanged(old: *const Config, new: *const Config) bool {
+    // Default provider name changed → need a new provider.
+    if (!std.mem.eql(u8, old.default_provider, new.default_provider)) return true;
+
+    // Compare provider entries: count, names, api_keys, base_urls.
+    if (old.providers.len != new.providers.len) return true;
+    for (old.providers, new.providers) |o, n| {
+        if (!std.mem.eql(u8, o.name, n.name)) return true;
+        if (!optionalStrEql(o.api_key, n.api_key)) return true;
+        if (!optionalStrEql(o.base_url, n.base_url)) return true;
+        if (!optionalStrEql(o.user_agent, n.user_agent)) return true;
+        if (o.native_tools != n.native_tools) return true;
+    }
+
+    // Reliability API keys (key rotation) changed.
+    if (old.reliability.api_keys.len != new.reliability.api_keys.len) return true;
+    for (old.reliability.api_keys, new.reliability.api_keys) |o, n| {
+        if (!std.mem.eql(u8, o, n)) return true;
+    }
+
+    // Fallback provider list changed.
+    if (old.reliability.fallback_providers.len != new.reliability.fallback_providers.len) return true;
+    for (old.reliability.fallback_providers, new.reliability.fallback_providers) |o, n| {
+        if (!std.mem.eql(u8, o, n)) return true;
+    }
+
+    // Retry settings changed.
+    if (old.reliability.provider_retries != new.reliability.provider_retries) return true;
+    if (old.reliability.provider_backoff_ms != new.reliability.provider_backoff_ms) return true;
+
+    return false;
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // Tests
 // ════════════════════════════════════════════════════════════════════════════
@@ -1380,7 +1430,7 @@ test "mergeGlobalWithEndpoint propagates global sub_agent to endpoint with gener
         .sub_agent_provider = "openai",
     };
     const endpoint = config_types.ChannelModelOverride{
-        .model = "gpt-4",  // endpoint has its own general model
+        .model = "gpt-4", // endpoint has its own general model
     };
     const merged = mergeGlobalWithEndpoint(global, endpoint);
     // Endpoint model wins over global
@@ -1396,7 +1446,7 @@ test "mergeGlobalWithEndpoint endpoint sub_agent wins over global" {
     };
     const endpoint = config_types.ChannelModelOverride{
         .model = "gpt-4",
-        .sub_agent_model = "claude-3-haiku",  // endpoint has its own sub_agent
+        .sub_agent_model = "claude-3-haiku", // endpoint has its own sub_agent
     };
     const merged = mergeGlobalWithEndpoint(global, endpoint);
     // Endpoint sub_agent wins
@@ -2231,4 +2281,156 @@ test "ChannelManager collects web channel from config" {
     try std.testing.expect(web_ptr.bus == &event_bus);
     try std.testing.expectEqualStrings("/relay", web_ptr.ws_path);
     try std.testing.expectEqualStrings("relay-token-0123456789", web_ptr.configured_auth_token.?);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// providerConfigChanged tests
+// ════════════════════════════════════════════════════════════════════════════
+
+test "providerConfigChanged detects api_key addition" {
+    const no_key = [_]config_types.ProviderEntry{
+        .{ .name = "openrouter" },
+    };
+    const with_key = [_]config_types.ProviderEntry{
+        .{ .name = "openrouter", .api_key = "sk-or-test" },
+    };
+
+    var base = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .default_model = "test/model",
+        .providers = &no_key,
+    };
+
+    var changed = base;
+    changed.providers = &with_key;
+
+    try std.testing.expect(providerConfigChanged(&base, &changed));
+    try std.testing.expect(!providerConfigChanged(&base, &base));
+}
+
+test "providerConfigChanged detects api_key change" {
+    const key_a = [_]config_types.ProviderEntry{
+        .{ .name = "openrouter", .api_key = "key-a" },
+    };
+    const key_b = [_]config_types.ProviderEntry{
+        .{ .name = "openrouter", .api_key = "key-b" },
+    };
+
+    var a = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .default_model = "test/model",
+        .providers = &key_a,
+    };
+
+    var b = a;
+    b.providers = &key_b;
+
+    try std.testing.expect(providerConfigChanged(&a, &b));
+}
+
+test "providerConfigChanged detects default_provider change" {
+    var a = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .default_model = "test/model",
+    };
+
+    var b = a;
+    b.default_provider = "anthropic";
+
+    try std.testing.expect(providerConfigChanged(&a, &b));
+}
+
+test "providerConfigChanged detects provider count change" {
+    const one = [_]config_types.ProviderEntry{
+        .{ .name = "openrouter", .api_key = "key" },
+    };
+    const two = [_]config_types.ProviderEntry{
+        .{ .name = "openrouter", .api_key = "key" },
+        .{ .name = "anthropic", .api_key = "key2" },
+    };
+
+    var a = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .default_model = "test/model",
+        .providers = &one,
+    };
+
+    var b = a;
+    b.providers = &two;
+
+    try std.testing.expect(providerConfigChanged(&a, &b));
+}
+
+test "providerConfigChanged detects base_url change" {
+    const base = [_]config_types.ProviderEntry{
+        .{ .name = "openrouter", .api_key = "key", .base_url = null },
+    };
+    const with_url = [_]config_types.ProviderEntry{
+        .{ .name = "openrouter", .api_key = "key", .base_url = "https://custom.example.com/v1" },
+    };
+
+    var a = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .default_model = "test/model",
+        .providers = &base,
+    };
+
+    var b = a;
+    b.providers = &with_url;
+
+    try std.testing.expect(providerConfigChanged(&a, &b));
+}
+
+test "providerConfigChanged returns false for identical configs" {
+    const providers = [_]config_types.ProviderEntry{
+        .{ .name = "openrouter", .api_key = "key" },
+    };
+
+    const a = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .default_model = "test/model",
+        .providers = &providers,
+    };
+
+    try std.testing.expect(!providerConfigChanged(&a, &a));
+}
+
+test "providerConfigChanged detects retry settings change" {
+    var a = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .default_model = "test/model",
+    };
+
+    var b = a;
+    b.reliability.provider_retries = 5;
+
+    try std.testing.expect(providerConfigChanged(&a, &b));
+}
+
+test "providerConfigChanged detects fallback_providers change" {
+    var a = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .default_model = "test/model",
+    };
+
+    var b = a;
+    b.reliability.fallback_providers = &.{"anthropic"};
+
+    try std.testing.expect(providerConfigChanged(&a, &b));
 }

@@ -336,6 +336,9 @@ pub const ChannelRuntime = struct {
     subagent_manager: ?*subagent_mod.SubagentManager,
     policy_tracker: *security.RateTracker,
     security_policy: *security.SecurityPolicy,
+    /// Previous provider bundles kept alive to avoid dangling pointers in
+    /// sessions that may still reference the old provider.  Freed on deinit.
+    prev_provider_bundles: std.ArrayListUnmanaged(provider_runtime.RuntimeProviderBundle) = .empty,
 
     /// Initialize the runtime from config — mirrors main.zig:702-786 setup.
     pub fn init(allocator: std.mem.Allocator, config: *const Config) !*ChannelRuntime {
@@ -456,6 +459,41 @@ pub const ChannelRuntime = struct {
         return self;
     }
 
+    /// Rebuild the provider bundle from the current config (e.g. after an API
+    /// key change).  The old bundle is kept alive in `prev_provider_bundles` so
+    /// that sessions still referencing its vtable pointer remain valid until
+    /// ChannelRuntime is torn down.
+    pub fn rebuildProvider(self: *ChannelRuntime, new_config: *const Config) void {
+        var new_bundle = provider_runtime.RuntimeProviderBundle.init(self.allocator, new_config) catch |err| {
+            log.warn("Provider rebuild failed — sessions still using previous credentials: {s}", .{@errorName(err)});
+            return;
+        };
+
+        // Stash the old bundle so its memory (and vtable pointers) stay valid.
+        self.prev_provider_bundles.append(self.allocator, self.provider_bundle) catch {
+            // If we cannot keep the old bundle alive we must not swap — a
+            // dangling pointer would be worse than a stale API key.
+            new_bundle.deinit();
+            log.warn("Could not stash previous provider bundle; skipping provider update", .{});
+            return;
+        };
+
+        self.provider_bundle = new_bundle;
+        const new_provider = new_bundle.provider();
+
+        // Propagate to session manager + all existing sessions.
+        self.session_mgr.updateProvider(new_provider);
+
+        // Also update the subagent manager's api_key so that background
+        // subagent threads pick up the new credentials.
+        if (self.subagent_manager) |mgr| {
+            mgr.api_key = new_bundle.primaryApiKey();
+            mgr.configured_providers = new_config.providers;
+        }
+
+        log.info("Provider bundle rebuilt — API key / provider config updated for all sessions", .{});
+    }
+
     pub fn deinit(self: *ChannelRuntime) void {
         const alloc = self.allocator;
         self.session_mgr.deinit();
@@ -466,6 +504,9 @@ pub const ChannelRuntime = struct {
             alloc.destroy(mgr);
         }
         if (self.mem_rt) |*rt| rt.deinit();
+        // Free stashed provider bundles from hot-reloads, then the current one.
+        for (self.prev_provider_bundles.items) |*bundle| bundle.deinit();
+        self.prev_provider_bundles.deinit(alloc);
         self.provider_bundle.deinit();
         self.policy_tracker.deinit();
         alloc.destroy(self.security_policy);
