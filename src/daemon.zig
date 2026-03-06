@@ -1701,7 +1701,7 @@ test "hasSupervisedChannels true for nostr" {
         .owner_pubkey = "a" ** 64,
     };
     config.channels.nostr = &ns_cfg;
-    try std.testing.expect(hasSupervisedChannels(&config));
+    try std.testing.expectEqual(channel_catalog.isBuildEnabled(.nostr), hasSupervisedChannels(&config));
 }
 
 test "stateFilePath derives from config_path" {
