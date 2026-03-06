@@ -618,17 +618,24 @@ pub const ChannelManager = struct {
             }
         }
 
-        // ── Global model change: hot-update ALL non-endpoint-based sessions ──
+        // ── Hot-update ALL non-endpoint-based sessions ──
         // MQTT and Redis Stream sessions are already handled above with
         // per-endpoint merge logic.  All other channel types (Telegram,
         // Discord, Slack, Signal, Matrix, IRC, Web, etc.) inherit directly
         // from global config, so we update them here.
-        if (global_model_changed) {
-            if (self.runtime) |rt| {
-                const global_mo = buildGlobalModelOverride(new_config);
-                const exclude = &[_][]const u8{ "mqtt:", "redis_stream:" };
-                const updated = rt.session_mgr.updateModelParamsExcludingPrefixes(global_mo, exclude);
-                if (updated > 0) log.info("Global model changed, hot-updated {d} non-endpoint session(s)", .{updated});
+        //
+        // Model params are always applied (not only when globalModelConfigChanged)
+        // to ensure sessions stay in sync even when the change detection has
+        // edge-case gaps.  Non-model config-derived fields (reasoning_effort,
+        // exec_security, etc.) are also refreshed so that /debug reflects the
+        // latest config.
+        if (self.runtime) |rt| {
+            const global_mo = buildGlobalModelOverride(new_config);
+            const exclude = &[_][]const u8{ "mqtt:", "redis_stream:" };
+            const model_updated = rt.session_mgr.updateModelParamsExcludingPrefixes(global_mo, exclude);
+            const cfg_refreshed = rt.session_mgr.refreshNonModelConfig(new_config);
+            if (model_updated > 0 or cfg_refreshed > 0) {
+                log.info("Hot-updated {d} session(s) (model={d}, config={d})", .{ @max(model_updated, cfg_refreshed), model_updated, cfg_refreshed });
             }
         }
 
