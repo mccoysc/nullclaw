@@ -9,6 +9,8 @@ pub const AutonomyLevel = enum {
     supervised,
     /// Full: autonomous execution within policy bounds
     full,
+    /// Godmode: bypasses all security checks (allowlist, syntax, risk, approval, rate limiting)
+    godmode,
 
     pub fn default() AutonomyLevel {
         return .supervised;
@@ -19,6 +21,7 @@ pub const AutonomyLevel = enum {
             .read_only => "readonly",
             .supervised => "supervised",
             .full => "full",
+            .godmode => "godmode",
         };
     }
 
@@ -26,6 +29,7 @@ pub const AutonomyLevel = enum {
         if (std.mem.eql(u8, s, "readonly") or std.mem.eql(u8, s, "read_only")) return .read_only;
         if (std.mem.eql(u8, s, "supervised")) return .supervised;
         if (std.mem.eql(u8, s, "full")) return .full;
+        if (std.mem.eql(u8, s, "godmode")) return .godmode;
         return null;
     }
 };
@@ -145,6 +149,7 @@ pub const SecurityPolicy = struct {
         command: []const u8,
         approved: bool,
     ) error{ CommandNotAllowed, HighRiskBlocked, ApprovalRequired }!CommandRiskLevel {
+        if (self.autonomy == .godmode) return .low;
         if (!self.isCommandAllowed(command)) {
             return error.CommandNotAllowed;
         }
@@ -173,6 +178,7 @@ pub const SecurityPolicy = struct {
 
     /// Check if a shell command is allowed.
     pub fn isCommandAllowed(self: *const SecurityPolicy, command: []const u8) bool {
+        if (self.autonomy == .godmode) return true;
         if (self.autonomy == .read_only) return false;
 
         // Reject oversized commands — never silently truncate
@@ -1583,4 +1589,43 @@ test "full autonomy wildcard: arbitrary commands allowed" {
     try std.testing.expect(p.isCommandAllowed("cargo build --release"));
     try std.testing.expect(p.isCommandAllowed("make all"));
     try std.testing.expect(p.isCommandAllowed("zig build test"));
+}
+
+// ── Godmode autonomy level tests ────────────────────────────────
+
+test "godmode fromString returns godmode" {
+    try std.testing.expectEqual(AutonomyLevel.godmode, AutonomyLevel.fromString("godmode").?);
+}
+
+test "godmode toString returns godmode" {
+    try std.testing.expectEqualStrings("godmode", AutonomyLevel.godmode.toString());
+}
+
+test "godmode isCommandAllowed bypasses all syntax checks" {
+    const p = SecurityPolicy{ .autonomy = .godmode };
+    // Subshell expansion — blocked by full, allowed by godmode
+    try std.testing.expect(p.isCommandAllowed("echo $(whoami)"));
+    // Backtick expansion
+    try std.testing.expect(p.isCommandAllowed("echo `id`"));
+    // Output redirection
+    try std.testing.expect(p.isCommandAllowed("echo hi > /tmp/out"));
+    // Background &
+    try std.testing.expect(p.isCommandAllowed("sleep 1 &"));
+    // Process substitution
+    try std.testing.expect(p.isCommandAllowed("diff <(ls) <(ls /tmp)"));
+}
+
+test "godmode validateCommandExecution returns low for all commands" {
+    const p = SecurityPolicy{ .autonomy = .godmode };
+    // High-risk command — godmode bypasses entirely
+    const risk1 = try p.validateCommandExecution("sudo rm -rf /", false);
+    try std.testing.expectEqual(CommandRiskLevel.low, risk1);
+    // Command not on any allowlist — godmode bypasses
+    const risk2 = try p.validateCommandExecution("python3 exploit.py", false);
+    try std.testing.expectEqual(CommandRiskLevel.low, risk2);
+}
+
+test "godmode canAct returns true" {
+    const p = SecurityPolicy{ .autonomy = .godmode };
+    try std.testing.expect(p.canAct());
 }
