@@ -1114,6 +1114,7 @@ fn globalModelConfigChanged(old: *const Config, new: *const Config) bool {
     if (@abs(old.default_temperature - new.default_temperature) > 0.001) return true;
     if (old.agent.max_context_tokens != new.agent.max_context_tokens) return true;
     if (old.agent.token_limit != new.agent.token_limit) return true;
+    if (old.agent.token_limit_explicit != new.agent.token_limit_explicit) return true;
     if (!optionalStrEql(old.sub_agent_provider, new.sub_agent_provider)) return true;
     if (!optionalStrEql(old.sub_agent_model, new.sub_agent_model)) return true;
     if (!optionalStrEql(old.tools_reviewer_provider, new.tools_reviewer_provider)) return true;
@@ -1225,6 +1226,29 @@ test "globalModelConfigChanged detects sub_agent and tools_reviewer changes" {
     var changed_trp = base;
     changed_trp.tools_reviewer_provider = "new-prov";
     try std.testing.expect(globalModelConfigChanged(&base, &changed_trp));
+}
+
+test "globalModelConfigChanged detects token_limit_explicit change" {
+    const base = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .agent = .{ .token_limit = 8192, .token_limit_explicit = false },
+    };
+    // No change
+    try std.testing.expect(!globalModelConfigChanged(&base, &base));
+
+    // token_limit_explicit flipped to true
+    var changed = base;
+    changed.agent.token_limit_explicit = true;
+    try std.testing.expect(globalModelConfigChanged(&base, &changed));
+
+    // token_limit_explicit flipped back to false
+    var base_explicit = base;
+    base_explicit.agent.token_limit_explicit = true;
+    var changed_back = base_explicit;
+    changed_back.agent.token_limit_explicit = false;
+    try std.testing.expect(globalModelConfigChanged(&base_explicit, &changed_back));
 }
 
 test "buildGlobalModelOverride includes sub_agent and tools_reviewer fields" {
