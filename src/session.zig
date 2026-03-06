@@ -411,6 +411,27 @@ pub const SessionManager = struct {
         self.config = new_config;
     }
 
+    /// Replace the provider used by the session manager AND all existing
+    /// sessions.  Called during config hot-reload when API keys or provider
+    /// settings change.  Each session's agent.provider is patched in-place
+    /// under its own mutex to avoid racing with in-flight turns.
+    pub fn updateProvider(self: *SessionManager, new_provider: Provider) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        // Update the manager-level provider (used for newly created sessions).
+        self.provider = new_provider;
+
+        // Patch every existing session's agent.
+        var it = self.sessions.iterator();
+        while (it.next()) |entry| {
+            const session = entry.value_ptr.*;
+            session.mutex.lock();
+            session.agent.provider = new_provider;
+            session.mutex.unlock();
+        }
+    }
+
     /// Find or create a session for the given key. Thread-safe.
     pub fn getOrCreate(self: *SessionManager, session_key: []const u8) !*Session {
         self.mutex.lock();
@@ -2656,4 +2677,33 @@ test "refreshNonModelConfig excludes mqtt and redis_stream sessions" {
     const s_mqtt = try sm.getOrCreate("mqtt:account1:topic1");
     try testing.expect(s_mqtt.agent.sub_agent_max_iterations != 99);
     try testing.expect(s_mqtt.agent.reasoning_effort == null);
+}
+
+test "updateProvider propagates new provider to existing sessions" {
+    var mock_a = MockProvider{ .response = "provider-a" };
+    var mock_b = MockProvider{ .response = "provider-b" };
+    var cfg = testConfig();
+
+    var sm = testSessionManager(testing.allocator, &mock_a, &cfg);
+    defer sm.deinit();
+
+    // Create two sessions using the original provider.
+    const s1 = try sm.getOrCreate("telegram:default:user1");
+    const s2 = try sm.getOrCreate("telegram:default:user2");
+
+    // Both sessions should reference mock_a's vtable.
+    try testing.expectEqualStrings("mock", s1.agent.provider.getName());
+    try testing.expectEqualStrings("mock", s2.agent.provider.getName());
+
+    // Swap provider.
+    sm.updateProvider(mock_b.provider());
+
+    // Session manager and existing sessions all point to mock_b.
+    try testing.expect(sm.provider.ptr == @as(*anyopaque, @ptrCast(&mock_b)));
+    try testing.expect(s1.agent.provider.ptr == @as(*anyopaque, @ptrCast(&mock_b)));
+    try testing.expect(s2.agent.provider.ptr == @as(*anyopaque, @ptrCast(&mock_b)));
+
+    // New session also gets mock_b.
+    const s3 = try sm.getOrCreate("telegram:default:user3");
+    try testing.expect(s3.agent.provider.ptr == @as(*anyopaque, @ptrCast(&mock_b)));
 }
