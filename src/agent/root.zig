@@ -16,6 +16,7 @@ const ChatResponse = providers.ChatResponse;
 const ToolSpec = providers.ToolSpec;
 const tools_mod = @import("../tools/root.zig");
 const Tool = tools_mod.Tool;
+const ToolRegistry = tools_mod.ToolRegistry;
 const memory_mod = @import("../memory/root.zig");
 const Memory = memory_mod.Memory;
 const bootstrap_mod = @import("../bootstrap/root.zig");
@@ -227,7 +228,20 @@ pub const Agent = struct {
     allocator: std.mem.Allocator,
     provider: Provider,
     tools: []const Tool,
+    /// When true, `tools` was heap-allocated specifically for this agent
+    /// (e.g. a fresh registry snapshot taken at session-creation time).
+    /// `deinit()` will free it.  When false, `tools` is a borrowed slice
+    /// owned by the caller (ChannelRuntime) — do NOT free.
+    tools_owned: bool = false,
     tool_specs: []const ToolSpec,
+    /// Optional dynamic registry. When set, executeTool() dispatches via the
+    /// registry (with SO ref-counting). Must remain alive for the agent's lifetime.
+    registry: ?*ToolRegistry = null,
+    /// Cached registry generation — compared against registry.generation at
+    /// the start of each turn to detect staleness and trigger a refresh of
+    /// tool_specs + tools snapshot.  Replaces the old boolean tool_specs_dirty
+    /// flag which was never set to true.
+    cached_registry_generation: u32 = 0,
     mem: ?Memory,
     bootstrap: ?bootstrap_mod.BootstrapProvider = null,
     session_store: ?memory_mod.SessionStore = null,
@@ -501,6 +515,7 @@ pub const Agent = struct {
         // Shut down the async skill queue first (blocks until worker exits).
         self.async_skill_queue.deinit();
         if (self.bootstrap) |bp| bp.deinit();
+        if (self.tools_owned) self.allocator.free(self.tools);
         if (self.model_name_owned) self.allocator.free(self.model_name);
         if (self.default_provider_owned) self.allocator.free(self.default_provider);
         if (self.exec_node_id_owned and self.exec_node_id != null) self.allocator.free(self.exec_node_id.?);
@@ -513,6 +528,48 @@ pub const Agent = struct {
         }
         self.history.deinit(self.allocator);
         self.allocator.free(self.tool_specs);
+    }
+
+    /// Rebuild tool_specs from the registry.
+    /// Call after adding/removing tools from the registry to keep the LLM
+    /// function-calling schema in sync.
+    ///
+    /// The ToolSpec fields (.name, .description, .parameters_json) are
+    /// borrowed pointers into the Tool vtable / wrapper structs.  We must
+    /// read them while the registry mutex is held so a concurrent hot-reload
+    /// cannot free the underlying wrappers mid-copy (UAF).  We use the
+    /// registry's internal mutex via a manual lock/unlock bracket.
+    pub fn refreshToolSpecs(self: *Agent) !void {
+        const reg = self.registry orelse return;
+
+        // Hold the registry mutex for the entire copy so that tool wrapper
+        // pointers remain valid while we dereference .name()/.description()
+        // etc.  This prevents the UAF where a hot-reload frees wrappers
+        // between copySlice() and the ToolSpec field reads.
+        reg.mutex.lock();
+        defer reg.mutex.unlock();
+
+        const entry_count = reg.entries.items.len;
+        const new_specs = try self.allocator.alloc(ToolSpec, entry_count);
+        errdefer self.allocator.free(new_specs);
+
+        for (reg.entries.items, 0..) |e, i| {
+            new_specs[i] = .{
+                .name = e.tool.name(),
+                .description = e.tool.description(),
+                .parameters_json = e.tool.parametersJson(),
+            };
+        }
+
+        self.allocator.free(self.tool_specs);
+        self.tool_specs = new_specs;
+    }
+
+    /// Returns true when the registry is draining (pending SO unload).
+    /// The channel layer should call this before accepting new messages.
+    pub fn isRegistryDraining(self: *const Agent) bool {
+        const reg = self.registry orelse return false;
+        return reg.isPendingDrain();
     }
 
     /// Estimate total tokens in conversation history.
@@ -990,6 +1047,55 @@ pub const Agent = struct {
     pub fn turn(self: *Agent, user_message: []const u8) ![]const u8 {
         self.context_was_compacted = false;
         commands.refreshSubagentToolContext(self);
+
+        // Rebuild tool_specs and tools snapshot if the registry was mutated
+        // since the last turn.  Both must be refreshed together so the
+        // capabilities section, system prompt, and XML tool instructions all
+        // reflect the current registry state.
+        //
+        // Detection: compare our cached generation against the registry's
+        // atomic generation counter (bumped by applyPlugins / hot-reload).
+        // This replaces the old boolean `tool_specs_dirty` flag which was
+        // never set to true (BUG-0002).
+        if (self.registry) |reg| {
+            const current_gen = reg.generation.load(.acquire);
+            if (current_gen != self.cached_registry_generation) {
+                self.refreshToolSpecs() catch |err| {
+                    log.warn("refreshToolSpecs failed: {}; using stale specs", .{err});
+                };
+                // Also refresh the tools snapshot so system-prompt generation
+                // and capability advertising use the live registry contents.
+                // Use dupe-from-copySlice pattern (same as session.zig) to
+                // avoid realloc ownership issues.
+                const n = reg.count();
+                var stack_buf: [256]Tool = undefined;
+                const heap_buf: ?[]Tool = self.allocator.alloc(Tool, n) catch null;
+                if (heap_buf != null or n <= stack_buf.len) {
+                    const temp: []Tool = if (heap_buf) |b| b else stack_buf[0..n];
+                    defer if (heap_buf) |b| self.allocator.free(b);
+                    const filled = reg.copySlice(temp);
+                    const new_snapshot = self.allocator.dupe(Tool, temp[0..filled]) catch null;
+                    if (new_snapshot) |snapshot| {
+                        if (self.tools_owned) self.allocator.free(self.tools);
+                        self.tools = snapshot;
+                        self.tools_owned = true;
+                        // Invalidate the system prompt so it is rebuilt with the new
+                        // tool list on this turn (fixes stale capabilities section).
+                        self.has_system_prompt = false;
+
+                        self.cached_registry_generation = current_gen;
+                    } else {
+                        // Snapshot dupe OOM — do NOT update generation so
+                        // the next turn retries the refresh.
+                        log.warn("tools snapshot dupe failed (OOM); will retry next turn", .{});
+                    }
+                } else {
+                    // OOM with > 256 tools: skip refresh; do NOT update
+                    // cached_registry_generation so the next turn retries.
+                    log.warn("tools snapshot refresh skipped: OOM for {} tools", .{n});
+                }
+            }
+        }
 
         const effective_user_message = blk: {
             if (commands.bareSessionResetPrompt(user_message)) |fresh_prompt| {
@@ -2542,7 +2648,31 @@ pub const Agent = struct {
 
         const trimmed_call_name = std.mem.trim(u8, call.name, " \t\r\n");
 
-        for (self.tools) |t| {
+        // Acquire SO ref count BEFORE copying tools from the registry.
+        // This prevents the hot-reload drain from completing while we hold
+        // a snapshot that may reference SO-backed tool pointers.
+        const has_registry = self.registry != null;
+        if (has_registry) self.registry.?.acquireSoCall();
+        defer if (has_registry) self.registry.?.releaseSoCall();
+
+        // Resolve effective tool list: registry takes priority over static slice.
+        // When a registry is present, NEVER fall back to self.tools — doing so
+        // would resurrect tools that were removed by overwrite/hot-reload.
+        var effective_tools_buf: ?[]Tool = null;
+        defer if (effective_tools_buf) |buf| tool_allocator.free(buf);
+        const effective_tools: []const Tool = if (self.registry) |reg| blk: {
+            const n = reg.count();
+            if (n == 0) break :blk &[_]Tool{};
+            const buf = tool_allocator.alloc(Tool, n) catch {
+                log.err("failed to allocate tool buffer for registry dispatch", .{});
+                break :blk &[_]Tool{};
+            };
+            effective_tools_buf = buf; // track for deferred free
+            const filled = reg.copySlice(buf);
+            break :blk buf[0..filled];
+        } else self.tools;
+
+        for (effective_tools) |t| {
             if (std.ascii.eqlIgnoreCase(t.name(), trimmed_call_name)) {
                 // Parse arguments JSON to ObjectMap ONCE
                 const parsed = std.json.parseFromSlice(
@@ -2582,6 +2712,9 @@ pub const Agent = struct {
                         };
                     }
                 }
+
+                // SO ref count is already held for the entire executeTool scope
+                // (acquired before copySlice above), so no per-tool acquire needed.
 
                 const result = t.execute(tool_allocator, args) catch |err| {
                     return .{

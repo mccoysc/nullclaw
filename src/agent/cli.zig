@@ -234,8 +234,43 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     ) catch null;
     defer if (bootstrap_provider) |bp| bp.deinit();
 
-    // Create tools (with agents config for delegate depth enforcement)
-    const tools = try tools_mod.allTools(allocator, cfg.workspace_dir, .{
+    // Create tools — use buildInitialRegistry when plugins are configured so
+    // that SO/script plugin tools are loaded and agent.registry is set.
+    const cli_plugins = &cfg.tools.plugins;
+    const cli_has_plugins = cli_plugins.add.len > 0 or cli_plugins.overwrite.len > 0 or cli_plugins.current_tools_list_path != null;
+
+    var tool_registry: ?*tools_mod.ToolRegistry = null;
+    const tools: []const tools_mod.Tool = if (cli_has_plugins) blk: {
+        const reg = try tools_mod.buildInitialRegistry(allocator, cfg.workspace_dir, .{
+            .http_enabled = cfg.http_request.enabled,
+            .http_allowed_domains = cfg.http_request.allowed_domains,
+            .http_max_response_size = cfg.http_request.max_response_size,
+            .http_timeout_secs = cfg.http_request.timeout_secs,
+            .web_search_base_url = cfg.http_request.search_base_url,
+            .web_search_provider = cfg.http_request.search_provider,
+            .web_search_fallback_providers = cfg.http_request.search_fallback_providers,
+            .browser_enabled = cfg.browser.enabled,
+            .mcp_tools = mcp_tools,
+            .agents = cfg.agents,
+            .fallback_api_key = resolved_api_key,
+            .tools_config = cfg.tools,
+            .allowed_paths = cfg.autonomy.allowed_paths,
+            .policy = &policy,
+            .subagent_manager = &subagent_manager,
+            .bootstrap_provider = bootstrap_provider,
+            .backend_name = cfg.memory.backend,
+            .current_tools_list_path = cfg.tools.plugins.current_tools_list_path,
+        });
+        errdefer {
+            reg.deinit();
+            allocator.destroy(reg);
+        }
+        const buf = try allocator.alloc(tools_mod.Tool, reg.count());
+        const copied = reg.copySlice(buf);
+        std.debug.assert(copied == buf.len);
+        tool_registry = reg;
+        break :blk buf;
+    } else try tools_mod.allTools(allocator, cfg.workspace_dir, .{
         .http_enabled = cfg.http_request.enabled,
         .http_allowed_domains = cfg.http_request.allowed_domains,
         .http_max_response_size = cfg.http_request.max_response_size,
@@ -254,7 +289,11 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         .bootstrap_provider = bootstrap_provider,
         .backend_name = cfg.memory.backend,
     });
-    defer tools_mod.deinitTools(allocator, tools);
+    defer if (tool_registry) |reg| {
+        allocator.free(tools);
+        reg.deinit();
+        allocator.destroy(reg);
+    } else tools_mod.deinitTools(allocator, tools);
 
     // Bind memory backend once for this tool set before creating agents.
     tools_mod.bindMemoryTools(tools, mem_opt);
@@ -279,6 +318,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
 
         var agent = try Agent.fromConfig(allocator, &cfg, provider_i, tools, mem_opt, obs);
         agent.policy = &policy;
+        if (tool_registry) |reg| agent.registry = reg;
         agent.session_store = if (mem_rt) |rt| rt.session_store else null;
         agent.response_cache = if (mem_rt) |*rt| rt.response_cache else null;
         agent.mem_rt = if (mem_rt) |*rt| rt else null;
@@ -373,6 +413,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
 
     var agent = try Agent.fromConfig(allocator, &cfg, provider_i, tools, mem_opt, obs);
     agent.policy = &policy;
+    if (tool_registry) |reg| agent.registry = reg;
     agent.session_store = if (mem_rt) |rt| rt.session_store else null;
     agent.response_cache = if (mem_rt) |*rt| rt.response_cache else null;
     agent.mem_rt = if (mem_rt) |*rt| rt else null;

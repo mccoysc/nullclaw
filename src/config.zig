@@ -90,6 +90,9 @@ pub const NamedAgentConfig = config_types.NamedAgentConfig;
 pub const McpServerConfig = config_types.McpServerConfig;
 pub const ModelPricing = config_types.ModelPricing;
 pub const ToolsConfig = config_types.ToolsConfig;
+pub const ExternalToolKind = config_types.ExternalToolKind;
+pub const ExternalToolConfig = config_types.ExternalToolConfig;
+pub const ToolPluginsConfig = config_types.ToolPluginsConfig;
 pub const ProviderEntry = config_types.ProviderEntry;
 pub const AudioMediaConfig = config_types.AudioMediaConfig;
 pub const DmScope = config_types.DmScope;
@@ -861,6 +864,48 @@ pub const Config = struct {
         try w.print("    \"shell_max_output_bytes\": {d},\n", .{self.tools.shell_max_output_bytes});
         try w.print("    \"max_file_size_bytes\": {d},\n", .{self.tools.max_file_size_bytes});
         try w.print("    \"web_fetch_max_chars\": {d}", .{self.tools.web_fetch_max_chars});
+        // tools.plugins
+        {
+            const pl = self.tools.plugins;
+            const has_plugins = pl.overwrite.len > 0 or pl.add.len > 0 or
+                pl.current_tools_list_path != null or pl.hot_reload_interval_secs != 5;
+            if (has_plugins) {
+                try w.print(",\n    \"plugins\": {{\n", .{});
+                var wrote_field = false;
+                if (pl.overwrite.len > 0) {
+                    try w.print("      \"overwrite\": [", .{});
+                    for (pl.overwrite, 0..) |entry, i| {
+                        try w.print("{{\"kind\": \"{s}\", \"path\": ", .{@tagName(entry.kind)});
+                        try writeJsonStr(w, entry.path);
+                        try w.print("}}", .{});
+                        if (i + 1 < pl.overwrite.len) try w.print(", ", .{});
+                    }
+                    try w.print("]", .{});
+                    wrote_field = true;
+                }
+                if (pl.add.len > 0) {
+                    if (wrote_field) try w.print(",\n", .{}) else wrote_field = true;
+                    try w.print("      \"add\": [", .{});
+                    for (pl.add, 0..) |entry, i| {
+                        try w.print("{{\"kind\": \"{s}\", \"path\": ", .{@tagName(entry.kind)});
+                        try writeJsonStr(w, entry.path);
+                        try w.print("}}", .{});
+                        if (i + 1 < pl.add.len) try w.print(", ", .{});
+                    }
+                    try w.print("]", .{});
+                }
+                if (pl.current_tools_list_path) |p| {
+                    if (wrote_field) try w.print(",\n", .{}) else wrote_field = true;
+                    try w.print("      \"current_tools_list_path\": ", .{});
+                    try writeJsonStr(w, p);
+                }
+                if (pl.hot_reload_interval_secs != 5) {
+                    if (wrote_field) try w.print(",\n", .{});
+                    try w.print("      \"hot_reload_interval_secs\": {d}", .{pl.hot_reload_interval_secs});
+                }
+                try w.print("\n    }}", .{});
+            }
+        }
         // tools.media.audio
         {
             const am = self.audio_media;

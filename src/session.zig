@@ -91,6 +91,12 @@ pub const SessionManager = struct {
     config: *const Config,
     provider: Provider,
     tools: []const Tool,
+    /// Optional dynamic tool registry. When non-null, every new session's
+    /// agent has its `registry` field set to this pointer so that tool
+    /// dispatch goes through the registry (enabling plugin tools and SO
+    /// ref-counting).  The registry is NOT owned by SessionManager — it is
+    /// owned by ChannelRuntime.
+    tool_registry: ?*tools_mod.ToolRegistry = null,
     mem: ?Memory,
     session_store: ?memory_mod.SessionStore = null,
     response_cache: ?*memory_mod.cache.ResponseCache = null,
@@ -454,20 +460,53 @@ pub const SessionManager = struct {
         // channels with their own model work even when no global model is set.
         const mo = lookupChannelModelOverride(self.config, session_key);
 
+        // When a plugin registry is present, snapshot current tools from the
+        // registry rather than using self.tools, which may be stale after a
+        // hot-reload (applyOverwriteAll frees old tool entries; self.tools still
+        // holds Tool copies whose .ptr fields now dangle).
+        // The snapshot is heap-allocated and owned by the agent (tools_owned=true)
+        // so agent.deinit() will free it when the session is destroyed.
+        //
+        // Pattern mirrors refreshToolSpecs: temp stack/heap buffer → copySlice →
+        // dupe exact slice.  This avoids realloc's ownership complexity and
+        // correctly handles the (rare) TOCTOU shrink between count()+copySlice().
+        const tools_for_session: []const Tool = if (self.tool_registry) |reg| blk: {
+            const n = reg.count();
+            var stack_buf: [256]Tool = undefined;
+            const heap_buf: ?[]Tool = if (n > stack_buf.len)
+                try self.allocator.alloc(Tool, n)
+            else
+                null;
+            defer if (heap_buf) |b| self.allocator.free(b);
+            const temp: []Tool = if (heap_buf) |b| b else stack_buf[0..n];
+            const filled = reg.copySlice(temp);
+            break :blk try self.allocator.dupe(Tool, temp[0..filled]);
+        } else self.tools;
+        // Use a nullable sentinel so we can cancel the errdefer once ownership
+        // transfers to the agent (agent.deinit will free it via tools_owned).
+        var tools_errcleanup: ?[]const Tool = if (self.tool_registry != null) tools_for_session else null;
+        errdefer if (tools_errcleanup) |t| self.allocator.free(t);
+
         var agent = try Agent.fromConfigWithChannelModel(
             self.allocator,
             self.config,
             self.provider,
-            self.tools,
+            tools_for_session,
             self.mem,
             self.observer,
             mo.model,
         );
+        // Transfer ownership: agent.deinit() frees the snapshot buffer.
+        // Disable the errdefer so we don't double-free on later errors.
+        if (self.tool_registry != null) agent.tools_owned = true;
+        tools_errcleanup = null;
         agent.policy = self.policy;
         agent.session_store = self.session_store;
         agent.response_cache = self.response_cache;
         agent.mem_rt = self.mem_rt;
         agent.memory_session_id = owned_key;
+        // Wire dynamic registry so agent dispatches through plugin tools.
+        if (self.tool_registry) |reg| agent.registry = reg;
         if (self.config.diagnostics.token_usage_ledger_enabled) {
             agent.usage_record_callback = usageRecordForwarder;
             agent.usage_record_ctx = @ptrCast(self);
@@ -682,6 +721,10 @@ pub const SessionManager = struct {
 
     /// Process a message within a session context and optionally forward text deltas.
     /// Deltas are only emitted when provider streaming is active.
+    ///
+    /// Returns `error.RegistryDraining` immediately (without processing the message)
+    /// when the tool registry is mid-drain waiting for in-flight SO calls to finish.
+    /// Channel loops MUST handle this error and skip the message (do not reply).
     pub fn processMessageStreaming(
         self: *SessionManager,
         session_key: []const u8,
@@ -689,6 +732,15 @@ pub const SessionManager = struct {
         conversation_context: ?ConversationContext,
         stream_sink: ?streaming.Sink,
     ) ![]const u8 {
+        // Refuse new messages while SO libraries are being drained / unloaded.
+        // This is the single chokepoint for all channels.
+        if (self.tool_registry) |reg| {
+            if (reg.isPendingDrain()) {
+                log.warn("message rejected: tool registry is draining (plugin replacement in progress)", .{});
+                return error.RegistryDraining;
+            }
+        }
+
         const channel = if (conversation_context) |ctx| (ctx.channel orelse "unknown") else "unknown";
         const session_hash = std.hash.Wyhash.hash(0, session_key);
 
@@ -2707,4 +2759,21 @@ test "updateProvider propagates new provider to existing sessions" {
     // New session also gets mock_b.
     const s3 = try sm.getOrCreate("telegram:default:user3");
     try testing.expect(s3.agent.provider.ptr == @as(*anyopaque, @ptrCast(&mock_b)));
+}
+
+test "processMessage returns RegistryDraining error when registry is draining" {
+    const alloc = testing.allocator;
+    var mock = MockProvider{ .response = "should not be reached" };
+    const cfg = testConfig();
+    var sm = testSessionManager(alloc, &mock, &cfg);
+    defer sm.deinit();
+
+    // Create a registry and set it as draining.
+    var reg = tools_mod.ToolRegistry.init(alloc);
+    defer reg.deinit();
+    reg.draining.store(true, .release);
+    sm.tool_registry = &reg;
+
+    const result = sm.processMessage("drain:test", "hello", null);
+    try testing.expectError(error.RegistryDraining, result);
 }
