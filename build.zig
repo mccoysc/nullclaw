@@ -462,11 +462,12 @@ pub fn build(b: *std.Build) void {
             module.linkSystemLibrary("pq", .{});
         }
         if (enable_channel_web) {
-            const ws_dep = b.dependency("websocket", .{
+            if (b.lazyDependency("websocket", .{
                 .target = target,
                 .optimize = optimize,
-            });
-            module.addImport("websocket", ws_dep.module("websocket"));
+            })) |ws_dep| {
+                module.addImport("websocket", ws_dep.module("websocket"));
+            }
         }
         break :blk module;
     };
