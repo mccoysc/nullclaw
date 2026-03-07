@@ -237,7 +237,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     // Create tools — use buildInitialRegistry when plugins are configured so
     // that SO/script plugin tools are loaded and agent.registry is set.
     const cli_plugins = &cfg.tools.plugins;
-    const cli_has_plugins = cli_plugins.add.len > 0 or cli_plugins.overwrite.len > 0;
+    const cli_has_plugins = cli_plugins.add.len > 0 or cli_plugins.overwrite.len > 0 or cli_plugins.current_tools_list_path != null;
 
     var tool_registry: ?*tools_mod.ToolRegistry = null;
     const tools: []const tools_mod.Tool = if (cli_has_plugins) blk: {
