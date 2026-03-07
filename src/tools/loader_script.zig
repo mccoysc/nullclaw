@@ -177,7 +177,10 @@ fn runList(allocator: Allocator, interp: []const u8, script_path: []const u8) ![
     }
 
     const parsed = std.json.parseFromSlice(
-        std.json.Value, allocator, stdout, .{},
+        std.json.Value,
+        allocator,
+        stdout,
+        .{},
     ) catch return error.ScriptInvalidJson;
     defer parsed.deinit();
 
@@ -228,7 +231,6 @@ pub fn loadScript(
 
     const defs = runList(allocator, interp, path) catch |err| {
         log.err("script '{s}' --nullclaw-list: {}", .{ path, err });
-        allocator.free(interp);
         return err;
     };
     defer {
@@ -288,4 +290,138 @@ test "loader_script: ScriptToolWrapper deinit frees all owned strings" {
 test "loader_script: ScriptKind tag names" {
     try std.testing.expectEqualStrings("python", @tagName(ScriptKind.python));
     try std.testing.expectEqualStrings("node", @tagName(ScriptKind.node));
+}
+
+// ── End-to-end tests against examples/plugins/ ─────────────────────
+
+/// Helper: resolve examples/plugins/<filename> relative to repo root (CWD).
+fn examplePath(allocator: Allocator, filename: []const u8) ![]const u8 {
+    const rel = try std.fmt.allocPrint(allocator, "examples/plugins/{s}", .{filename});
+    defer allocator.free(rel);
+    return std.fs.cwd().realpathAlloc(allocator, rel) catch
+        try allocator.dupe(u8, rel);
+}
+
+/// Helper: free a ToolResult produced by a ScriptToolWrapper.
+/// On success the output is heap-allocated; on failure the error_msg may be
+/// a heap-allocated stdout copy or a static literal — we only free when we
+/// know the test reached the success assertion.
+fn freeToolResult(allocator: Allocator, result: root.ToolResult) void {
+    if (result.output.len > 0) allocator.free(result.output);
+    if (result.error_msg) |e| allocator.free(e);
+}
+
+test "loader_script: e2e Python discovers and executes tools from example_plugin.py" {
+    const allocator = std.testing.allocator;
+
+    const py_path = try examplePath(allocator, "example_plugin.py");
+    defer allocator.free(py_path);
+
+    const tools = loadScript(allocator, .python, py_path) catch |err| {
+        if (err == error.InterpreterNotFound) return; // python3 not in PATH
+        return err;
+    };
+    defer {
+        for (tools) |t| t.deinit(allocator);
+        allocator.free(tools);
+    }
+
+    // example_plugin.py exports py_upper and py_word_count.
+    try std.testing.expectEqual(@as(usize, 2), tools.len);
+    try std.testing.expectEqualStrings("py_upper", tools[0].name());
+    try std.testing.expectEqualStrings("py_word_count", tools[1].name());
+
+    // Execute py_upper.
+    {
+        const parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            allocator,
+            "{\"text\":\"hello world\"}",
+            .{},
+        );
+        defer parsed.deinit();
+
+        const result = try tools[0].execute(allocator, parsed.value.object);
+        defer freeToolResult(allocator, result);
+
+        try std.testing.expect(result.success);
+        // Strip trailing newline that the Python script appends.
+        const out = std.mem.trimRight(u8, result.output, "\r\n");
+        try std.testing.expectEqualStrings("HELLO WORLD", out);
+    }
+
+    // Execute py_word_count.
+    {
+        const parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            allocator,
+            "{\"text\":\"one two three\"}",
+            .{},
+        );
+        defer parsed.deinit();
+
+        const result = try tools[1].execute(allocator, parsed.value.object);
+        defer freeToolResult(allocator, result);
+
+        try std.testing.expect(result.success);
+        const out = std.mem.trimRight(u8, result.output, "\r\n");
+        try std.testing.expectEqualStrings("3", out);
+    }
+}
+
+test "loader_script: e2e Node.js discovers and executes tools from example_plugin.js" {
+    const allocator = std.testing.allocator;
+
+    const js_path = try examplePath(allocator, "example_plugin.js");
+    defer allocator.free(js_path);
+
+    const tools = loadScript(allocator, .node, js_path) catch |err| {
+        if (err == error.InterpreterNotFound) return; // node not in PATH
+        return err;
+    };
+    defer {
+        for (tools) |t| t.deinit(allocator);
+        allocator.free(tools);
+    }
+
+    // example_plugin.js exports js_reverse and js_char_count.
+    try std.testing.expectEqual(@as(usize, 2), tools.len);
+    try std.testing.expectEqualStrings("js_reverse", tools[0].name());
+    try std.testing.expectEqualStrings("js_char_count", tools[1].name());
+
+    // Execute js_reverse.
+    {
+        const parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            allocator,
+            "{\"text\":\"nullclaw\"}",
+            .{},
+        );
+        defer parsed.deinit();
+
+        const result = try tools[0].execute(allocator, parsed.value.object);
+        defer freeToolResult(allocator, result);
+
+        try std.testing.expect(result.success);
+        const out = std.mem.trimRight(u8, result.output, "\r\n");
+        try std.testing.expectEqualStrings("walcllun", out);
+    }
+
+    // Execute js_char_count.
+    {
+        const parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            allocator,
+            "{\"text\":\"hello\"}",
+            .{},
+        );
+        defer parsed.deinit();
+
+        const result = try tools[1].execute(allocator, parsed.value.object);
+        defer freeToolResult(allocator, result);
+
+        try std.testing.expect(result.success);
+        const out = std.mem.trimRight(u8, result.output, "\r\n");
+        try std.testing.expectEqualStrings("5", out);
+    }
 }

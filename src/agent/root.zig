@@ -228,6 +228,11 @@ pub const Agent = struct {
     allocator: std.mem.Allocator,
     provider: Provider,
     tools: []const Tool,
+    /// When true, `tools` was heap-allocated specifically for this agent
+    /// (e.g. a fresh registry snapshot taken at session-creation time).
+    /// `deinit()` will free it.  When false, `tools` is a borrowed slice
+    /// owned by the caller (ChannelRuntime) — do NOT free.
+    tools_owned: bool = false,
     tool_specs: []const ToolSpec,
     /// Optional dynamic registry. When set, executeTool() dispatches via the
     /// registry (with SO ref-counting). Must remain alive for the agent's lifetime.
@@ -508,6 +513,7 @@ pub const Agent = struct {
         // Shut down the async skill queue first (blocks until worker exits).
         self.async_skill_queue.deinit();
         if (self.bootstrap) |bp| bp.deinit();
+        if (self.tools_owned) self.allocator.free(self.tools);
         if (self.model_name_owned) self.allocator.free(self.model_name);
         if (self.default_provider_owned) self.allocator.free(self.default_provider);
         if (self.exec_node_id_owned and self.exec_node_id != null) self.allocator.free(self.exec_node_id.?);
@@ -551,8 +557,20 @@ pub const Agent = struct {
             };
         }
 
+        // Trim allocation to the actual fill count.  If the registry shrank
+        // between count() and copySlice() (hot-reload TOCTOU), `filled < n`
+        // and new_specs[filled..n] would be uninitialized.  realloc for a
+        // smaller size never fails on GPA; on an arena it may fail (OOM), in
+        // which case we return the error and the errdefer frees new_specs —
+        // which is still valid, because Zig's allocator contract guarantees
+        // the original memory is untouched on a failed realloc.
+        const final_specs = if (filled == n)
+            new_specs
+        else
+            try self.allocator.realloc(new_specs, filled);
+
         self.allocator.free(self.tool_specs);
-        self.tool_specs = new_specs;
+        self.tool_specs = final_specs;
         self.tool_specs_dirty = false;
     }
 

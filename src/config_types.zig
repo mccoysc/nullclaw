@@ -252,6 +252,11 @@ pub const ToolPluginsConfig = struct {
     /// How often (in seconds) the plugins config is checked for changes.
     /// 0 disables hot-reload polling. Default: 5.
     hot_reload_interval_secs: u64 = 5,
+    /// Optional filesystem path where nullclaw writes the current effective tool
+    /// list as a JSON array after startup and after every hot-reload cycle.
+    /// Each entry: { "name", "description", "params_json", "source" }
+    /// null (default) disables the write-back.
+    current_tools_list_path: ?[]const u8 = null,
 };
 
 pub const ModelRouteConfig = struct {

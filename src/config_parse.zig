@@ -907,6 +907,55 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (tl.object.get("web_fetch_max_chars")) |v| {
                 if (v == .integer) self.tools.web_fetch_max_chars = @intCast(v.integer);
             }
+            // tools.plugins — external SO/python/node plugin sources
+            if (tl.object.get("plugins")) |pl| {
+                if (pl == .object) {
+                    if (pl.object.get("hot_reload_interval_secs")) |v| {
+                        if (v == .integer and v.integer >= 0)
+                            self.tools.plugins.hot_reload_interval_secs = @intCast(v.integer);
+                    }
+                    // Parse helper: array of {kind, path} objects → []ExternalToolConfig
+                    const parseEntries = struct {
+                        fn call(
+                            alloc: std.mem.Allocator,
+                            arr: std.json.Value,
+                        ) ![]const types.ExternalToolConfig {
+                            if (arr != .array) return &.{};
+                            const items = arr.array.items;
+                            var list: std.ArrayListUnmanaged(types.ExternalToolConfig) = .empty;
+                            errdefer {
+                                for (list.items) |entry| alloc.free(entry.path);
+                                list.deinit(alloc);
+                            }
+                            for (items) |item| {
+                                if (item != .object) continue;
+                                const kind_v = item.object.get("kind") orelse continue;
+                                const path_v = item.object.get("path") orelse continue;
+                                if (kind_v != .string or path_v != .string) continue;
+                                const kind = std.meta.stringToEnum(
+                                    types.ExternalToolKind,
+                                    kind_v.string,
+                                ) orelse continue;
+                                // Ensure capacity before duping the path so that a
+                                // list growth failure doesn't leave an allocated-but-
+                                // unenqueued path behind (which the errdefer wouldn't see).
+                                try list.ensureUnusedCapacity(alloc, 1);
+                                const path = try alloc.dupe(u8, path_v.string);
+                                list.appendAssumeCapacity(.{ .kind = kind, .path = path });
+                            }
+                            return list.toOwnedSlice(alloc);
+                        }
+                    }.call;
+                    if (pl.object.get("add")) |arr|
+                        self.tools.plugins.add = try parseEntries(self.allocator, arr);
+                    if (pl.object.get("overwrite")) |arr|
+                        self.tools.plugins.overwrite = try parseEntries(self.allocator, arr);
+                    if (pl.object.get("current_tools_list_path")) |v| {
+                        if (v == .string)
+                            self.tools.plugins.current_tools_list_path = try self.allocator.dupe(u8, v.string);
+                    }
+                }
+            }
             // tools.media.audio → self.audio_media
             if (tl.object.get("media")) |media| {
                 if (media == .object) {

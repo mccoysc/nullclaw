@@ -40,11 +40,11 @@ pub const SoToolDef = extern struct {
         out_buf: [*]u8,
         out_cap: usize,
         out_len: *usize,
-    ) callconv(.C) bool,
+    ) callconv(.c) bool,
 };
 
-pub const SoListFn = fn (out_count: *usize) callconv(.C) [*]SoToolDef;
-pub const SoFreeFn = fn (tools: [*]SoToolDef, count: usize) callconv(.C) void;
+pub const SoListFn = fn (out_count: *usize) callconv(.c) [*]SoToolDef;
+pub const SoFreeFn = fn (tools: [*]SoToolDef, count: usize) callconv(.c) void;
 
 // ── SoHandle — owns one loaded library ───────────────────────────
 
@@ -75,7 +75,7 @@ pub const SoToolWrapper = struct {
     name_buf: []const u8,
     description_buf: []const u8,
     params_json_buf: []const u8,
-    execute_fn: *const fn ([*:0]const u8, [*]u8, usize, *usize) callconv(.C) bool,
+    execute_fn: *const fn ([*:0]const u8, [*]u8, usize, *usize) callconv(.c) bool,
 
     pub const vtable = Tool.VTable{
         .execute = &executeImpl,
@@ -141,7 +141,7 @@ pub const SoToolMeta = struct {
     name: []const u8, // owned
     description: []const u8, // owned
     params_json: []const u8, // owned
-    execute_fn: *const fn ([*:0]const u8, [*]u8, usize, *usize) callconv(.C) bool,
+    execute_fn: *const fn ([*:0]const u8, [*]u8, usize, *usize) callconv(.c) bool,
 
     pub fn deinit(self: SoToolMeta, allocator: Allocator) void {
         allocator.free(self.name);
@@ -226,4 +226,99 @@ pub fn wrapMeta(
         .execute_fn = meta.execute_fn,
     };
     return w;
+}
+
+// ── Tests ─────────────────────────────────────────────────────────
+
+// End-to-end: compile examples/plugins/example_plugin.c, load it via
+// openSo/wrapMeta, execute both exported tools, verify output.
+// Linux only — DynLib + dlopen with .so files is not meaningful elsewhere.
+test "loader_so: e2e compile and execute example_plugin.c" {
+    const builtin = @import("builtin");
+    if (comptime builtin.os.tag != .linux) return;
+
+    const allocator = std.testing.allocator;
+
+    // Compile the example C plugin into a temporary directory.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+
+    const so_path = try std.fmt.allocPrint(allocator, "{s}/example_plugin.so", .{tmp_path});
+    defer allocator.free(so_path);
+
+    // src path: resolve examples/plugins/example_plugin.c from CWD (repo root).
+    const c_path = try std.fs.cwd().realpathAlloc(allocator, "examples/plugins/example_plugin.c");
+    defer allocator.free(c_path);
+
+    // Compile with cc.
+    {
+        const argv = [_][]const u8{ "cc", "-shared", "-fPIC", "-o", so_path, c_path };
+        var child = std.process.Child.init(&argv, allocator);
+        child.stdout_behavior = .Ignore;
+        child.stderr_behavior = .Ignore;
+        try child.spawn();
+        const term = try child.wait();
+        switch (term) {
+            .Exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
+            else => return error.CompileFailed,
+        }
+    }
+
+    // Open the shared library.
+    const opened = try openSo(allocator, so_path);
+    var handle = opened.handle;
+    defer handle.deinit();
+    defer {
+        for (opened.metas) |m| m.deinit(allocator);
+        allocator.free(opened.metas);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), opened.metas.len);
+    try std.testing.expectEqualStrings("so_echo", opened.metas[0].name);
+    try std.testing.expectEqualStrings("so_reverse", opened.metas[1].name);
+
+    // ── so_echo: wraps args JSON ──────────────────────────────────
+    {
+        const w = try wrapMeta(allocator, opened.metas[0], 0);
+        const t = w.tool();
+        defer t.deinit(allocator);
+
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{\"x\":1}", .{});
+        defer parsed.deinit();
+
+        const result = try t.execute(allocator, parsed.value.object);
+        defer if (result.output.len > 0) allocator.free(result.output);
+        // SoToolWrapper.executeImpl always heap-allocates its output via
+        // allocator.dupe — on success it ends up in result.output, on failure
+        // in result.error_msg.  Both are safe to free here.
+        defer if (result.error_msg) |e| allocator.free(e);
+
+        try std.testing.expect(result.success);
+        try std.testing.expect(std.mem.indexOf(u8, result.output, "echo:") != null);
+    }
+
+    // ── so_reverse: reverses "text" ───────────────────────────────
+    {
+        const w = try wrapMeta(allocator, opened.metas[1], 0);
+        const t = w.tool();
+        defer t.deinit(allocator);
+
+        const parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            allocator,
+            "{\"text\":\"hello\"}",
+            .{},
+        );
+        defer parsed.deinit();
+
+        const result = try t.execute(allocator, parsed.value.object);
+        defer if (result.output.len > 0) allocator.free(result.output);
+        defer if (result.error_msg) |e| allocator.free(e);
+
+        try std.testing.expect(result.success);
+        try std.testing.expectEqualStrings("olleh", result.output);
+    }
 }
