@@ -342,9 +342,21 @@ pub const ToolRegistry = struct {
         // Guard — abort if every plugin load failed (new_entries is empty).
         // Proceeding would wipe built-ins + all existing plugins, leaving the
         // agent with zero tools.  Keep the current registry as a safe fallback.
+        //
+        // Also clean up any SO slots appended during Step 2 as side-effects of
+        // loadSo() but whose corresponding tool entries were lost to OOM: those
+        // slots (indices old_slot_count..) have no tool referencing them and
+        // would otherwise leak open shared-library handles until deinit().
         if (new_entries.items.len == 0) {
             log.warn("overwrite: all plugin loads failed; keeping existing registry", .{});
             new_entries.deinit(self.allocator);
+            self.mutex.lock();
+            for (self.so_slots.items[old_slot_count..]) |slot| {
+                slot.deinit(self.allocator);
+                self.allocator.destroy(slot);
+            }
+            self.so_slots.shrinkRetainingCapacity(old_slot_count);
+            self.mutex.unlock();
             return;
         }
 

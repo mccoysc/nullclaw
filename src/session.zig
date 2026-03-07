@@ -460,15 +460,41 @@ pub const SessionManager = struct {
         // channels with their own model work even when no global model is set.
         const mo = lookupChannelModelOverride(self.config, session_key);
 
+        // When a plugin registry is present, snapshot current tools from the
+        // registry rather than using self.tools, which may be stale after a
+        // hot-reload (applyOverwriteAll frees old tool entries; self.tools still
+        // holds Tool copies whose .ptr fields now dangle).
+        // The snapshot is heap-allocated and owned by the agent (tools_owned=true)
+        // so agent.deinit() will free it when the session is destroyed.
+        //
+        // Pattern mirrors refreshToolSpecs: temp stack/heap buffer → copySlice →
+        // dupe exact slice.  This avoids realloc's ownership complexity and
+        // correctly handles the (rare) TOCTOU shrink between count()+copySlice().
+        const tools_for_session: []const Tool = if (self.tool_registry) |reg| blk: {
+            const n = reg.count();
+            var stack_buf: [256]Tool = undefined;
+            const heap_buf: ?[]Tool = if (n > stack_buf.len)
+                try self.allocator.alloc(Tool, n)
+            else
+                null;
+            defer if (heap_buf) |b| self.allocator.free(b);
+            const temp: []Tool = if (heap_buf) |b| b else stack_buf[0..n];
+            const filled = reg.copySlice(temp);
+            break :blk try self.allocator.dupe(Tool, temp[0..filled]);
+        } else self.tools;
+        errdefer if (self.tool_registry != null) self.allocator.free(tools_for_session);
+
         var agent = try Agent.fromConfigWithChannelModel(
             self.allocator,
             self.config,
             self.provider,
-            self.tools,
+            tools_for_session,
             self.mem,
             self.observer,
             mo.model,
         );
+        // Transfer ownership: agent.deinit() frees the snapshot buffer.
+        if (self.tool_registry != null) agent.tools_owned = true;
         agent.policy = self.policy;
         agent.session_store = self.session_store;
         agent.response_cache = self.response_cache;
