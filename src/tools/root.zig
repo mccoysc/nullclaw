@@ -576,11 +576,12 @@ pub fn buildInitialRegistry(
     // so that builtin_tools is freed if the registry allocation itself OOMs.
     // When registered == 0 (before the loop), this frees ALL tools + slice.
     var registered: usize = 0;
+    var builtin_slice_freed = false;
     errdefer {
         for (builtin_tools[registered..]) |remaining| {
             remaining.deinit(allocator);
         }
-        allocator.free(builtin_tools);
+        if (!builtin_slice_freed) allocator.free(builtin_tools);
     }
 
     // Step 2: create registry and populate with built-ins.
@@ -601,6 +602,7 @@ pub fn buildInitialRegistry(
     }
     // All tools transferred; free the outer slice only (structs now owned by registry).
     allocator.free(builtin_tools);
+    builtin_slice_freed = true;
 
     // Step 3: apply external plugins (overwrite then add).
     const plugins = opts.tools_config.plugins;
