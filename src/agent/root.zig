@@ -1079,12 +1079,16 @@ pub const Agent = struct {
                         if (self.tools_owned) self.allocator.free(self.tools);
                         self.tools = snapshot;
                         self.tools_owned = true;
-                    }
-                    // Invalidate the system prompt so it is rebuilt with the new
-                    // tool list on this turn (fixes stale capabilities section).
-                    self.has_system_prompt = false;
+                        // Invalidate the system prompt so it is rebuilt with the new
+                        // tool list on this turn (fixes stale capabilities section).
+                        self.has_system_prompt = false;
 
-                    self.cached_registry_generation = current_gen;
+                        self.cached_registry_generation = current_gen;
+                    } else {
+                        // Snapshot dupe OOM — do NOT update generation so
+                        // the next turn retries the refresh.
+                        log.warn("tools snapshot dupe failed (OOM); will retry next turn", .{});
+                    }
                 } else {
                     // OOM with > 256 tools: skip refresh; do NOT update
                     // cached_registry_generation so the next turn retries.
