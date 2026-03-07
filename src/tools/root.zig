@@ -603,11 +603,15 @@ pub fn buildInitialRegistry(
     const plugins = opts.tools_config.plugins;
     if (plugins.overwrite.len > 0 or plugins.add.len > 0) {
         reg.applyPlugins(plugins) catch |err| {
+            // Overwrite failures are fatal — proceeding with a partially applied
+            // registry is effectively fail-open (builtins still present when the
+            // config explicitly asked to replace them).
+            if (plugins.overwrite.len > 0) return err;
             std.log.scoped(.tool_registry).err(
                 "applyPlugins during init failed: {}",
                 .{err},
             );
-            // Non-fatal: registry is still usable with built-ins only.
+            // add-only failure is non-fatal: registry is still usable with built-ins.
         };
     }
 

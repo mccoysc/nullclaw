@@ -527,8 +527,13 @@ pub const ToolRegistry = struct {
         // Register the SoSlot (owns the handle).
         const slot = try self.allocator.create(SoSlot);
         errdefer self.allocator.destroy(slot);
-        const slot_id = self.next_slot_id;
-        self.next_slot_id += 1;
+        const slot_id = blk: {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            const id = self.next_slot_id;
+            self.next_slot_id += 1;
+            break :blk id;
+        };
         slot.* = .{
             .id = slot_id,
             .path = try self.allocator.dupe(u8, path),

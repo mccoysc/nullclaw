@@ -111,6 +111,10 @@ pub const SoToolWrapper = struct {
         var out_len: usize = 0;
 
         const ok = self.execute_fn(args_z.ptr, out_buf.ptr, out_buf.len, &out_len);
+        if (out_len > out_buf.len) {
+            log.err("SO plugin returned out_len={} > out_cap={}", .{ out_len, out_buf.len });
+            return ToolResult.fail("plugin reported invalid output length");
+        }
         const output = try allocator.dupe(u8, out_buf[0..out_len]);
         return if (ok) ToolResult.ok(output) else ToolResult.fail(output);
     }
@@ -177,6 +181,7 @@ pub fn openSo(allocator: Allocator, path: []const u8) !struct {
 
     var count: usize = 0;
     const defs_ptr = list_fn(&count);
+    errdefer free_fn(defs_ptr, count);
 
     const handle = SoHandle{
         .lib = lib,
@@ -217,12 +222,17 @@ pub fn wrapMeta(
 ) !*SoToolWrapper {
     const w = try allocator.create(SoToolWrapper);
     errdefer allocator.destroy(w);
+    const name_buf = try allocator.dupe(u8, meta.name);
+    errdefer allocator.free(name_buf);
+    const description_buf = try allocator.dupe(u8, meta.description);
+    errdefer allocator.free(description_buf);
+    const params_json_buf = try allocator.dupe(u8, meta.params_json);
     w.* = .{
         .allocator = allocator,
         .slot_id = slot_id,
-        .name_buf = try allocator.dupe(u8, meta.name),
-        .description_buf = try allocator.dupe(u8, meta.description),
-        .params_json_buf = try allocator.dupe(u8, meta.params_json),
+        .name_buf = name_buf,
+        .description_buf = description_buf,
+        .params_json_buf = params_json_buf,
         .execute_fn = meta.execute_fn,
     };
     return w;

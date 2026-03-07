@@ -1057,11 +1057,26 @@ pub const Agent = struct {
         self.context_was_compacted = false;
         commands.refreshSubagentToolContext(self);
 
-        // Rebuild tool_specs if the registry was mutated since the last turn.
+        // Rebuild tool_specs and tools snapshot if the registry was mutated
+        // since the last turn.  Both must be refreshed together so the
+        // capabilities section, system prompt, and XML tool instructions all
+        // reflect the current registry state.
         if (self.tool_specs_dirty) {
             self.refreshToolSpecs() catch |err| {
                 log.warn("refreshToolSpecs failed: {}; using stale specs", .{err});
             };
+            // Also refresh the tools snapshot so system-prompt generation and
+            // capability advertising use the live registry contents.
+            if (self.registry) |reg| {
+                const n = reg.count();
+                const new_tools = self.allocator.alloc(Tool, n) catch null;
+                if (new_tools) |buf| {
+                    const filled = reg.copySlice(buf);
+                    if (self.tools_owned) self.allocator.free(self.tools);
+                    self.tools = buf[0..filled];
+                    self.tools_owned = true;
+                }
+            }
         }
 
         const effective_user_message = blk: {
@@ -2617,10 +2632,15 @@ pub const Agent = struct {
 
         // Resolve effective tool list: registry takes priority over static slice.
         // For registry-backed tools we also manage SO reference counting.
+        // When a registry is present, NEVER fall back to self.tools — doing so
+        // would resurrect tools that were removed by overwrite/hot-reload.
         const effective_tools: []const Tool = if (self.registry) |reg| blk: {
             const n = reg.count();
-            if (n == 0) break :blk self.tools;
-            const buf = tool_allocator.alloc(Tool, n) catch break :blk self.tools;
+            if (n == 0) break :blk &[_]Tool{};
+            const buf = tool_allocator.alloc(Tool, n) catch {
+                log.err("failed to allocate tool buffer for registry dispatch", .{});
+                break :blk &[_]Tool{};
+            };
             const filled = reg.copySlice(buf);
             break :blk buf[0..filled];
         } else self.tools;

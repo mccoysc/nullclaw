@@ -35,12 +35,23 @@ const log = std.log.scoped(.loader_script);
 // noisy dependency imports (which may print to stdout) do not
 // contaminate the actual tool output.
 
-/// Create a unique temp file path like "/tmp/nullclaw_XXXXXXXXXXXXXXXX".
+/// Create a unique temp file path using the platform temp directory.
+/// On Windows uses %TEMP%, on POSIX uses TMPDIR or falls back to /tmp.
 fn makeTmpPath(allocator: Allocator) ![]const u8 {
+    const builtin = @import("builtin");
     var rand_buf: [8]u8 = undefined;
     std.crypto.random.bytes(&rand_buf);
     const hex = std.fmt.bytesToHex(rand_buf, .lower);
-    return std.fmt.allocPrint(allocator, "/tmp/nullclaw_{s}", .{&hex});
+    const tmp_dir: []const u8 = if (comptime builtin.os.tag == .windows)
+        std.process.getEnvVarOwned(allocator, "TEMP") catch
+            std.process.getEnvVarOwned(allocator, "TMP") catch
+            return std.fmt.allocPrint(allocator, "C:\\Temp\\nullclaw_{s}", .{&hex})
+    else
+        std.process.getEnvVarOwned(allocator, "TMPDIR") catch
+            try allocator.dupe(u8, "/tmp");
+    defer allocator.free(tmp_dir);
+    const sep: []const u8 = if (comptime builtin.os.tag == .windows) "\\" else "/";
+    return std.fmt.allocPrint(allocator, "{s}{s}nullclaw_{s}", .{ tmp_dir, sep, &hex });
 }
 
 /// Read the entire contents of a temp file.

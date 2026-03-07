@@ -76,6 +76,12 @@ fn processTelegramMessage(
     };
 
     const reply = runtime.session_mgr.processMessage(session_key, content, conversation_context) catch |err| {
+        // RegistryDraining: plugin replacement in progress — silently skip
+        // the message without replying, as required by the drain contract.
+        if (err == error.RegistryDraining) {
+            log.info("message skipped: tool registry draining (plugin replacement in progress)", .{});
+            return;
+        }
         log.err("Agent error: {}", .{err});
         const err_msg: []const u8 = switch (err) {
             error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError => "Network error. Please try again.",
@@ -955,6 +961,10 @@ pub fn runSignalLoop(
             };
 
             const reply = runtime.session_mgr.processMessage(session_key, msg.content, conversation_context) catch |err| {
+                if (err == error.RegistryDraining) {
+                    log.info("Signal message skipped: tool registry draining", .{});
+                    continue;
+                }
                 log.err("Signal agent error: {}", .{err});
                 const err_msg: []const u8 = switch (err) {
                     error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError => "Network error. Please try again.",
@@ -1156,6 +1166,10 @@ pub fn runMatrixLoop(
             defer mx_ptr.stopTyping(typing_target) catch {};
 
             const reply = runtime.session_mgr.processMessage(session_key, msg.content, null) catch |err| {
+                if (err == error.RegistryDraining) {
+                    log.info("Matrix message skipped: tool registry draining", .{});
+                    continue;
+                }
                 log.err("Matrix agent error: {}", .{err});
                 const err_msg: []const u8 = switch (err) {
                     error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError => "Network error. Please try again.",
