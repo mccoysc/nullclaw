@@ -95,6 +95,12 @@ fn waitWithTimeout(child: *std.process.Child, timeout_ns: u64) !std.process.Chil
 
 /// Windows implementation: WaitForSingleObject with a millisecond timeout.
 /// If the wait times out, TerminateProcess is called and ScriptTimeout returned.
+///
+/// On the **success path** we avoid calling `child.wait()` directly (which would
+/// do a redundant `WaitForSingleObjectEx(INFINITE)` inside `waitUnwrappedWindows`).
+/// Instead we harvest the exit code with `GetExitCodeProcess`, close the process
+/// and thread handles ourselves, then set `child.term` so that a final
+/// `child.wait()` only runs `cleanupStreams()` — no double-wait.
 fn waitWithTimeoutWindows(child: *std.process.Child, timeout_ns: u64) !std.process.Child.Term {
     const windows = std.os.windows;
     const timeout_ms: windows.DWORD = @intCast(@min(timeout_ns / std.time.ns_per_ms, std.math.maxInt(windows.DWORD)));
@@ -104,7 +110,8 @@ fn waitWithTimeoutWindows(child: *std.process.Child, timeout_ns: u64) !std.proce
         error.WaitTimeOut => {
             // Timeout — kill the child process.
             windows.TerminateProcess(child.id, 1) catch {};
-            // Reap the handle so child.wait() can clean up.
+            // Reap via child.wait() — the process is already dead so the
+            // internal INFINITE wait returns immediately.
             _ = child.wait() catch {};
             return error.ScriptTimeout;
         },
@@ -114,9 +121,28 @@ fn waitWithTimeoutWindows(child: *std.process.Child, timeout_ns: u64) !std.proce
         },
     };
 
-    // Process exited within the timeout — let child.wait() harvest the
-    // exit code and clean up handles.
-    return child.wait();
+    // ── Success path: process exited within timeout ──────────────────
+    //
+    // Harvest exit code directly instead of going through child.wait()
+    // which would redundantly call WaitForSingleObjectEx(INFINITE).
+    var exit_code: windows.DWORD = undefined;
+    const exit_term: std.process.Child.Term = if (windows.kernel32.GetExitCodeProcess(child.id, &exit_code) != 0)
+        .{ .Exited = @as(u8, @truncate(exit_code)) }
+    else
+        .{ .Unknown = 0 };
+
+    // Close process + thread handles (mirrors waitUnwrappedWindows).
+    std.posix.close(child.id);
+    std.posix.close(child.thread_handle);
+
+    // Mark the child as terminated so child.wait() short-circuits via
+    // the `if (self.term)` early-return and only runs cleanupStreams().
+    child.term = @as(std.process.Child.SpawnError!std.process.Child.Term, exit_term);
+    child.id = undefined;
+
+    // Let wait() run cleanupStreams() for any remaining pipe handles.
+    _ = child.wait() catch {};
+    return exit_term;
 }
 
 // ── Temp-file helpers ───────────────────────────────────────────
@@ -431,6 +457,7 @@ pub fn loadScript(
         const desc_d = try allocator.dupe(u8, def.description);
         errdefer allocator.free(desc_d);
         const params_d = try allocator.dupe(u8, def.params_json);
+        errdefer allocator.free(params_d);
         w.* = .{
             .allocator = allocator,
             .interp = interp_d,
