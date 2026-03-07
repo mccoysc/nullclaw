@@ -831,7 +831,8 @@ pub const NucleoFlash = struct {
         child.spawn() catch return Peripheral.PeripheralError.FlashFailed;
         // Drain pipes to avoid deadlock
         if (child.stdout) |*out| {
-            _ = out.readToEndAlloc(allocator, 64 * 1024) catch {};
+            const data = out.readToEndAlloc(allocator, 64 * 1024) catch null;
+            if (data) |d| allocator.free(d);
         }
         if (child.stderr) |*err_pipe| {
             _ = err_pipe.readToEndAlloc(allocator, 64 * 1024) catch {};
