@@ -378,7 +378,9 @@ pub const ToolRegistry = struct {
             }
         }
 
-        // Step 4 — free ALL existing entries and OLD SO slots.
+        // Steps 4 and 5 — free ALL existing entries/SO slots, then register new tools.
+        // Both steps run under a single mutex hold so that concurrent readers
+        // (copySlice, count, executeTool) never observe an empty registry window.
         self.mutex.lock();
 
         for (self.entries.items) |*e| {
@@ -406,13 +408,13 @@ pub const ToolRegistry = struct {
         }
         self.so_slots.shrinkRetainingCapacity(new_slot_count);
 
-        self.mutex.unlock();
-
-        // Step 5 — register all new tools.
+        // Step 5 — register all new tools (mutex is still held from Step 4).
+        // Keeping the single lock hold across both clear+repopulate prevents
+        // concurrent readers (copySlice, count, executeTool) from observing an
+        // empty registry between the two steps.
         // Failures (OOM) are logged and the affected tool is freed; partial
         // success is acceptable — the caller observes the actual registry state
         // via currentToolsList.
-        self.mutex.lock();
         for (new_entries.items) |e| {
             self.registerEntry(e) catch |err| {
                 const tool_name = e.tool.name();
