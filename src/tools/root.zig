@@ -568,8 +568,9 @@ pub fn buildInitialRegistry(
         .bootstrap_provider = opts.bootstrap_provider,
         .backend_name = opts.backend_name,
     });
-    // builtin_tools slice is freed at the end; tool structs are transferred to registry.
-    errdefer deinitTools(allocator, builtin_tools);
+    // builtin_tools slice ownership: tool structs are transferred one-by-one
+    // into the registry.  On error, reg.deinit() frees already-registered
+    // tools; we must manually free unregistered ones (including the failed one).
 
     // Step 2: create registry and populate with built-ins.
     const reg = try allocator.create(ToolRegistry);
@@ -579,12 +580,15 @@ pub fn buildInitialRegistry(
 
     // Transfer built-in tools into registry (each registered as "builtin").
     // On failure partway through: reg.deinit() (via errdefer) frees the already-
-    // registered tools; the outer errdefer frees the unregistered remainder.
+    // registered tools (0..registered-1); the catch block below frees the
+    // unregistered remainder (registered..) and the slice itself.
     var registered: usize = 0;
     for (builtin_tools) |t| {
         reg.register(t) catch |err| {
-            // Free remaining unregistered tools (registered ones freed by reg.deinit).
-            for (builtin_tools[registered + 1 ..]) |remaining| {
+            // Free the failed tool and all remaining unregistered tools.
+            // Already-registered tools (0..registered-1) are freed by
+            // errdefer reg.deinit() above.
+            for (builtin_tools[registered..]) |remaining| {
                 remaining.deinit(allocator);
             }
             allocator.free(builtin_tools);
