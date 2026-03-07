@@ -229,9 +229,9 @@ pub const RedisStreamChannel = struct {
         const base = buildRedisBaseArgs(ep, &port_buf, &db_buf);
 
         const result = self.runRedisCommand(base.args[0..base.count], &.{
-            "XGROUP",    "CREATE",
+            "XGROUP",        "CREATE",
             ep.listen_topic, ep.consumer_group,
-            "$",         "MKSTREAM",
+            "$",             "MKSTREAM",
         }) catch {
             // Group may already exist, which is fine
             return;
@@ -268,10 +268,10 @@ pub const RedisStreamChannel = struct {
 
         // XREADGROUP GROUP <group> <consumer> COUNT 10 BLOCK 1000 STREAMS <stream> >
         const output = try self.runRedisCommand(base.args[0..base.count], &.{
-            "XREADGROUP", "GROUP",
+            "XREADGROUP",      "GROUP",
             ep.consumer_group, ep.consumer_name,
-            "COUNT",      "10",
-            "STREAMS",    ep.listen_topic,
+            "COUNT",           "10",
+            "STREAMS",         ep.listen_topic,
             ">",
         });
         defer self.allocator.free(output);
@@ -425,9 +425,9 @@ pub const RedisStreamChannel = struct {
 
         // XADD <stream> * pubkey <hex> sig <hex> body <base64>
         const result = try self.runRedisCommand(base.args[0..base.count], &.{
-            "XADD",       reply_stream,
-            "*",          "pubkey",
-            fields.pubkey, "sig",
+            "XADD",          reply_stream,
+            "*",             "pubkey",
+            fields.pubkey,   "sig",
             &fields.sig_hex, "body",
             fields.b64_body,
         });
