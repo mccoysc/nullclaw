@@ -231,7 +231,6 @@ pub fn loadScript(
 
     const defs = runList(allocator, interp, path) catch |err| {
         log.err("script '{s}' --nullclaw-list: {}", .{ path, err });
-        allocator.free(interp);
         return err;
     };
     defer {

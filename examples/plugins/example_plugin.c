@@ -55,7 +55,7 @@ static bool so_echo_execute(const char *args_json,
                              size_t     *out_len)
 {
     int n = snprintf(out_buf, out_cap, "echo: %s", args_json);
-    *out_len = (n > 0 && (size_t)n < out_cap) ? (size_t)n : out_cap;
+    *out_len = (n > 0 && (size_t)n < out_cap) ? (size_t)n : (out_cap > 0 ? out_cap - 1 : 0);
     return true;
 }
 

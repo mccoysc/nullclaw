@@ -922,8 +922,11 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                         ) ![]const types.ExternalToolConfig {
                             if (arr != .array) return &.{};
                             const items = arr.array.items;
-                            const buf = try alloc.alloc(types.ExternalToolConfig, items.len);
-                            var n: usize = 0;
+                            var list: std.ArrayListUnmanaged(types.ExternalToolConfig) = .empty;
+                            errdefer {
+                                for (list.items) |entry| alloc.free(entry.path);
+                                list.deinit(alloc);
+                            }
                             for (items) |item| {
                                 if (item != .object) continue;
                                 const kind_v = item.object.get("kind") orelse continue;
@@ -933,13 +936,14 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                                     types.ExternalToolKind,
                                     kind_v.string,
                                 ) orelse continue;
-                                buf[n] = .{
-                                    .kind = kind,
-                                    .path = try alloc.dupe(u8, path_v.string),
-                                };
-                                n += 1;
+                                // Ensure capacity before duping the path so that a
+                                // list growth failure doesn't leave an allocated-but-
+                                // unenqueued path behind (which the errdefer wouldn't see).
+                                try list.ensureUnusedCapacity(alloc, 1);
+                                const path = try alloc.dupe(u8, path_v.string);
+                                list.appendAssumeCapacity(.{ .kind = kind, .path = path });
                             }
-                            return buf[0..n];
+                            return list.toOwnedSlice(alloc);
                         }
                     }.call;
                     if (pl.object.get("add")) |arr|

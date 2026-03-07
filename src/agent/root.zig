@@ -551,8 +551,20 @@ pub const Agent = struct {
             };
         }
 
+        // Trim allocation to the actual fill count.  If the registry shrank
+        // between count() and copySlice() (hot-reload TOCTOU), `filled < n`
+        // and new_specs[filled..n] would be uninitialized.  realloc for a
+        // smaller size never fails on GPA; on an arena it may fail (OOM), in
+        // which case we return the error and the errdefer frees new_specs —
+        // which is still valid, because Zig's allocator contract guarantees
+        // the original memory is untouched on a failed realloc.
+        const final_specs = if (filled == n)
+            new_specs
+        else
+            try self.allocator.realloc(new_specs, filled);
+
         self.allocator.free(self.tool_specs);
-        self.tool_specs = new_specs;
+        self.tool_specs = final_specs;
         self.tool_specs_dirty = false;
     }
 

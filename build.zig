@@ -389,6 +389,9 @@ pub fn build(b: *std.Build) void {
         null;
     // Disable web channel when the websocket package is not yet available.
     const enable_channel_web = channels.enable_channel_web and ws_dep != null;
+    if (channels.enable_channel_web and ws_dep == null) {
+        std.log.warn("web channel disabled: websocket dependency not yet cached (run an online build first)", .{});
+    }
 
     // Force-disable C-linked backends when targeting WASI (no C library linking in wasm32-wasi).
     const effective_enable_sqlite = enable_sqlite and !is_wasi;

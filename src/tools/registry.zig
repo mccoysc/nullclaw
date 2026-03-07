@@ -394,9 +394,10 @@ pub const ToolRegistry = struct {
         self.mutex.lock();
         for (new_entries.items) |e| {
             self.registerEntry(e) catch |err| {
+                const tool_name = e.tool.name();
                 e.tool.deinit(self.allocator);
                 self.allocator.free(e.source);
-                log.err("overwrite: failed to register '{s}': {}", .{ e.tool.name(), err });
+                log.err("overwrite: failed to register '{s}': {}", .{ tool_name, err });
             };
         }
         self.mutex.unlock();
@@ -464,9 +465,10 @@ pub const ToolRegistry = struct {
                     .source = src,
                     .so_slot_id = sid,
                 }) catch |err| {
+                    const tool_name = t.name();
                     t.deinit(self.allocator);
                     self.allocator.free(src);
-                    log.err("add plugin: failed to register '{s}': {}", .{ t.name(), err });
+                    log.err("add plugin: failed to register '{s}': {}", .{ tool_name, err });
                     break :blk false;
                 };
                 break :blk true;
