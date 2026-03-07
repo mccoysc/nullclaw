@@ -1283,15 +1283,15 @@ pub const Agent = struct {
                                         messages[idx].content = try arena.dupe(u8, hook_result.content);
                                     }
                                 },
-                                            .passthrough, .agent, .async_agent => {},
-                                        }
-                                        break;
-                                    }
-                                }
+                                .passthrough, .agent, .async_agent => {},
                             }
+                            break;
                         }
+                    }
+                }
+            }
 
-                        const timer_start = std.time.milliTimestamp();
+            const timer_start = std.time.milliTimestamp();
             const is_streaming = self.stream_callback != null and self.stream_ctx != null and self.provider.supportsStreaming();
             const native_tools_enabled = !is_streaming and self.provider.supportsNativeTools();
 
@@ -2385,26 +2385,26 @@ pub const Agent = struct {
                     log.warn(
                         "sub-agent error: failed to parse valid response | output={s} instructions={s} hook_content={s}",
                         .{
-                                            response_text,
-                                            skill_instructions,
-                                            hook_content,
-                                        },
-                                    );
-                                    return .{
-                                        .action = .agent_error,
-                                        .content = result_allocator.dupe(u8, "sub-agent error: failed to parse response") catch "",
-                                        .content_owned = true,
-                                    };
-                                };
-                                // parseSubAgentResponse returns .agent as sentinel when no tag found
-                                // (shouldn't happen since we checked hasValidBehaviorTag, but be safe)
-                                if (parsed.action == .agent) {
-                                    log.warn(
-                                        "sub-agent error: behavior tag detected but parse returned sentinel | output={s} instructions={s} hook_content={s}",
-                                        .{
-                                            response_text,
-                                            skill_instructions,
-                                            hook_content,
+                            response_text,
+                            skill_instructions,
+                            hook_content,
+                        },
+                    );
+                    return .{
+                        .action = .agent_error,
+                        .content = result_allocator.dupe(u8, "sub-agent error: failed to parse response") catch "",
+                        .content_owned = true,
+                    };
+                };
+                // parseSubAgentResponse returns .agent as sentinel when no tag found
+                // (shouldn't happen since we checked hasValidBehaviorTag, but be safe)
+                if (parsed.action == .agent) {
+                    log.warn(
+                        "sub-agent error: behavior tag detected but parse returned sentinel | output={s} instructions={s} hook_content={s}",
+                        .{
+                            response_text,
+                            skill_instructions,
+                            hook_content,
                         },
                     );
                     return .{
