@@ -324,7 +324,8 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const is_wasi = target.result.os.tag == .wasi;
     const is_static = b.option(bool, "static", "Static build") orelse false;
-    const app_version = b.option([]const u8, "version", "Version string embedded in the binary") orelse "2026.3.3";
+    const app_version = b.option([]const u8, "version", "Version string embedded in the binary") orelse
+        getGitVersion(b) orelse "unknown";
     const channels_raw = b.option(
         []const u8,
         "channels",
@@ -548,4 +549,24 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&b.addRunArtifact(lib_tests).step);
         test_step.dependOn(&b.addRunArtifact(exe_tests).step);
     }
+}
+
+/// Attempt to derive the version string from the current git tag.
+/// Returns the exact tag (e.g. "v2026.3.7.2"), preserving any "v" prefix,
+/// or null when git is unavailable or HEAD is not at an exact tag.
+fn getGitVersion(b: *std.Build) ?[]const u8 {
+    const result = std.process.Child.run(.{
+        .allocator = b.allocator,
+        .argv = &.{ "git", "describe", "--tags", "--exact-match" },
+        .max_output_bytes = 256,
+    }) catch return null;
+    defer b.allocator.free(result.stdout);
+    defer b.allocator.free(result.stderr);
+    switch (result.term) {
+        .Exited => |code| if (code != 0) return null,
+        else => return null,
+    }
+    const trimmed = std.mem.trim(u8, result.stdout, &std.ascii.whitespace);
+    if (trimmed.len == 0) return null;
+    return b.allocator.dupe(u8, trimmed) catch null;
 }

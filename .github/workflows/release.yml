@@ -6,8 +6,46 @@ on:
   workflow_dispatch:
 
 jobs:
+  version:
+    name: Determine version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.release_info.outputs.version }}
+      title: ${{ steps.release_info.outputs.title }}
+      tag: ${{ steps.release_info.outputs.tag }}
+      prerelease: ${{ steps.release_info.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine release info
+        id: release_info
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          DATE=$(date -u +'%Y.%m.%d' | sed 's/\.0\([0-9]\)/.\1/g')
+          DATE_ESCAPED="${DATE//./\\.}"
+          EXISTING=$(gh release list --repo "${{ github.repository }}" --limit 200 --json tagName -q '.[].tagName' 2>/dev/null || true)
+          SEQ=0
+          while IFS= read -r tag; do
+            if [[ "$tag" =~ ^v${DATE_ESCAPED}\.([0-9]+)$ ]]; then
+              N="${BASH_REMATCH[1]}"
+              if (( N >= SEQ )); then
+                SEQ=$((N + 1))
+              fi
+            fi
+          done <<< "$EXISTING"
+          VERSION="${DATE}.${SEQ}"
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "title=v${VERSION}" >> $GITHUB_OUTPUT
+          echo "tag=v${VERSION}" >> $GITHUB_OUTPUT
+          echo "prerelease=false" >> $GITHUB_OUTPUT
+
   build:
     name: Build (${{ matrix.target }})
+    needs: version
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -59,7 +97,7 @@ jobs:
 
       - name: Build ReleaseSmall
         if: ${{ matrix.disabled != true }}
-        run: zig build -Doptimize=ReleaseSmall ${{ matrix.zig_target && format('-Dtarget={0}', matrix.zig_target) || '' }}
+        run: zig build -Doptimize=ReleaseSmall -Dversion=${{ needs.version.outputs.tag }} ${{ matrix.zig_target && format('-Dtarget={0}', matrix.zig_target) || '' }}
 
       - name: Upload artifact
         if: ${{ matrix.disabled != true }}
@@ -69,7 +107,7 @@ jobs:
           path: zig-out/bin/nullclaw${{ matrix.ext }}
 
   release:
-    needs: build
+    needs: [version, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -79,34 +117,10 @@ jobs:
 
       - uses: actions/download-artifact@v4
 
-      - name: Determine release info
-        id: release_info
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        shell: bash
-        run: |
-          DATE=$(date -u +'%Y.%m.%d' | sed 's/\.0\([0-9]\)/.\1/g')
-          DATE_ESCAPED="${DATE//./\\.}"
-          EXISTING=$(gh release list --repo "${{ github.repository }}" --limit 200 --json tagName -q '.[].tagName' 2>/dev/null || true)
-          SEQ=0
-          while IFS= read -r tag; do
-            if [[ "$tag" =~ ^v${DATE_ESCAPED}\.([0-9]+)$ ]]; then
-              N="${BASH_REMATCH[1]}"
-              if (( N >= SEQ )); then
-                SEQ=$((N + 1))
-              fi
-            fi
-          done <<< "$EXISTING"
-          VERSION="${DATE}.${SEQ}"
-          echo "version=${VERSION}" >> $GITHUB_OUTPUT
-          echo "title=v${VERSION}" >> $GITHUB_OUTPUT
-          echo "tag=v${VERSION}" >> $GITHUB_OUTPUT
-          echo "prerelease=false" >> $GITHUB_OUTPUT
-
       - name: Rename binaries
         shell: bash
         run: |
-          VERSION="${{ steps.release_info.outputs.version }}"
+          VERSION="${{ needs.version.outputs.version }}"
           mv nullclaw-linux-x86_64/nullclaw   nullclaw-${VERSION}-linux-x86_64.bin
           mv nullclaw-linux-aarch64/nullclaw  nullclaw-${VERSION}-linux-aarch64.bin
           mv nullclaw-linux-riscv64/nullclaw  nullclaw-${VERSION}-linux-riscv64.bin
@@ -119,18 +133,18 @@ jobs:
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.release_info.outputs.tag }}
-          name: ${{ steps.release_info.outputs.title }}
-          prerelease: ${{ steps.release_info.outputs.prerelease }}
+          tag_name: ${{ needs.version.outputs.tag }}
+          name: ${{ needs.version.outputs.title }}
+          prerelease: ${{ needs.version.outputs.prerelease }}
           files: |
-            nullclaw-${{ steps.release_info.outputs.version }}-linux-x86_64.bin
-            nullclaw-${{ steps.release_info.outputs.version }}-linux-aarch64.bin
-            nullclaw-${{ steps.release_info.outputs.version }}-linux-riscv64.bin
-            nullclaw-${{ steps.release_info.outputs.version }}-macos-aarch64.bin
-            nullclaw-${{ steps.release_info.outputs.version }}-macos-x86_64.bin
-            nullclaw-${{ steps.release_info.outputs.version }}-windows-x86_64.exe
-            nullclaw-${{ steps.release_info.outputs.version }}-windows-aarch64.exe
-            nullclaw-${{ steps.release_info.outputs.version }}-wasm32-wasi.wasm
+            nullclaw-${{ needs.version.outputs.version }}-linux-x86_64.bin
+            nullclaw-${{ needs.version.outputs.version }}-linux-aarch64.bin
+            nullclaw-${{ needs.version.outputs.version }}-linux-riscv64.bin
+            nullclaw-${{ needs.version.outputs.version }}-macos-aarch64.bin
+            nullclaw-${{ needs.version.outputs.version }}-macos-x86_64.bin
+            nullclaw-${{ needs.version.outputs.version }}-windows-x86_64.exe
+            nullclaw-${{ needs.version.outputs.version }}-windows-aarch64.exe
+            nullclaw-${{ needs.version.outputs.version }}-wasm32-wasi.wasm
           generate_release_notes: true
 
   docker:

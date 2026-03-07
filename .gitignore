@@ -25,3 +25,6 @@ config.signal.json
 .cursor/
 .trae/
 .codebuddy/
+
+# Downloaded compiler toolchains
+tools/zig-*/
