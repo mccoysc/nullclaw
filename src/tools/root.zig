@@ -95,6 +95,10 @@ pub const i2c = @import("i2c.zig");
 pub const spi = @import("spi.zig");
 pub const path_security = @import("path_security.zig");
 pub const process_util = @import("process_util.zig");
+pub const registry = @import("registry.zig");
+pub const loader_so = @import("loader_so.zig");
+pub const loader_script = @import("loader_script.zig");
+pub const ToolRegistry = registry.ToolRegistry;
 
 // ── Core types ──────────────────────────────────────────────────────
 
@@ -494,6 +498,122 @@ pub fn bindMemoryRuntime(tools: []const Tool, mem_rt: ?*memory_mod.MemoryRuntime
             mt.mem_rt = mem_rt;
         }
     }
+}
+
+/// Build a ToolRegistry pre-populated with built-in tools (in the same order
+/// and with the same options as `allTools`), then apply any external plugins
+/// from `opts.tools_config.plugins`.
+///
+/// Initialization order:
+///   1. All built-in tools (shell, file I/O, git, memory, http, …)
+///   2. overwrite plugins — replace existing built-ins by name
+///   3. add plugins — append / replace unconditionally
+///
+/// Hot-reload is NOT started here; call `reg.startHotReload(config_path, interval)`
+/// separately after the registry is returned.
+///
+/// The caller owns the returned registry and must call `reg.deinit()`.
+pub fn buildInitialRegistry(
+    allocator: std.mem.Allocator,
+    workspace_dir: []const u8,
+    opts: struct {
+        http_enabled: bool = false,
+        http_allowed_domains: []const []const u8 = &.{},
+        http_max_response_size: u32 = 1_000_000,
+        http_timeout_secs: u64 = 30,
+        web_search_base_url: ?[]const u8 = null,
+        web_search_provider: []const u8 = "auto",
+        web_search_fallback_providers: []const []const u8 = &.{},
+        browser_enabled: bool = false,
+        screenshot_enabled: bool = false,
+        composio_api_key: ?[]const u8 = null,
+        browser_open_domains: ?[]const []const u8 = null,
+        hardware_boards: ?[]const []const u8 = null,
+        mcp_tools: ?[]const Tool = null,
+        agents: ?[]const @import("../config.zig").NamedAgentConfig = null,
+        fallback_api_key: ?[]const u8 = null,
+        delegate_depth: u32 = 0,
+        subagent_manager: ?*@import("../subagent.zig").SubagentManager = null,
+        allowed_paths: []const []const u8 = &.{},
+        tools_config: @import("../config.zig").ToolsConfig = .{},
+        policy: ?*const @import("../security/policy.zig").SecurityPolicy = null,
+        bootstrap_provider: ?@import("../bootstrap/root.zig").BootstrapProvider = null,
+        backend_name: []const u8 = "hybrid",
+        /// Optional path to write currentToolsList.json. Ignored if null.
+        current_tools_list_path: ?[]const u8 = null,
+    },
+) !*ToolRegistry {
+    // Step 1: build built-in tools with existing allTools() factory.
+    const builtin_tools = try allTools(allocator, workspace_dir, .{
+        .http_enabled = opts.http_enabled,
+        .http_allowed_domains = opts.http_allowed_domains,
+        .http_max_response_size = opts.http_max_response_size,
+        .http_timeout_secs = opts.http_timeout_secs,
+        .web_search_base_url = opts.web_search_base_url,
+        .web_search_provider = opts.web_search_provider,
+        .web_search_fallback_providers = opts.web_search_fallback_providers,
+        .browser_enabled = opts.browser_enabled,
+        .screenshot_enabled = opts.screenshot_enabled,
+        .composio_api_key = opts.composio_api_key,
+        .browser_open_domains = opts.browser_open_domains,
+        .hardware_boards = opts.hardware_boards,
+        .mcp_tools = opts.mcp_tools,
+        .agents = opts.agents,
+        .fallback_api_key = opts.fallback_api_key,
+        .delegate_depth = opts.delegate_depth,
+        .subagent_manager = opts.subagent_manager,
+        .allowed_paths = opts.allowed_paths,
+        .tools_config = opts.tools_config,
+        .policy = opts.policy,
+        .bootstrap_provider = opts.bootstrap_provider,
+        .backend_name = opts.backend_name,
+    });
+    // builtin_tools slice is freed at the end; tool structs are transferred to registry.
+    errdefer deinitTools(allocator, builtin_tools);
+
+    // Step 2: create registry and populate with built-ins.
+    const reg = try allocator.create(ToolRegistry);
+    errdefer allocator.destroy(reg);
+    reg.* = ToolRegistry.init(allocator);
+    errdefer reg.deinit();
+
+    // Transfer built-in tools into registry (each registered as "builtin").
+    // On failure partway through: reg.deinit() (via errdefer) frees the already-
+    // registered tools; the outer errdefer frees the unregistered remainder.
+    var registered: usize = 0;
+    for (builtin_tools) |t| {
+        reg.register(t) catch |err| {
+            // Free remaining unregistered tools (registered ones freed by reg.deinit).
+            for (builtin_tools[registered + 1 ..]) |remaining| {
+                remaining.deinit(allocator);
+            }
+            allocator.free(builtin_tools);
+            return err;
+        };
+        registered += 1;
+    }
+    // All tools transferred; free the outer slice only (structs now owned by registry).
+    allocator.free(builtin_tools);
+
+    // Step 3: apply external plugins (overwrite then add).
+    const plugins = opts.tools_config.plugins;
+    if (plugins.overwrite.len > 0 or plugins.add.len > 0) {
+        reg.applyPlugins(plugins) catch |err| {
+            std.log.scoped(.tool_registry).err(
+                "applyPlugins during init failed: {}",
+                .{err},
+            );
+            // Non-fatal: registry is still usable with built-ins only.
+        };
+    }
+
+    // Step 4: set currentToolsList path and do an initial write.
+    if (opts.current_tools_list_path) |p| {
+        reg.setCurrentToolsListPath(p) catch {};
+    }
+    reg.writeCurrentToolsList();
+
+    return reg;
 }
 
 /// Free all heap-allocated tool structs and the tools slice itself.

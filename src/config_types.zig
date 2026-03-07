@@ -212,6 +212,46 @@ pub const ToolsConfig = struct {
     shell_max_output_bytes: u32 = 1_048_576, // 1MB
     max_file_size_bytes: u32 = 10_485_760, // 10MB — shared file_read/edit/append
     web_fetch_max_chars: u32 = 100_000,
+    /// External tool plugins loaded at startup (and on hot reload).
+    plugins: ToolPluginsConfig = .{},
+};
+
+// ── External tool plugin types ──────────────────────────────────
+
+/// Kind of external tool source.
+pub const ExternalToolKind = enum {
+    /// Native shared library (.so / .dll / .dylib).
+    /// Must export `nullclaw_tools_list` and `nullclaw_tools_free` — see loader_so.zig.
+    so,
+    /// Python 3 script. Requires `python3` in PATH.
+    /// Must accept `--nullclaw-list` and `--nullclaw-call <name> <json>`.
+    python,
+    /// Node.js script. Requires `node` in PATH.
+    /// Same CLI protocol as `python`.
+    node,
+};
+
+/// One external tool source entry (a library or a script).
+pub const ExternalToolConfig = struct {
+    kind: ExternalToolKind,
+    /// Absolute or workspace-relative path to the library / script file.
+    path: []const u8,
+};
+
+/// Dynamic plugin section inside ToolsConfig.
+///
+/// Processing order on startup / hot-reload:
+///   1. `overwrite` — for each exported tool whose name matches an existing
+///      registry entry, replace it (freeing old resources). Unknown names are
+///      logged and silently ignored.
+///   2. `add` — append (or replace if same name) every exported tool into the
+///      registry.
+pub const ToolPluginsConfig = struct {
+    overwrite: []const ExternalToolConfig = &.{},
+    add: []const ExternalToolConfig = &.{},
+    /// How often (in seconds) the plugins config is checked for changes.
+    /// 0 disables hot-reload polling. Default: 5.
+    hot_reload_interval_secs: u64 = 5,
 };
 
 pub const ModelRouteConfig = struct {

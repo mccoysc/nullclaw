@@ -16,6 +16,7 @@ const ChatResponse = providers.ChatResponse;
 const ToolSpec = providers.ToolSpec;
 const tools_mod = @import("../tools/root.zig");
 const Tool = tools_mod.Tool;
+const ToolRegistry = tools_mod.ToolRegistry;
 const memory_mod = @import("../memory/root.zig");
 const Memory = memory_mod.Memory;
 const bootstrap_mod = @import("../bootstrap/root.zig");
@@ -228,6 +229,12 @@ pub const Agent = struct {
     provider: Provider,
     tools: []const Tool,
     tool_specs: []const ToolSpec,
+    /// Optional dynamic registry. When set, executeTool() dispatches via the
+    /// registry (with SO ref-counting). Must remain alive for the agent's lifetime.
+    registry: ?*ToolRegistry = null,
+    /// Set to true when registry contents have changed so tool_specs are rebuilt
+    /// before the next LLM call.
+    tool_specs_dirty: bool = false,
     mem: ?Memory,
     bootstrap: ?bootstrap_mod.BootstrapProvider = null,
     session_store: ?memory_mod.SessionStore = null,
@@ -513,6 +520,47 @@ pub const Agent = struct {
         }
         self.history.deinit(self.allocator);
         self.allocator.free(self.tool_specs);
+    }
+
+    /// Rebuild tool_specs from the registry.
+    /// Call after adding/removing tools from the registry to keep the LLM
+    /// function-calling schema in sync.
+    pub fn refreshToolSpecs(self: *Agent) !void {
+        const reg = self.registry orelse return;
+        const n = reg.count();
+        const new_specs = try self.allocator.alloc(ToolSpec, n);
+        errdefer self.allocator.free(new_specs);
+
+        // Copy each tool's spec from the registry (mutex-protected internally).
+        var filled: usize = 0;
+        var stack_buf: [256]Tool = undefined;
+        const heap_buf: ?[]Tool = if (n > stack_buf.len)
+            try self.allocator.alloc(Tool, n)
+        else
+            null;
+        defer if (heap_buf) |b| self.allocator.free(b);
+
+        const buf: []Tool = if (heap_buf) |b| b else stack_buf[0..n];
+        filled = reg.copySlice(buf);
+
+        for (buf[0..filled], 0..) |t, i| {
+            new_specs[i] = .{
+                .name = t.name(),
+                .description = t.description(),
+                .parameters_json = t.parametersJson(),
+            };
+        }
+
+        self.allocator.free(self.tool_specs);
+        self.tool_specs = new_specs;
+        self.tool_specs_dirty = false;
+    }
+
+    /// Returns true when the registry is draining (pending SO unload).
+    /// The channel layer should call this before accepting new messages.
+    pub fn isRegistryDraining(self: *const Agent) bool {
+        const reg = self.registry orelse return false;
+        return reg.isPendingDrain();
     }
 
     /// Estimate total tokens in conversation history.
@@ -990,6 +1038,13 @@ pub const Agent = struct {
     pub fn turn(self: *Agent, user_message: []const u8) ![]const u8 {
         self.context_was_compacted = false;
         commands.refreshSubagentToolContext(self);
+
+        // Rebuild tool_specs if the registry was mutated since the last turn.
+        if (self.tool_specs_dirty) {
+            self.refreshToolSpecs() catch |err| {
+                log.warn("refreshToolSpecs failed: {}; using stale specs", .{err});
+            };
+        }
 
         const effective_user_message = blk: {
             if (commands.bareSessionResetPrompt(user_message)) |fresh_prompt| {
@@ -2542,7 +2597,17 @@ pub const Agent = struct {
 
         const trimmed_call_name = std.mem.trim(u8, call.name, " \t\r\n");
 
-        for (self.tools) |t| {
+        // Resolve effective tool list: registry takes priority over static slice.
+        // For registry-backed tools we also manage SO reference counting.
+        const effective_tools: []const Tool = if (self.registry) |reg| blk: {
+            const n = reg.count();
+            if (n == 0) break :blk self.tools;
+            const buf = tool_allocator.alloc(Tool, n) catch break :blk self.tools;
+            const filled = reg.copySlice(buf);
+            break :blk buf[0..filled];
+        } else self.tools;
+
+        for (effective_tools) |t| {
             if (std.ascii.eqlIgnoreCase(t.name(), trimmed_call_name)) {
                 // Parse arguments JSON to ObjectMap ONCE
                 const parsed = std.json.parseFromSlice(
@@ -2582,6 +2647,11 @@ pub const Agent = struct {
                         };
                     }
                 }
+
+                // Acquire SO ref count if this is a SO-backed tool.
+                const is_so = if (self.registry) |reg| reg.isSoTool(t) else false;
+                if (is_so) self.registry.?.acquireSoCall();
+                defer if (is_so) self.registry.?.releaseSoCall();
 
                 const result = t.execute(tool_allocator, args) catch |err| {
                     return .{
