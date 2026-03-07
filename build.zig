@@ -500,6 +500,13 @@ pub fn build(b: *std.Build) void {
         });
     exe.root_module.addImport("build_options", build_options_module);
 
+    // Link libc so that std.DynLib uses dlopen/dlsym for SO plugin loading.
+    // Without this Zig falls back to ElfDynLib which does not perform full
+    // relocation, causing data-section pointers in plugin SOs to be invalid.
+    if (!is_wasi) {
+        exe.linkLibC();
+    }
+
     // Link SQLite on the compile step (not the module)
     if (!is_wasi) {
         if (sqlite3) |lib| {
