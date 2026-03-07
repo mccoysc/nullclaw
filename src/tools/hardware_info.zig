@@ -33,11 +33,6 @@ const BOARD_DB = [_]BoardInfo{
         .desc = "Dual-core: STM32 (MCU) + Linux (aarch64). GPIO via Bridge app on port 9999.",
     },
     .{
-        .id = "esp32",
-        .chip = "ESP32",
-        .desc = "Dual-core Xtensa LX6, 240 MHz. Flash: 4 MB typical. Built-in LED on GPIO 2.",
-    },
-    .{
         .id = "rpi-gpio",
         .chip = "Raspberry Pi",
         .desc = "ARM Linux. Native GPIO via sysfs/rppal. No fixed LED pin.",
@@ -107,9 +102,6 @@ fn memoryMapStatic(board: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, board, "arduino-uno")) {
         return "Flash: 16 KB, SRAM: 2 KB, EEPROM: 1 KB";
     }
-    if (std.mem.eql(u8, board, "esp32")) {
-        return "Flash: 4 MB, IRAM/DRAM per ESP-IDF layout";
-    }
     return null;
 }
 
@@ -175,22 +167,9 @@ test "hardware_board_info unknown board returns message" {
     try std.testing.expect(std.mem.indexOf(u8, result.output, "custom-board") != null);
 }
 
-test "hardware_board_info esp32" {
-    const boards = [_][]const u8{"esp32"};
-    var hi = HardwareBoardInfoTool{ .boards = &boards };
-    const t = hi.tool();
-    const parsed = try root.parseTestArgs("{\"board\": \"esp32\"}");
-    defer parsed.deinit();
-    const result = try t.execute(std.testing.allocator, parsed.value.object);
-    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
-    try std.testing.expect(result.success);
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "ESP32") != null);
-}
-
 test "memoryMapStatic returns for known boards" {
     try std.testing.expect(memoryMapStatic("nucleo-f401re") != null);
     try std.testing.expect(memoryMapStatic("nucleo-f411re") != null);
     try std.testing.expect(memoryMapStatic("arduino-uno") != null);
-    try std.testing.expect(memoryMapStatic("esp32") != null);
     try std.testing.expect(memoryMapStatic("unknown") == null);
 }
