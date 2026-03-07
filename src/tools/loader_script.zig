@@ -45,9 +45,10 @@ const poll_interval_ns: u64 = 50 * std.time.ns_per_ms; // 50 ms
 fn waitWithTimeout(child: *std.process.Child, timeout_ns: u64) !std.process.Child.Term {
     const builtin = @import("builtin");
 
-    // On Windows fall back to unbounded wait.
+    // On Windows there is no POSIX kill(); return an explicit error so
+    // callers get a deterministic failure instead of an unbounded hang.
     if (comptime builtin.os.tag == .windows) {
-        return child.wait();
+        return error.ScriptTimeoutUnsupportedOnWindows;
     }
 
     const pid = child.id;
@@ -143,7 +144,9 @@ fn detectInterpreter(allocator: Allocator, kind: ScriptKind) ?[]const u8 {
         child.stdout_behavior = .Ignore;
         child.stderr_behavior = .Ignore;
         child.spawn() catch continue;
-        const term = child.wait() catch continue;
+        // Use a short timeout (5 s) so a broken interpreter doesn't block
+        // loadScript() indefinitely.
+        const term = waitWithTimeout(&child, 5 * std.time.ns_per_s) catch continue;
         switch (term) {
             .Exited => |code| if (code == 0) {
                 return allocator.dupe(u8, cand) catch null;

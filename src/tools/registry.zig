@@ -146,6 +146,11 @@ pub const ToolRegistry = struct {
     /// Copy tool pointers into `out`. Returns the slice of `out` that was filled.
     /// Caller provides a buffer; call with out.len == 0 to get count first.
     /// For performance in the agent dispatch loop, prefer `withSlice`.
+    ///
+    /// WARNING: When executing SO-backed tools returned by this method, callers
+    /// MUST bracket the execution with `acquireSoCall()`/`releaseSoCall()` to
+    /// prevent the library from being unloaded during execution. Use `isSoTool()`
+    /// to check if a tool is SO-backed.
     pub fn copySlice(self: *ToolRegistry, out: []Tool) usize {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -705,24 +710,67 @@ pub const ToolRegistry = struct {
         defer buf.deinit(self.allocator);
 
         self.mutex.lock();
-        buf.appendSlice(self.allocator, "[\n") catch {};
-        var first = true;
-        for (self.entries.items) |e| {
-            if (!first) buf.appendSlice(self.allocator, ",\n") catch {};
-            first = false;
-            buf.appendSlice(self.allocator, "  {\"name\":") catch {};
-            appendJsonString(&buf, self.allocator, e.tool.name()) catch {};
-            buf.appendSlice(self.allocator, ",\"description\":") catch {};
-            appendJsonString(&buf, self.allocator, e.tool.description()) catch {};
-            buf.appendSlice(self.allocator, ",\"params_json\":") catch {};
-            appendJsonString(&buf, self.allocator, e.tool.parametersJson()) catch {};
-            buf.appendSlice(self.allocator, ",\"source\":") catch {};
-            appendJsonString(&buf, self.allocator, e.source) catch {};
-            buf.append(self.allocator, '}') catch {};
+        var ok = true;
+        buf.appendSlice(self.allocator, "[\n") catch {
+            ok = false;
+        };
+        if (ok) {
+            var first = true;
+            for (self.entries.items) |e| {
+                if (!first) buf.appendSlice(self.allocator, ",\n") catch {
+                    ok = false;
+                    break;
+                };
+                first = false;
+                buf.appendSlice(self.allocator, "  {\"name\":") catch {
+                    ok = false;
+                    break;
+                };
+                appendJsonString(&buf, self.allocator, e.tool.name()) catch {
+                    ok = false;
+                    break;
+                };
+                buf.appendSlice(self.allocator, ",\"description\":") catch {
+                    ok = false;
+                    break;
+                };
+                appendJsonString(&buf, self.allocator, e.tool.description()) catch {
+                    ok = false;
+                    break;
+                };
+                buf.appendSlice(self.allocator, ",\"params_json\":") catch {
+                    ok = false;
+                    break;
+                };
+                appendJsonString(&buf, self.allocator, e.tool.parametersJson()) catch {
+                    ok = false;
+                    break;
+                };
+                buf.appendSlice(self.allocator, ",\"source\":") catch {
+                    ok = false;
+                    break;
+                };
+                appendJsonString(&buf, self.allocator, e.source) catch {
+                    ok = false;
+                    break;
+                };
+                buf.append(self.allocator, '}') catch {
+                    ok = false;
+                    break;
+                };
+            }
         }
         self.mutex.unlock();
 
-        buf.appendSlice(self.allocator, "\n]\n") catch {};
+        if (!ok) {
+            log.warn("writeCurrentToolsList: OOM during JSON construction; skipping write", .{});
+            return;
+        }
+
+        buf.appendSlice(self.allocator, "\n]\n") catch {
+            log.warn("writeCurrentToolsList: OOM during JSON finalization; skipping write", .{});
+            return;
+        };
 
         std.fs.cwd().writeFile(.{ .sub_path = out_path, .data = buf.items }) catch |err| {
             log.warn("writeCurrentToolsList '{s}': {}", .{ out_path, err });
