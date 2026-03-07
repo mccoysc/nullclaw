@@ -690,6 +690,10 @@ pub const SessionManager = struct {
 
     /// Process a message within a session context and optionally forward text deltas.
     /// Deltas are only emitted when provider streaming is active.
+    ///
+    /// Returns `error.RegistryDraining` immediately (without processing the message)
+    /// when the tool registry is mid-drain waiting for in-flight SO calls to finish.
+    /// Channel loops MUST handle this error and skip the message (do not reply).
     pub fn processMessageStreaming(
         self: *SessionManager,
         session_key: []const u8,
@@ -697,6 +701,15 @@ pub const SessionManager = struct {
         conversation_context: ?ConversationContext,
         stream_sink: ?streaming.Sink,
     ) ![]const u8 {
+        // Refuse new messages while SO libraries are being drained / unloaded.
+        // This is the single chokepoint for all channels.
+        if (self.tool_registry) |reg| {
+            if (reg.isPendingDrain()) {
+                log.warn("message rejected: tool registry is draining (plugin replacement in progress)", .{});
+                return error.RegistryDraining;
+            }
+        }
+
         const channel = if (conversation_context) |ctx| (ctx.channel orelse "unknown") else "unknown";
         const session_hash = std.hash.Wyhash.hash(0, session_key);
 
@@ -2715,4 +2728,21 @@ test "updateProvider propagates new provider to existing sessions" {
     // New session also gets mock_b.
     const s3 = try sm.getOrCreate("telegram:default:user3");
     try testing.expect(s3.agent.provider.ptr == @as(*anyopaque, @ptrCast(&mock_b)));
+}
+
+test "processMessage returns RegistryDraining error when registry is draining" {
+    const alloc = testing.allocator;
+    var mock = MockProvider{ .response = "should not be reached" };
+    const cfg = testConfig();
+    var sm = testSessionManager(alloc, &mock, &cfg);
+    defer sm.deinit();
+
+    // Create a registry and set it as draining.
+    var reg = tools_mod.ToolRegistry.init(alloc);
+    defer reg.deinit();
+    reg.draining.store(true, .release);
+    sm.tool_registry = &reg;
+
+    const result = sm.processMessage("drain:test", "hello", null);
+    try testing.expectError(error.RegistryDraining, result);
 }
