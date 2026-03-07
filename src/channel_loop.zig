@@ -65,8 +65,18 @@ fn processTelegramMessage(
     tg_ptr.startTyping(typing_target) catch {};
     defer tg_ptr.stopTyping(typing_target) catch {};
 
-    // Set ScheduleTool context for delivery
-    setScheduleToolContext(runtime.tools, sender);
+    // Set ScheduleTool context for delivery.
+    // When a registry is present, query it for the live tool list instead of
+    // using the potentially-stale runtime.tools snapshot.
+    if (runtime.tool_registry) |reg| {
+        reg.withSlice(sender, struct {
+            fn f(chat_id: []const u8, tools_slice: []const tools_mod.Tool) void {
+                setScheduleToolContext(tools_slice, chat_id);
+            }
+        }.f);
+    } else {
+        setScheduleToolContext(runtime.tools, sender);
+    }
 
     // Build conversation context for Telegram
     const conversation_context: ?ConversationContext = .{

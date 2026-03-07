@@ -915,7 +915,7 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                             self.tools.plugins.hot_reload_interval_secs = @intCast(v.integer);
                     }
                     // Parse helper: array of {kind, path} objects → []ExternalToolConfig
-                    const parseEntries = struct {
+                    const parse_entries = struct {
                         fn call(
                             alloc: std.mem.Allocator,
                             arr: std.json.Value,
@@ -947,9 +947,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                         }
                     }.call;
                     if (pl.object.get("add")) |arr|
-                        self.tools.plugins.add = try parseEntries(self.allocator, arr);
+                        self.tools.plugins.add = try parse_entries(self.allocator, arr);
                     if (pl.object.get("overwrite")) |arr|
-                        self.tools.plugins.overwrite = try parseEntries(self.allocator, arr);
+                        self.tools.plugins.overwrite = try parse_entries(self.allocator, arr);
                     if (pl.object.get("current_tools_list_path")) |v| {
                         if (v == .string)
                             self.tools.plugins.current_tools_list_path = try self.allocator.dupe(u8, v.string);

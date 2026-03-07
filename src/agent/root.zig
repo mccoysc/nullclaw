@@ -2630,8 +2630,14 @@ pub const Agent = struct {
 
         const trimmed_call_name = std.mem.trim(u8, call.name, " \t\r\n");
 
+        // Acquire SO ref count BEFORE copying tools from the registry.
+        // This prevents the hot-reload drain from completing while we hold
+        // a snapshot that may reference SO-backed tool pointers.
+        const has_registry = self.registry != null;
+        if (has_registry) self.registry.?.acquireSoCall();
+        defer if (has_registry) self.registry.?.releaseSoCall();
+
         // Resolve effective tool list: registry takes priority over static slice.
-        // For registry-backed tools we also manage SO reference counting.
         // When a registry is present, NEVER fall back to self.tools — doing so
         // would resurrect tools that were removed by overwrite/hot-reload.
         const effective_tools: []const Tool = if (self.registry) |reg| blk: {
@@ -2686,10 +2692,8 @@ pub const Agent = struct {
                     }
                 }
 
-                // Acquire SO ref count if this is a SO-backed tool.
-                const is_so = if (self.registry) |reg| reg.isSoTool(t) else false;
-                if (is_so) self.registry.?.acquireSoCall();
-                defer if (is_so) self.registry.?.releaseSoCall();
+                // SO ref count is already held for the entire executeTool scope
+                // (acquired before copySlice above), so no per-tool acquire needed.
 
                 const result = t.execute(tool_allocator, args) catch |err| {
                     return .{

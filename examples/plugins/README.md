@@ -3,6 +3,12 @@
 This directory contains ready-to-use examples for each of the three plugin
 kinds supported by nullclaw's dynamic tool registry.
 
+> **Security Warning:** Plugins execute arbitrary code with the same privileges
+> as the nullclaw process. Only load plugins from sources you trust. Shared
+> libraries (`so`/`dll`) run native code inside the host process; script
+> plugins (`python`/`node`) spawn child processes that inherit the environment.
+> Review every plugin before adding it to your configuration.
+
 ## Plugin kinds
 
 | Kind     | File                   | Runtime required           |

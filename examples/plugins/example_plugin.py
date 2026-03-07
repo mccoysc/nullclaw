@@ -52,11 +52,15 @@ TOOLS = [
 # ── Tool implementations ──────────────────────────────────────────
 
 def py_upper(args: dict) -> str:
-    return args.get("text", "").upper()
+    if "text" not in args or not isinstance(args["text"], str):
+        raise ValueError("Missing or invalid 'text' parameter")
+    return args["text"].upper()
 
 
 def py_word_count(args: dict) -> str:
-    words = args.get("text", "").split()
+    if "text" not in args or not isinstance(args["text"], str):
+        raise ValueError("Missing or invalid 'text' parameter")
+    words = args["text"].split()
     return str(len(words))
 
 

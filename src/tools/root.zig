@@ -580,18 +580,18 @@ pub fn buildInitialRegistry(
 
     // Transfer built-in tools into registry (each registered as "builtin").
     // On failure partway through: reg.deinit() (via errdefer) frees the already-
-    // registered tools (0..registered-1); the catch block below frees the
-    // unregistered remainder (registered..) and the slice itself.
+    // registered tools; the errdefer below frees the unregistered remainder
+    // and the slice itself.  This avoids the previous double-free where the
+    // catch block AND errdefer deinitTools both tried to free builtin_tools.
     var registered: usize = 0;
+    errdefer {
+        for (builtin_tools[registered..]) |remaining| {
+            remaining.deinit(allocator);
+        }
+        allocator.free(builtin_tools);
+    }
     for (builtin_tools) |t| {
         reg.register(t) catch |err| {
-            // Free the failed tool and all remaining unregistered tools.
-            // Already-registered tools (0..registered-1) are freed by
-            // errdefer reg.deinit() above.
-            for (builtin_tools[registered..]) |remaining| {
-                remaining.deinit(allocator);
-            }
-            allocator.free(builtin_tools);
             return err;
         };
         registered += 1;

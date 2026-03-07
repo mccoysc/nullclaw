@@ -313,9 +313,10 @@ pub fn loadScript(
         try list.append(allocator, w.tool());
     }
 
-    // Free interp AFTER toOwnedSlice to avoid double-free if toOwnedSlice
-    // fails (errdefer at top also frees interp on error paths).
-    const result = list.toOwnedSlice(allocator);
+    // Use `try` so that on OOM the errdefer at line 281 frees interp exactly
+    // once.  Without `try`, the unconditional free below would double-free
+    // when errdefer also fires.
+    const result = try list.toOwnedSlice(allocator);
     allocator.free(interp);
     return result;
 }
@@ -361,7 +362,8 @@ fn examplePath(allocator: Allocator, filename: []const u8) ![]const u8 {
 /// the error_msg may be a static literal — we only free when we know the
 /// test reached the success assertion.
 fn freeToolResult(allocator: Allocator, result: root.ToolResult) void {
-    if (result.output.len > 0) allocator.free(result.output);
+    // Free unconditionally: readToEndAlloc may return a heap-allocated empty slice.
+    allocator.free(result.output);
     if (result.error_msg) |e| allocator.free(e);
 }
 

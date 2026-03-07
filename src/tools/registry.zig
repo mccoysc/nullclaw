@@ -162,7 +162,10 @@ pub const ToolRegistry = struct {
             for (self.entries.items, 0..) |e, i| stack_buf[i] = e.tool;
             func(ctx, stack_buf[0..self.entries.items.len]);
         } else {
-            const heap = self.allocator.alloc(Tool, self.entries.items.len) catch return;
+            const heap = self.allocator.alloc(Tool, self.entries.items.len) catch {
+                log.err("withSlice: heap alloc failed for {d} tools; callback skipped", .{self.entries.items.len});
+                return;
+            };
             defer self.allocator.free(heap);
             for (self.entries.items, 0..) |e, i| heap[i] = e.tool;
             func(ctx, heap);
@@ -587,7 +590,14 @@ pub const ToolRegistry = struct {
 
     fn loadScript(self: *ToolRegistry, kind: loader_script.ScriptKind, path: []const u8) !LoadedBatch {
         const raw_tools = try loader_script.loadScript(self.allocator, kind, path);
+        // On mid-loop OOM the errdefer below frees already-moved tools via
+        // tools_list; we must also free the NOT-yet-moved remainder of raw_tools.
+        // Track how many have been moved so we can free [moved..] on error.
+        var raw_moved: usize = 0;
         defer self.allocator.free(raw_tools);
+        errdefer {
+            for (raw_tools[raw_moved..]) |t| t.deinit(self.allocator);
+        }
 
         const source_tag = try std.fmt.allocPrint(self.allocator, "script:{s}", .{path});
         defer self.allocator.free(source_tag);
@@ -605,6 +615,7 @@ pub const ToolRegistry = struct {
 
         for (raw_tools) |t| {
             try tools_list.append(self.allocator, t);
+            raw_moved += 1;
             try sources_list.append(self.allocator, try self.allocator.dupe(u8, source_tag));
             try slot_ids_list.append(self.allocator, null);
         }

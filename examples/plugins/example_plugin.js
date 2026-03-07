@@ -51,11 +51,17 @@ const TOOLS = [
 // ── Tool implementations ─────────────────────────────────────────
 
 function js_reverse(args) {
-  return (args.text || '').split('').reverse().join('');
+  if (!args || typeof args.text !== 'string') {
+    throw new Error("Missing or invalid 'text' parameter");
+  }
+  return args.text.split('').reverse().join('');
 }
 
 function js_char_count(args) {
-  return String((args.text || '').length);
+  if (!args || typeof args.text !== 'string') {
+    throw new Error("Missing or invalid 'text' parameter");
+  }
+  return String(args.text.length);
 }
 
 const HANDLERS = { js_reverse, js_char_count };

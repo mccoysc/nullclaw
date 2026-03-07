@@ -77,8 +77,15 @@ static bool so_reverse_execute(const char *args_json,
         while (*p == ' ' || *p == '\t') p++;
         if (*p == '"') {
             p++;
-            const char *end = strchr(p, '"');
-            if (end) { src = p; src_len = (size_t)(end - p); }
+            /* Walk the string handling backslash escapes so that escaped
+             * quotes (e.g. \"hello\") don't terminate the scan early. */
+            const char *start = p;
+            while (*p && *p != '"') {
+                if (*p == '\\' && *(p + 1)) p++; /* skip escaped char */
+                p++;
+            }
+            src = start;
+            src_len = (size_t)(p - start);
         }
     }
 
