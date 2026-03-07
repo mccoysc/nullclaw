@@ -12,6 +12,7 @@ set -euo pipefail
 
 ZIG_VERSION="0.15.2"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ZIG_DOWNLOAD_INDEX="https://ziglang.org/download/index.json"
 
 # Detect OS and architecture
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
@@ -54,6 +55,31 @@ echo "  Destination: ${DEST_DIR}"
 
 cd "$SCRIPT_DIR"
 
+# Fetch expected SHA256 from the official download index.
+EXPECTED_SHA256=""
+if command -v python3 &>/dev/null; then
+  FETCH_CMD=""
+  if command -v curl &>/dev/null; then
+    FETCH_CMD="curl -sL --fail"
+  elif command -v wget &>/dev/null; then
+    FETCH_CMD="wget -qO-"
+  fi
+  if [ -n "$FETCH_CMD" ]; then
+    EXPECTED_SHA256="$($FETCH_CMD "$ZIG_DOWNLOAD_INDEX" 2>/dev/null \
+      | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    pkg = '${ZIG_OS}-${ZIG_ARCH}'
+    info = d.get('${ZIG_VERSION}', {}).get(pkg, {})
+    print(info.get('shasum', ''))
+except Exception:
+    pass
+" 2>/dev/null || true)"
+  fi
+fi
+
+# Download the tarball.
 if command -v curl &>/dev/null; then
   curl -L --fail --progress-bar -o "${TARBALL}" "${DOWNLOAD_URL}"
 elif command -v wget &>/dev/null; then
@@ -63,8 +89,47 @@ else
   exit 1
 fi
 
+# Verify SHA256 checksum if we were able to retrieve one.
+if [ -n "$EXPECTED_SHA256" ]; then
+  echo "Verifying checksum..."
+  if command -v sha256sum &>/dev/null; then
+    ACTUAL_SHA256="$(sha256sum "${TARBALL}" | awk '{print $1}')"
+  elif command -v shasum &>/dev/null; then
+    ACTUAL_SHA256="$(shasum -a 256 "${TARBALL}" | awk '{print $1}')"
+  else
+    echo "Warning: neither sha256sum nor shasum found; skipping checksum verification." >&2
+    ACTUAL_SHA256=""
+  fi
+  if [ -n "$ACTUAL_SHA256" ]; then
+    if [ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]; then
+      echo "Checksum mismatch for ${TARBALL}:" >&2
+      echo "  expected: ${EXPECTED_SHA256}" >&2
+      echo "  actual:   ${ACTUAL_SHA256}" >&2
+      rm -f "${TARBALL}"
+      exit 1
+    fi
+    echo "  Checksum OK (${ACTUAL_SHA256:0:16}...)"
+  fi
+else
+  echo "Warning: could not fetch checksum from ${ZIG_DOWNLOAD_INDEX}; skipping verification." >&2
+fi
+
 echo "Extracting ${TARBALL}..."
-tar -xJf "${TARBALL}"
+# Extract to a temporary directory first, then verify the top-level directory
+# matches the expected package name to guard against unexpected layout.
+TMPDIR_EXTRACT="$(mktemp -d "${SCRIPT_DIR}/.zig-extract-XXXXXX")"
+trap 'rm -rf "${TMPDIR_EXTRACT}"' EXIT
+
+tar -xJf "${TARBALL}" -C "${TMPDIR_EXTRACT}"
+
+EXTRACTED_DIRS=("${TMPDIR_EXTRACT}"/*)
+if [ "${#EXTRACTED_DIRS[@]}" -ne 1 ] || [ "$(basename "${EXTRACTED_DIRS[0]}")" != "${PACKAGE_NAME}" ]; then
+  echo "Unexpected extraction layout in ${TARBALL}:" >&2
+  ls "${TMPDIR_EXTRACT}" >&2
+  exit 1
+fi
+
+mv "${EXTRACTED_DIRS[0]}" "${DEST_DIR}"
 rm -f "${TARBALL}"
 
 echo ""
