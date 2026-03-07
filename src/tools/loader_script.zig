@@ -328,10 +328,12 @@ fn runList(allocator: Allocator, interp: []const u8, script_path: []const u8) ![
             "{}";
 
         // Validate params_json is parseable as a JSON value.
-        _ = std.json.parseFromSlice(std.json.Value, allocator, params, .{}) catch {
+        // We must deinit the result to free the arena allocated by parseFromSlice.
+        const validation = std.json.parseFromSlice(std.json.Value, allocator, params, .{}) catch {
             log.warn("script discovery: skipping tool '{s}' with invalid params_json", .{name_v.string});
             continue;
         };
+        validation.deinit();
 
         try out.ensureUnusedCapacity(allocator, 1);
         const name_d = try allocator.dupe(u8, name_v.string);

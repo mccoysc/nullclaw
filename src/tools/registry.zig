@@ -605,7 +605,11 @@ pub const ToolRegistry = struct {
 
         for (opened.metas) |meta| {
             const w = try loader_so.wrapMeta(self.allocator, meta, slot_id);
-            try tools_list.append(self.allocator, w.tool());
+            // If any append below fails, free the wrapper we just created.
+            tools_list.append(self.allocator, w.tool()) catch |err| {
+                w.tool().deinit(self.allocator);
+                return err;
+            };
             try sources_list.append(self.allocator, try self.allocator.dupe(u8, source_tag));
             try slot_ids_list.append(self.allocator, slot_id);
         }
@@ -697,7 +701,7 @@ pub const ToolRegistry = struct {
     pub fn writeCurrentToolsList(self: *ToolRegistry) void {
         const out_path = self.current_tools_list_path orelse return;
 
-        var buf: std.ArrayList(u8) = .empty;
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
         defer buf.deinit(self.allocator);
 
         self.mutex.lock();
@@ -725,7 +729,7 @@ pub const ToolRegistry = struct {
         };
     }
 
-    fn appendJsonString(buf: *std.ArrayList(u8), allocator: Allocator, s: []const u8) !void {
+    fn appendJsonString(buf: *std.ArrayListUnmanaged(u8), allocator: Allocator, s: []const u8) !void {
         try buf.append(allocator, '"');
         for (s) |c| switch (c) {
             '"' => try buf.appendSlice(allocator, "\\\""),
