@@ -434,7 +434,7 @@ pub const ArduinoPeripheral = struct {
         // Drain stderr to avoid pipe deadlock
         if (compile_child.stderr) |*err_pipe| {
             const data = err_pipe.readToEndAlloc(allocator, 64 * 1024) catch null;
-            defer if (data) |d| allocator.free(d);
+            if (data) |d| allocator.free(d);
         }
         const compile_term = compile_child.wait() catch return Peripheral.PeripheralError.FlashFailed;
         const compile_ok = switch (compile_term) {
@@ -453,7 +453,7 @@ pub const ArduinoPeripheral = struct {
         upload_child.spawn() catch return Peripheral.PeripheralError.FlashFailed;
         if (upload_child.stderr) |*err_pipe| {
             const data = err_pipe.readToEndAlloc(allocator, 64 * 1024) catch null;
-            defer if (data) |d| allocator.free(d);
+            if (data) |d| allocator.free(d);
         }
         const upload_term = upload_child.wait() catch return Peripheral.PeripheralError.FlashFailed;
         const upload_ok = switch (upload_term) {
@@ -479,230 +479,6 @@ pub const ArduinoPeripheral = struct {
     pub fn isArduinoCliAvailable(allocator: std.mem.Allocator) bool {
         var child = std.process.Child.init(
             &.{ "arduino-cli", "version" },
-            allocator,
-        );
-        child.stdout_behavior = .Ignore;
-        child.stderr_behavior = .Ignore;
-        child.spawn() catch return false;
-        const term = child.wait() catch return false;
-        return switch (term) {
-            .Exited => |code| code == 0,
-            else => false,
-        };
-    }
-};
-
-// ── Esp32Peripheral ────────────────────────────────────────────
-
-/// ESP32 peripheral: GPIO/ADC over serial JSON, firmware flash via esptool.py.
-///
-/// Architecture notes (vs native/Arduino):
-///   - CPU: Dual-core Xtensa LX6 at 240 MHz (not AVR/ARM).
-///   - GPIO: GPIO0-GPIO31 bidirectional; GPIO32-GPIO39 are ADC1 input-only.
-///   - ADC: 18 channels on GPIO32-GPIO39 (12-bit); use "adc_read" JSON command.
-///   - Flash tool: esptool.py (not arduino-cli / probe-rs).
-///   - Flash command: esptool.py --port PORT --baud BAUD write_flash 0x0 FIRMWARE
-///   - Serial protocol: same newline-delimited JSON as ArduinoPeripheral.
-///   - USB bridge: CP2102 (VID 0x10c4) or CH340 (VID 0x1a86) — not native USB CDC.
-///
-/// Compilation differences vs native (x86_64/aarch64):
-///   - Target triple: xtensa-esp32-none-elf (bare-metal, no OS).
-///   - Toolchain: xtensa-esp32-elf-gcc / ESP-IDF (not zig build / musl).
-///   - No libc, no filesystem, no heap by default — uses FreeRTOS primitives.
-///   - Zig cross-compile: `zig build -Dtarget=xtensa-esp32-none` is not yet
-///     officially supported; use ESP-IDF CMake + zig cc shim instead.
-pub const Esp32Peripheral = struct {
-    allocator: std.mem.Allocator,
-    port_path: []const u8,
-    baud_rate: u32,
-    connected: bool = false,
-    serial_file: ?std.fs.File = null,
-    msg_id: u32 = 0,
-
-    /// GPIO32-GPIO39 are ADC1 input-only on ESP32 — cannot be used as digital outputs.
-    const ADC_PIN_THRESHOLD: u32 = 32;
-    /// ESP32 exposes GPIO0-GPIO39 (40 pins total).
-    const MAX_GPIO_PIN: u32 = 39;
-
-    const esp32_vtable = Peripheral.VTable{
-        .name = esp32Name,
-        .board_type = esp32BoardType,
-        .health_check = esp32HealthCheck,
-        .init_peripheral = esp32Init,
-        .read = esp32Read,
-        .write = esp32Write,
-        .flash = esp32Flash,
-        .capabilities = esp32Capabilities,
-    };
-
-    pub fn create(allocator: std.mem.Allocator, port_path: []const u8, baud: u32) Esp32Peripheral {
-        return .{
-            .allocator = allocator,
-            .port_path = port_path,
-            .baud_rate = baud,
-        };
-    }
-
-    pub fn peripheral(self: *Esp32Peripheral) Peripheral {
-        return .{
-            .ptr = @ptrCast(self),
-            .vtable = &esp32_vtable,
-        };
-    }
-
-    fn resolve(ptr: *anyopaque) *Esp32Peripheral {
-        return @ptrCast(@alignCast(ptr));
-    }
-
-    fn esp32Name(_: *anyopaque) []const u8 {
-        return "esp32";
-    }
-
-    fn esp32BoardType(_: *anyopaque) []const u8 {
-        return "esp32";
-    }
-
-    fn esp32HealthCheck(ptr: *anyopaque) bool {
-        return resolve(ptr).connected;
-    }
-
-    fn esp32Init(ptr: *anyopaque) Peripheral.PeripheralError!void {
-        const self = resolve(ptr);
-        const allocator = self.allocator;
-        // Confirm esptool.py is present on the host — the primary ESP32 flash tool.
-        var child = std.process.Child.init(
-            &.{ "esptool.py", "version" },
-            allocator,
-        );
-        child.stdout_behavior = .Ignore;
-        child.stderr_behavior = .Ignore;
-        child.spawn() catch {
-            self.connected = false;
-            return Peripheral.PeripheralError.DeviceNotFound;
-        };
-        const term = child.wait() catch {
-            self.connected = false;
-            return Peripheral.PeripheralError.DeviceNotFound;
-        };
-        const exited_ok = switch (term) {
-            .Exited => |code| code == 0,
-            else => false,
-        };
-        if (!exited_ok) {
-            self.connected = false;
-            return Peripheral.PeripheralError.DeviceNotFound;
-        }
-        self.connected = true;
-        // Open serial port for GPIO/ADC read-write communication.
-        if (isSerialPathAllowed(self.port_path)) {
-            const file = std.fs.openFileAbsolute(self.port_path, .{ .mode = .read_write }) catch return;
-            self.serial_file = file;
-        }
-    }
-
-    /// Read a GPIO or ADC pin value.
-    /// GPIO0-GPIO31: digital read via "gpio_read" JSON command.
-    /// GPIO32-GPIO39: ADC read via "adc_read" JSON command (returns 0-255 scaled value).
-    fn esp32Read(ptr: *anyopaque, addr: u32) Peripheral.PeripheralError!u8 {
-        const self = resolve(ptr);
-        if (!self.connected) return Peripheral.PeripheralError.NotConnected;
-        if (addr > MAX_GPIO_PIN) return Peripheral.PeripheralError.InvalidAddress;
-        const file = self.serial_file orelse return Peripheral.PeripheralError.NotConnected;
-
-        self.msg_id +%= 1;
-        var cmd_buf: [256]u8 = undefined;
-        // GPIO32-GPIO39 are ADC-only — dispatch to the "adc_read" command.
-        const cmd = if (addr >= ADC_PIN_THRESHOLD)
-            std.fmt.bufPrint(&cmd_buf, "{{\"id\":\"{d}\",\"cmd\":\"adc_read\",\"args\":{{\"pin\":{d}}}}}\n", .{ self.msg_id, addr }) catch
-                return Peripheral.PeripheralError.IoError
-        else
-            std.fmt.bufPrint(&cmd_buf, "{{\"id\":\"{d}\",\"cmd\":\"gpio_read\",\"args\":{{\"pin\":{d}}}}}\n", .{ self.msg_id, addr }) catch
-                return Peripheral.PeripheralError.IoError;
-
-        file.writeAll(cmd) catch return Peripheral.PeripheralError.IoError;
-
-        var resp_buf: [512]u8 = undefined;
-        const n = file.read(&resp_buf) catch return Peripheral.PeripheralError.IoError;
-        if (n == 0) return Peripheral.PeripheralError.Timeout;
-
-        return SerialPeripheral.parseResultValue(resp_buf[0..n]);
-    }
-
-    /// Write a GPIO pin value.
-    /// GPIO32-GPIO39 are ADC input-only and cannot be driven as outputs.
-    fn esp32Write(ptr: *anyopaque, addr: u32, data: u8) Peripheral.PeripheralError!void {
-        const self = resolve(ptr);
-        if (!self.connected) return Peripheral.PeripheralError.NotConnected;
-        if (addr > MAX_GPIO_PIN) return Peripheral.PeripheralError.InvalidAddress;
-        // GPIO32-GPIO39 are ADC input-only on ESP32 — reject write attempts.
-        if (addr >= ADC_PIN_THRESHOLD) return Peripheral.PeripheralError.UnsupportedOperation;
-        const file = self.serial_file orelse return Peripheral.PeripheralError.NotConnected;
-
-        self.msg_id +%= 1;
-        var cmd_buf: [256]u8 = undefined;
-        const cmd = std.fmt.bufPrint(&cmd_buf, "{{\"id\":\"{d}\",\"cmd\":\"gpio_write\",\"args\":{{\"pin\":{d},\"value\":{d}}}}}\n", .{ self.msg_id, addr, data }) catch
-            return Peripheral.PeripheralError.IoError;
-
-        file.writeAll(cmd) catch return Peripheral.PeripheralError.IoError;
-
-        var resp_buf: [512]u8 = undefined;
-        const n = file.read(&resp_buf) catch return Peripheral.PeripheralError.IoError;
-        if (n == 0) return Peripheral.PeripheralError.Timeout;
-
-        if (std.mem.indexOf(u8, resp_buf[0..n], "\"ok\":true") == null) {
-            return Peripheral.PeripheralError.IoError;
-        }
-    }
-
-    /// Flash firmware using esptool.py.
-    /// Equivalent to: esptool.py --port PORT --baud BAUD write_flash 0x0 FIRMWARE
-    fn esp32Flash(ptr: *anyopaque, firmware_path: []const u8) Peripheral.PeripheralError!void {
-        const self = resolve(ptr);
-        if (!self.connected) return Peripheral.PeripheralError.NotConnected;
-        if (firmware_path.len == 0) return Peripheral.PeripheralError.FlashFailed;
-        const allocator = self.allocator;
-
-        var baud_buf: [16]u8 = undefined;
-        const baud_str = std.fmt.bufPrint(&baud_buf, "{d}", .{self.baud_rate}) catch
-            return Peripheral.PeripheralError.FlashFailed;
-
-        var child = std.process.Child.init(
-            &.{ "esptool.py", "--port", self.port_path, "--baud", baud_str, "write_flash", "0x0", firmware_path },
-            allocator,
-        );
-        child.stdout_behavior = .Ignore;
-        child.stderr_behavior = .Pipe;
-        child.spawn() catch return Peripheral.PeripheralError.FlashFailed;
-        // Drain stderr to avoid pipe deadlock.
-        if (child.stderr) |*err_pipe| {
-            const drained = err_pipe.readToEndAlloc(allocator, 64 * 1024) catch null;
-            defer if (drained) |d| allocator.free(d);
-        }
-        const term = child.wait() catch return Peripheral.PeripheralError.FlashFailed;
-        const ok = switch (term) {
-            .Exited => |code| code == 0,
-            else => false,
-        };
-        if (!ok) return Peripheral.PeripheralError.FlashFailed;
-    }
-
-    fn esp32Capabilities(_: *anyopaque) PeripheralCapabilities {
-        return .{
-            .board_name = "esp32",
-            .board_type = "esp32",
-            .gpio_pins = "GPIO0-GPIO39",
-            .flash_size_kb = 4096,
-            .has_serial = true,
-            .has_gpio = true,
-            .has_flash = true,
-            .has_adc = true,
-        };
-    }
-
-    /// Check if esptool.py is available on the system.
-    pub fn isEsptoolAvailable(allocator: std.mem.Allocator) bool {
-        var child = std.process.Child.init(
-            &.{ "esptool.py", "version" },
             allocator,
         );
         child.stdout_behavior = .Ignore;
@@ -1029,8 +805,8 @@ pub const NucleoFlash = struct {
         child.spawn() catch return Peripheral.PeripheralError.IoError;
         // Drain stderr to avoid pipe deadlock
         if (child.stderr) |*err_pipe| {
-            const drained = err_pipe.readToEndAlloc(self.allocator, 64 * 1024) catch null;
-            defer if (drained) |d| self.allocator.free(d);
+            const data = err_pipe.readToEndAlloc(self.allocator, 64 * 1024) catch null;
+            if (data) |d| self.allocator.free(d);
         }
         const term = child.wait() catch return Peripheral.PeripheralError.IoError;
         const exited_ok = switch (term) {
@@ -1056,11 +832,11 @@ pub const NucleoFlash = struct {
         // Drain pipes to avoid deadlock
         if (child.stdout) |*out| {
             const data = out.readToEndAlloc(allocator, 64 * 1024) catch null;
-            defer if (data) |d| allocator.free(d);
+            if (data) |d| allocator.free(d);
         }
         if (child.stderr) |*err_pipe| {
             const data = err_pipe.readToEndAlloc(allocator, 64 * 1024) catch null;
-            defer if (data) |d| allocator.free(d);
+            if (data) |d| allocator.free(d);
         }
         const term = child.wait() catch return Peripheral.PeripheralError.FlashFailed;
         const ok = switch (term) {
@@ -1553,70 +1329,6 @@ test "NucleoFlash flash with empty path fails" {
     var nucleo = NucleoFlash.createF401(std.testing.allocator);
     nucleo.connected = true;
     const p = nucleo.peripheral();
-    try std.testing.expectError(Peripheral.PeripheralError.FlashFailed, p.flashFirmware(""));
-}
-
-test "Esp32Peripheral vtable works" {
-    var esp32 = Esp32Peripheral.create(std.testing.allocator, "/dev/ttyUSB0", 115200);
-    const p = esp32.peripheral();
-    try std.testing.expectEqualStrings("esp32", p.name());
-    try std.testing.expectEqualStrings("esp32", p.boardType());
-    try std.testing.expect(!p.healthCheck());
-    const caps = p.getCapabilities();
-    try std.testing.expect(caps.has_gpio);
-    try std.testing.expect(caps.has_flash);
-    try std.testing.expect(caps.has_adc);
-    try std.testing.expect(caps.has_serial);
-    try std.testing.expectEqual(@as(u32, 4096), caps.flash_size_kb);
-    try std.testing.expectEqualStrings("GPIO0-GPIO39", caps.gpio_pins);
-}
-
-test "Esp32Peripheral read fails when not connected" {
-    var esp32 = Esp32Peripheral.create(std.testing.allocator, "/dev/ttyUSB0", 115200);
-    const p = esp32.peripheral();
-    try std.testing.expectError(Peripheral.PeripheralError.NotConnected, p.read(2));
-}
-
-test "Esp32Peripheral read rejects out-of-range pin" {
-    var esp32 = Esp32Peripheral.create(std.testing.allocator, "/dev/ttyUSB0", 115200);
-    esp32.connected = true;
-    const p = esp32.peripheral();
-    try std.testing.expectError(Peripheral.PeripheralError.InvalidAddress, p.read(40));
-}
-
-test "Esp32Peripheral write fails when not connected" {
-    var esp32 = Esp32Peripheral.create(std.testing.allocator, "/dev/ttyUSB0", 115200);
-    const p = esp32.peripheral();
-    try std.testing.expectError(Peripheral.PeripheralError.NotConnected, p.writeByte(2, 1));
-}
-
-test "Esp32Peripheral write rejects ADC-only pin" {
-    var esp32 = Esp32Peripheral.create(std.testing.allocator, "/dev/ttyUSB0", 115200);
-    esp32.connected = true;
-    const p = esp32.peripheral();
-    // GPIO32-GPIO39 are ADC input-only on ESP32 -- cannot be driven as outputs.
-    try std.testing.expectError(Peripheral.PeripheralError.UnsupportedOperation, p.writeByte(32, 1));
-    try std.testing.expectError(Peripheral.PeripheralError.UnsupportedOperation, p.writeByte(35, 0));
-    try std.testing.expectError(Peripheral.PeripheralError.UnsupportedOperation, p.writeByte(39, 1));
-}
-
-test "Esp32Peripheral write rejects out-of-range pin" {
-    var esp32 = Esp32Peripheral.create(std.testing.allocator, "/dev/ttyUSB0", 115200);
-    esp32.connected = true;
-    const p = esp32.peripheral();
-    try std.testing.expectError(Peripheral.PeripheralError.InvalidAddress, p.writeByte(40, 1));
-}
-
-test "Esp32Peripheral flash fails when not connected" {
-    var esp32 = Esp32Peripheral.create(std.testing.allocator, "/dev/ttyUSB0", 115200);
-    const p = esp32.peripheral();
-    try std.testing.expectError(Peripheral.PeripheralError.NotConnected, p.flashFirmware("firmware.bin"));
-}
-
-test "Esp32Peripheral flash with empty path fails" {
-    var esp32 = Esp32Peripheral.create(std.testing.allocator, "/dev/ttyUSB0", 115200);
-    esp32.connected = true;
-    const p = esp32.peripheral();
     try std.testing.expectError(Peripheral.PeripheralError.FlashFailed, p.flashFirmware(""));
 }
 
