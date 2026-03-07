@@ -20,7 +20,7 @@ NullClaw 采用 vtable 可插拔架构。多数能力通过接口实现并在工
 | Runtime | `RuntimeAdapter` | Native、Docker、WASM | 新增 runtime adapter |
 | Security | `Sandbox` | Landlock、Firejail、Bubblewrap、Docker(auto) | 新增 sandbox backend |
 | Tunnel | `Tunnel` | None、Cloudflare、Tailscale、ngrok、Custom | 新增 tunnel provider |
-| Peripheral | `Peripheral` | Serial、Arduino、RPi GPIO、STM32/Nucleo | 新增硬件外设驱动 |
+| Peripheral | `Peripheral` | Serial、Arduino、RPi GPIO、STM32/Nucleo、**ESP32** | 新增硬件外设驱动 |
 
 ## Memory 子系统
 

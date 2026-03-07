@@ -675,7 +675,8 @@ pub const Esp32Peripheral = struct {
         child.spawn() catch return Peripheral.PeripheralError.FlashFailed;
         // Drain stderr to avoid pipe deadlock.
         if (child.stderr) |*err_pipe| {
-            _ = err_pipe.readToEndAlloc(allocator, 64 * 1024) catch {};
+            const drained = err_pipe.readToEndAlloc(allocator, 64 * 1024) catch null;
+            defer if (drained) |d| allocator.free(d);
         }
         const term = child.wait() catch return Peripheral.PeripheralError.FlashFailed;
         const ok = switch (term) {
