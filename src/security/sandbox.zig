@@ -1,5 +1,3 @@
-const std = @import("std");
-
 /// Sandbox backend vtable interface for OS-level isolation.
 /// In Zig, we use a vtable pattern instead of Rust's trait objects.
 pub const Sandbox = struct {

@@ -6,7 +6,6 @@
 
 const std = @import("std");
 const root = @import("root.zig");
-const sse = @import("sse.zig");
 const platform = @import("../platform.zig");
 const auth = @import("../auth.zig");
 const http_util = @import("../http_util.zig");
