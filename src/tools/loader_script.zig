@@ -38,17 +38,20 @@ const call_timeout_ns: u64 = 120 * std.time.ns_per_s;
 /// Poll interval when checking if a child has exited.
 const poll_interval_ns: u64 = 50 * std.time.ns_per_ms; // 50 ms
 
-/// Wait for a child process with a timeout.  Spawns a watchdog thread
-/// that sends SIGKILL after `timeout_ns`.  The main thread calls the
-/// normal `child.wait()` which will return once the child exits (or is
-/// killed).  Returns `error.ScriptTimeout` if the child was killed.
+/// Wait for a child process with a timeout.
+///
+/// * **Windows** – uses `WaitForSingleObject(hProcess, timeout_ms)`.
+///   On timeout the process is killed with `TerminateProcess` and
+///   `error.ScriptTimeout` is returned.
+/// * **POSIX** – spawns a watchdog thread that sends SIGKILL after
+///   `timeout_ns`.  The main thread calls `child.wait()`.
+///
+/// Returns `error.ScriptTimeout` if the child was killed by the timeout.
 fn waitWithTimeout(child: *std.process.Child, timeout_ns: u64) !std.process.Child.Term {
     const builtin = @import("builtin");
 
-    // On Windows there is no POSIX kill(); return an explicit error so
-    // callers get a deterministic failure instead of an unbounded hang.
     if (comptime builtin.os.tag == .windows) {
-        return error.ScriptTimeoutUnsupportedOnWindows;
+        return waitWithTimeoutWindows(child, timeout_ns);
     }
 
     const pid = child.id;
@@ -88,6 +91,32 @@ fn waitWithTimeout(child: *std.process.Child, timeout_ns: u64) !std.process.Chil
         else => {},
     }
     return term;
+}
+
+/// Windows implementation: WaitForSingleObject with a millisecond timeout.
+/// If the wait times out, TerminateProcess is called and ScriptTimeout returned.
+fn waitWithTimeoutWindows(child: *std.process.Child, timeout_ns: u64) !std.process.Child.Term {
+    const windows = std.os.windows;
+    const timeout_ms: windows.DWORD = @intCast(@min(timeout_ns / std.time.ns_per_ms, std.math.maxInt(windows.DWORD)));
+
+    // Wait for the process to exit or timeout.
+    windows.WaitForSingleObjectEx(child.id, timeout_ms, false) catch |err| switch (err) {
+        error.WaitTimeOut => {
+            // Timeout — kill the child process.
+            windows.TerminateProcess(child.id, 1) catch {};
+            // Reap the handle so child.wait() can clean up.
+            _ = child.wait() catch {};
+            return error.ScriptTimeout;
+        },
+        else => {
+            // Unexpected wait error — fall back to blocking wait.
+            return child.wait();
+        },
+    };
+
+    // Process exited within the timeout — let child.wait() harvest the
+    // exit code and clean up handles.
+    return child.wait();
 }
 
 // ── Temp-file helpers ───────────────────────────────────────────
