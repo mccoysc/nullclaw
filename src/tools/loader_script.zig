@@ -313,6 +313,11 @@ fn runList(allocator: Allocator, interp: []const u8, script_path: []const u8) ![
         if (item != .object) continue;
         const name_v = item.object.get("name") orelse continue;
         if (name_v != .string) continue;
+        // Skip empty tool names — they would create un-callable tools.
+        if (name_v.string.len == 0) {
+            log.warn("script discovery: skipping tool with empty name", .{});
+            continue;
+        }
         const desc = if (item.object.get("description")) |d|
             (if (d == .string) d.string else "")
         else
@@ -322,10 +327,23 @@ fn runList(allocator: Allocator, interp: []const u8, script_path: []const u8) ![
         else
             "{}";
 
-        try out.append(allocator, .{
-            .name = try allocator.dupe(u8, name_v.string),
-            .description = try allocator.dupe(u8, desc),
-            .params_json = try allocator.dupe(u8, params),
+        // Validate params_json is parseable as a JSON value.
+        _ = std.json.parseFromSlice(std.json.Value, allocator, params, .{}) catch {
+            log.warn("script discovery: skipping tool '{s}' with invalid params_json", .{name_v.string});
+            continue;
+        };
+
+        try out.ensureUnusedCapacity(allocator, 1);
+        const name_d = try allocator.dupe(u8, name_v.string);
+        errdefer allocator.free(name_d);
+        const desc_d = try allocator.dupe(u8, desc);
+        errdefer allocator.free(desc_d);
+        const params_d = try allocator.dupe(u8, params);
+        // ensureUnusedCapacity guarantees appendAssumeCapacity won't fail.
+        out.appendAssumeCapacity(.{
+            .name = name_d,
+            .description = desc_d,
+            .params_json = params_d,
         });
     }
     return out.toOwnedSlice(allocator);
@@ -368,13 +386,24 @@ pub fn loadScript(
     for (defs) |def| {
         const w = try allocator.create(ScriptToolWrapper);
         errdefer allocator.destroy(w);
+        // Stage each dupe in a local with errdefer so partial failures
+        // don't leak earlier allocations.
+        const interp_d = try allocator.dupe(u8, interp);
+        errdefer allocator.free(interp_d);
+        const path_d = try allocator.dupe(u8, abs_path);
+        errdefer allocator.free(path_d);
+        const name_d = try allocator.dupe(u8, def.name);
+        errdefer allocator.free(name_d);
+        const desc_d = try allocator.dupe(u8, def.description);
+        errdefer allocator.free(desc_d);
+        const params_d = try allocator.dupe(u8, def.params_json);
         w.* = .{
             .allocator = allocator,
-            .interp = try allocator.dupe(u8, interp),
-            .script_path = try allocator.dupe(u8, abs_path),
-            .name_buf = try allocator.dupe(u8, def.name),
-            .description_buf = try allocator.dupe(u8, def.description),
-            .params_json_buf = try allocator.dupe(u8, def.params_json),
+            .interp = interp_d,
+            .script_path = path_d,
+            .name_buf = name_d,
+            .description_buf = desc_d,
+            .params_json_buf = params_d,
         };
         try list.append(allocator, w.tool());
     }
@@ -426,9 +455,13 @@ fn examplePath(allocator: Allocator, filename: []const u8) ![]const u8 {
 /// Helper: free a ToolResult produced by a ScriptToolWrapper.
 /// On success the output is heap-allocated (read from temp file); on failure
 /// the error_msg may be a static literal — we only free when we know the
-/// test reached the success assertion.
+/// test reached the success path.
+///
+/// Only call this for results where `result.success == true`.  Failed results
+/// may contain static string literals in `.output` / `.error_msg` that must
+/// NOT be passed to allocator.free().
 fn freeToolResult(allocator: Allocator, result: root.ToolResult) void {
-    // Free unconditionally: readToEndAlloc may return a heap-allocated empty slice.
+    if (!result.success) return; // static literals — nothing to free
     allocator.free(result.output);
     if (result.error_msg) |e| allocator.free(e);
 }

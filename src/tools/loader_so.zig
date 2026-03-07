@@ -203,10 +203,17 @@ pub fn openSo(allocator: Allocator, path: []const u8) !struct {
     }
 
     for (defs_ptr[0..count]) |def| {
-        try metas.append(allocator, .{
-            .name = try allocator.dupe(u8, std.mem.span(def.name)),
-            .description = try allocator.dupe(u8, std.mem.span(def.description)),
-            .params_json = try allocator.dupe(u8, std.mem.span(def.params_json)),
+        try metas.ensureUnusedCapacity(allocator, 1);
+        const name = try allocator.dupe(u8, std.mem.span(def.name));
+        errdefer allocator.free(name);
+        const description = try allocator.dupe(u8, std.mem.span(def.description));
+        errdefer allocator.free(description);
+        const params_json = try allocator.dupe(u8, std.mem.span(def.params_json));
+        // ensureUnusedCapacity guarantees appendAssumeCapacity won't fail.
+        metas.appendAssumeCapacity(.{
+            .name = name,
+            .description = description,
+            .params_json = params_json,
             .execute_fn = def.execute,
         });
     }

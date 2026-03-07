@@ -237,9 +237,11 @@ pub const Agent = struct {
     /// Optional dynamic registry. When set, executeTool() dispatches via the
     /// registry (with SO ref-counting). Must remain alive for the agent's lifetime.
     registry: ?*ToolRegistry = null,
-    /// Set to true when registry contents have changed so tool_specs are rebuilt
-    /// before the next LLM call.
-    tool_specs_dirty: bool = false,
+    /// Cached registry generation — compared against registry.generation at
+    /// the start of each turn to detect staleness and trigger a refresh of
+    /// tool_specs + tools snapshot.  Replaces the old boolean tool_specs_dirty
+    /// flag which was never set to true.
+    cached_registry_generation: u64 = 0,
     mem: ?Memory,
     bootstrap: ?bootstrap_mod.BootstrapProvider = null,
     session_store: ?memory_mod.SessionStore = null,
@@ -531,47 +533,36 @@ pub const Agent = struct {
     /// Rebuild tool_specs from the registry.
     /// Call after adding/removing tools from the registry to keep the LLM
     /// function-calling schema in sync.
+    ///
+    /// The ToolSpec fields (.name, .description, .parameters_json) are
+    /// borrowed pointers into the Tool vtable / wrapper structs.  We must
+    /// read them while the registry mutex is held so a concurrent hot-reload
+    /// cannot free the underlying wrappers mid-copy (UAF).  We use the
+    /// registry's internal mutex via a manual lock/unlock bracket.
     pub fn refreshToolSpecs(self: *Agent) !void {
         const reg = self.registry orelse return;
-        const n = reg.count();
-        const new_specs = try self.allocator.alloc(ToolSpec, n);
+
+        // Hold the registry mutex for the entire copy so that tool wrapper
+        // pointers remain valid while we dereference .name()/.description()
+        // etc.  This prevents the UAF where a hot-reload frees wrappers
+        // between copySlice() and the ToolSpec field reads.
+        reg.mutex.lock();
+        defer reg.mutex.unlock();
+
+        const entry_count = reg.entries.items.len;
+        const new_specs = try self.allocator.alloc(ToolSpec, entry_count);
         errdefer self.allocator.free(new_specs);
 
-        // Copy each tool's spec from the registry (mutex-protected internally).
-        var filled: usize = 0;
-        var stack_buf: [256]Tool = undefined;
-        const heap_buf: ?[]Tool = if (n > stack_buf.len)
-            try self.allocator.alloc(Tool, n)
-        else
-            null;
-        defer if (heap_buf) |b| self.allocator.free(b);
-
-        const buf: []Tool = if (heap_buf) |b| b else stack_buf[0..n];
-        filled = reg.copySlice(buf);
-
-        for (buf[0..filled], 0..) |t, i| {
+        for (reg.entries.items, 0..) |e, i| {
             new_specs[i] = .{
-                .name = t.name(),
-                .description = t.description(),
-                .parameters_json = t.parametersJson(),
+                .name = e.tool.name(),
+                .description = e.tool.description(),
+                .parameters_json = e.tool.parametersJson(),
             };
         }
 
-        // Trim allocation to the actual fill count.  If the registry shrank
-        // between count() and copySlice() (hot-reload TOCTOU), `filled < n`
-        // and new_specs[filled..n] would be uninitialized.  realloc for a
-        // smaller size never fails on GPA; on an arena it may fail (OOM), in
-        // which case we return the error and the errdefer frees new_specs —
-        // which is still valid, because Zig's allocator contract guarantees
-        // the original memory is untouched on a failed realloc.
-        const final_specs = if (filled == n)
-            new_specs
-        else
-            try self.allocator.realloc(new_specs, filled);
-
         self.allocator.free(self.tool_specs);
-        self.tool_specs = final_specs;
-        self.tool_specs_dirty = false;
+        self.tool_specs = new_specs;
     }
 
     /// Returns true when the registry is draining (pending SO unload).
@@ -1061,34 +1052,41 @@ pub const Agent = struct {
         // since the last turn.  Both must be refreshed together so the
         // capabilities section, system prompt, and XML tool instructions all
         // reflect the current registry state.
-        if (self.tool_specs_dirty) {
-            self.refreshToolSpecs() catch |err| {
-                log.warn("refreshToolSpecs failed: {}; using stale specs", .{err});
-            };
-            // Also refresh the tools snapshot so system-prompt generation and
-            // capability advertising use the live registry contents.
-            if (self.registry) |reg| {
+        //
+        // Detection: compare our cached generation against the registry's
+        // atomic generation counter (bumped by applyPlugins / hot-reload).
+        // This replaces the old boolean `tool_specs_dirty` flag which was
+        // never set to true (BUG-0002).
+        if (self.registry) |reg| {
+            const current_gen = reg.generation.load(.acquire);
+            if (current_gen != self.cached_registry_generation) {
+                self.refreshToolSpecs() catch |err| {
+                    log.warn("refreshToolSpecs failed: {}; using stale specs", .{err});
+                };
+                // Also refresh the tools snapshot so system-prompt generation
+                // and capability advertising use the live registry contents.
+                // Use dupe-from-copySlice pattern (same as session.zig) to
+                // avoid realloc ownership issues.
                 const n = reg.count();
-                const new_tools = self.allocator.alloc(Tool, n) catch null;
-                if (new_tools) |buf| refresh_tools: {
-                    const filled = reg.copySlice(buf);
-                    // When the registry shrinks between count() and copySlice(),
-                    // filled < n.  We must realloc so deinit frees the correct
-                    // length (freeing a sub-slice of a larger alloc is UB/panic).
-                    const final_tools = if (filled < buf.len)
-                        (self.allocator.realloc(buf, filled) catch {
-                            // realloc failed — free the over-sized buffer and
-                            // keep the stale snapshot rather than storing an
-                            // unfree-able sub-slice.
-                            self.allocator.free(buf);
-                            break :refresh_tools;
-                        })
-                    else
-                        buf;
-                    if (self.tools_owned) self.allocator.free(self.tools);
-                    self.tools = final_tools;
-                    self.tools_owned = true;
+                var stack_buf: [256]Tool = undefined;
+                const heap_buf: ?[]Tool = self.allocator.alloc(Tool, n) catch null;
+                if (heap_buf != null or n <= stack_buf.len) {
+                    const temp: []Tool = if (heap_buf) |b| b else stack_buf[0..n];
+                    defer if (heap_buf) |b| self.allocator.free(b);
+                    const filled = reg.copySlice(temp);
+                    const new_snapshot = self.allocator.dupe(Tool, temp[0..filled]) catch null;
+                    if (new_snapshot) |snapshot| {
+                        if (self.tools_owned) self.allocator.free(self.tools);
+                        self.tools = snapshot;
+                        self.tools_owned = true;
+                    }
                 }
+
+                // Invalidate the system prompt so it is rebuilt with the new
+                // tool list on this turn (fixes stale capabilities section).
+                self.has_system_prompt = false;
+
+                self.cached_registry_generation = current_gen;
             }
         }
 
@@ -2653,6 +2651,8 @@ pub const Agent = struct {
         // Resolve effective tool list: registry takes priority over static slice.
         // When a registry is present, NEVER fall back to self.tools — doing so
         // would resurrect tools that were removed by overwrite/hot-reload.
+        var effective_tools_buf: ?[]Tool = null;
+        defer if (effective_tools_buf) |buf| tool_allocator.free(buf);
         const effective_tools: []const Tool = if (self.registry) |reg| blk: {
             const n = reg.count();
             if (n == 0) break :blk &[_]Tool{};
@@ -2660,6 +2660,7 @@ pub const Agent = struct {
                 log.err("failed to allocate tool buffer for registry dispatch", .{});
                 break :blk &[_]Tool{};
             };
+            effective_tools_buf = buf; // track for deferred free
             const filled = reg.copySlice(buf);
             break :blk buf[0..filled];
         } else self.tools;

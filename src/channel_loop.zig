@@ -32,11 +32,17 @@ const Atomic = @import("portable_atomic.zig").Atomic;
 const log = std.log.scoped(.channel_loop);
 
 /// Set ScheduleTool's default chat_id for delivery context.
+/// After an overwrite hot-reload, a tool named "schedule" might not be a
+/// ScheduleTool (it could be a plugin replacement).  We validate the vtable
+/// pointer before casting to avoid undefined behaviour.
 fn setScheduleToolContext(tools: []const tools_mod.Tool, chat_id: []const u8) void {
     for (tools) |tool| {
         if (std.mem.eql(u8, tool.name(), "schedule")) {
-            const schedule_tool: *tools_mod.schedule.ScheduleTool = @ptrCast(@alignCast(tool.ptr));
-            schedule_tool.setContext("telegram", chat_id);
+            // Only cast when the vtable proves this is really a ScheduleTool.
+            if (tool.vtable == &tools_mod.schedule.ScheduleTool.vtable) {
+                const schedule_tool: *tools_mod.schedule.ScheduleTool = @ptrCast(@alignCast(tool.ptr));
+                schedule_tool.setContext("telegram", chat_id);
+            }
             break;
         }
     }
@@ -73,7 +79,9 @@ fn processTelegramMessage(
             fn f(chat_id: []const u8, tools_slice: []const tools_mod.Tool) void {
                 setScheduleToolContext(tools_slice, chat_id);
             }
-        }.f);
+        }.f) catch |err| {
+            log.warn("withSlice OOM for schedule context: {}", .{err});
+        };
     } else {
         setScheduleToolContext(runtime.tools, sender);
     }
@@ -86,10 +94,15 @@ fn processTelegramMessage(
     };
 
     const reply = runtime.session_mgr.processMessage(session_key, content, conversation_context) catch |err| {
-        // RegistryDraining: plugin replacement in progress — silently skip
-        // the message without replying, as required by the drain contract.
+        // RegistryDraining: plugin replacement in progress — notify the user
+        // instead of silently dropping the message.
         if (err == error.RegistryDraining) {
-            log.info("message skipped: tool registry draining (plugin replacement in progress)", .{});
+            log.info("message deferred: tool registry draining (plugin replacement in progress)", .{});
+            tg_ptr.sendMessageWithReply(
+                sender,
+                "Plugin tools are being updated, please resend your message in a moment.",
+                reply_to_id,
+            ) catch |send_err| log.err("failed to send drain notice: {}", .{send_err});
             return;
         }
         log.err("Agent error: {}", .{err});

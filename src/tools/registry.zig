@@ -86,6 +86,11 @@ pub const ToolRegistry = struct {
     // ── operation-level mutex — serializes applyPlugins / hot-reload ──
     plugin_op_mutex: std.Thread.Mutex = .{},
 
+    // ── generation counter — monotonically increasing on every mutation ──
+    // Agents compare their cached generation to detect staleness and
+    // rebuild tool_specs + tools snapshot at the start of each turn.
+    generation: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
     // ── SO reference counting ─────────────────────────────────────
     active_so_calls: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     /// true while old SO tools are being drained before library unload.
@@ -151,11 +156,13 @@ pub const ToolRegistry = struct {
 
     /// Invoke `func(tools, ctx)` while holding the registry mutex.
     /// This is the preferred way to iterate tools without copying.
+    /// Returns `error.OutOfMemory` when the tool list exceeds the stack
+    /// buffer and the heap fallback allocation fails.
     pub fn withSlice(
         self: *ToolRegistry,
         ctx: anytype,
         comptime func: fn (@TypeOf(ctx), []const Tool) void,
-    ) void {
+    ) Allocator.Error!void {
         self.mutex.lock();
         defer self.mutex.unlock();
         // Build a temporary slice of Tool from entries.
@@ -165,10 +172,7 @@ pub const ToolRegistry = struct {
             for (self.entries.items, 0..) |e, i| stack_buf[i] = e.tool;
             func(ctx, stack_buf[0..self.entries.items.len]);
         } else {
-            const heap = self.allocator.alloc(Tool, self.entries.items.len) catch {
-                log.err("withSlice: heap alloc failed for {d} tools; callback skipped", .{self.entries.items.len});
-                return;
-            };
+            const heap = try self.allocator.alloc(Tool, self.entries.items.len);
             defer self.allocator.free(heap);
             for (self.entries.items, 0..) |e, i| heap[i] = e.tool;
             func(ctx, heap);
@@ -296,6 +300,9 @@ pub const ToolRegistry = struct {
                 log.warn("add plugin '{s}' skipped: {}", .{ entry.path, err });
             };
         }
+
+        // Bump generation so agents detect staleness at the start of each turn.
+        _ = self.generation.fetchAdd(1, .release);
 
         self.writeCurrentToolsList();
     }
