@@ -835,7 +835,8 @@ pub const NucleoFlash = struct {
             if (data) |d| allocator.free(d);
         }
         if (child.stderr) |*err_pipe| {
-            _ = err_pipe.readToEndAlloc(allocator, 64 * 1024) catch {};
+            const data = err_pipe.readToEndAlloc(allocator, 64 * 1024) catch null;
+            if (data) |d| allocator.free(d);
         }
         const term = child.wait() catch return Peripheral.PeripheralError.FlashFailed;
         const ok = switch (term) {
