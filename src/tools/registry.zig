@@ -567,8 +567,9 @@ pub const ToolRegistry = struct {
             self.mutex.lock();
             self.so_slots.append(self.allocator, slot) catch |err| {
                 self.mutex.unlock();
-                slot.deinit(self.allocator);
-                self.allocator.destroy(slot);
+                // Free only the path; let errdefer at line 553 destroy the
+                // slot struct and errdefer at line 544 close the handle.
+                self.allocator.free(slot.path);
                 return err;
             };
             self.mutex.unlock();
