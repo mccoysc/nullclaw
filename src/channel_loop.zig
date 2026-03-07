@@ -425,7 +425,7 @@ pub const ChannelRuntime = struct {
         // that plugin tools are loaded and hot-reload can be started.  Otherwise
         // fall back to the lighter-weight allTools() path.
         const plugins = &config.tools.plugins;
-        const has_plugins = plugins.add.len > 0 or plugins.overwrite.len > 0;
+        const has_plugins = plugins.add.len > 0 or plugins.overwrite.len > 0 or plugins.current_tools_list_path != null;
 
         var tool_registry: ?*tools_mod.ToolRegistry = null;
         const tools: []const tools_mod.Tool = if (has_plugins) blk: {
@@ -1559,9 +1559,11 @@ test "ChannelRuntime: Python plugin loaded via config.tools.plugins and wired in
     // Plugin tools must be visible in the registry.
     const reg = runtime.tool_registry.?;
     // example_plugin.py exports py_upper and py_word_count.
-    try std.testing.expect(reg.count() > 0);
-    var tool_buf: [128]tools_mod.Tool = undefined;
-    const n = reg.copySlice(&tool_buf);
+    const tool_count = reg.count();
+    try std.testing.expect(tool_count > 0);
+    const tool_buf = try allocator.alloc(tools_mod.Tool, tool_count);
+    defer allocator.free(tool_buf);
+    const n = reg.copySlice(tool_buf);
     var found_upper = false;
     for (tool_buf[0..n]) |t| {
         if (std.mem.eql(u8, t.name(), "py_upper")) {
@@ -1578,8 +1580,10 @@ test "ChannelRuntime: Python plugin loaded via config.tools.plugins and wired in
 
     // Execute py_upper via the registry's tool handle — the same vtable path
     // that Agent.executeTool() calls internally during a real conversation turn.
-    var tool_buf2: [128]tools_mod.Tool = undefined;
-    const n2 = reg.copySlice(&tool_buf2);
+    const tool_count2 = reg.count();
+    const tool_buf2 = try allocator.alloc(tools_mod.Tool, tool_count2);
+    defer allocator.free(tool_buf2);
+    const n2 = reg.copySlice(tool_buf2);
     var py_upper_tool: ?tools_mod.Tool = null;
     for (tool_buf2[0..n2]) |t| {
         if (std.mem.eql(u8, t.name(), "py_upper")) {

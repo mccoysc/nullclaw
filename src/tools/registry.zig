@@ -83,6 +83,9 @@ pub const ToolRegistry = struct {
     so_slots: std.ArrayListUnmanaged(*SoSlot) = .empty,
     next_slot_id: usize = 0,
 
+    // ── operation-level mutex — serializes applyPlugins / hot-reload ──
+    plugin_op_mutex: std.Thread.Mutex = .{},
+
     // ── SO reference counting ─────────────────────────────────────
     active_so_calls: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     /// true while old SO tools are being drained before library unload.
@@ -233,9 +236,11 @@ pub const ToolRegistry = struct {
     fn removeLocked(self: *ToolRegistry, name: []const u8) bool {
         for (self.entries.items, 0..) |*e, i| {
             if (std.mem.eql(u8, e.tool.name(), name)) {
+                const old_slot_id = e.so_slot_id;
                 e.tool.deinit(self.allocator);
                 self.allocator.free(e.source);
                 _ = self.entries.swapRemove(i);
+                if (old_slot_id) |sid| self.gcSoSlotLocked(sid);
                 return true;
             }
         }
@@ -246,9 +251,11 @@ pub const ToolRegistry = struct {
         // Replace existing by name.
         for (self.entries.items, 0..) |*e, i| {
             if (std.mem.eql(u8, e.tool.name(), entry.tool.name())) {
+                const old_slot_id = e.so_slot_id;
                 e.tool.deinit(self.allocator);
                 self.allocator.free(e.source);
                 self.entries.items[i] = entry;
+                if (old_slot_id) |sid| self.gcSoSlotLocked(sid);
                 return;
             }
         }
@@ -273,6 +280,11 @@ pub const ToolRegistry = struct {
     ///
     /// After both phases, writes currentToolsList if a path is configured.
     pub fn applyPlugins(self: *ToolRegistry, cfg: ToolPluginsConfig) !void {
+        // Serialize all plugin mutation operations so that concurrent
+        // hot-reload or applyAdd calls cannot interleave and leak slots.
+        self.plugin_op_mutex.lock();
+        defer self.plugin_op_mutex.unlock();
+
         // Phase 1: overwrite — collect all tools, clear registry, register new set.
         if (cfg.overwrite.len > 0) {
             self.applyOverwriteAll(cfg.overwrite);
@@ -526,6 +538,15 @@ pub const ToolRegistry = struct {
 
     fn loadSo(self: *ToolRegistry, path: []const u8) !LoadedBatch {
         const opened = try loader_so.openSo(self.allocator, path);
+        // Guard opened.handle and opened.metas against leaks if any
+        // subsequent allocation fails before ownership is transferred.
+        var handle_transferred = false;
+        errdefer if (!handle_transferred) {
+            for (opened.metas) |m| m.deinit(self.allocator);
+            self.allocator.free(opened.metas);
+            var h = opened.handle;
+            h.deinit();
+        };
 
         // Register the SoSlot (owns the handle).
         const slot = try self.allocator.create(SoSlot);
@@ -548,12 +569,12 @@ pub const ToolRegistry = struct {
                 self.mutex.unlock();
                 slot.deinit(self.allocator);
                 self.allocator.destroy(slot);
-                for (opened.metas) |m| m.deinit(self.allocator);
-                self.allocator.free(opened.metas);
                 return err;
             };
             self.mutex.unlock();
         }
+        // Ownership of opened.handle has been transferred into slot.
+        handle_transferred = true;
         defer {
             for (opened.metas) |m| m.deinit(self.allocator);
             self.allocator.free(opened.metas);
@@ -817,8 +838,8 @@ pub const ToolRegistry = struct {
     }
 
     fn parsePluginArray(allocator: Allocator, val: ?std.json.Value) ![]ExternalToolConfig {
-        const arr = val orelse return &.{};
-        if (arr != .array) return &.{};
+        const arr = val orelse return try allocator.alloc(ExternalToolConfig, 0);
+        if (arr != .array) return try allocator.alloc(ExternalToolConfig, 0);
         var out = std.ArrayListUnmanaged(ExternalToolConfig).empty;
         errdefer {
             for (out.items) |e| allocator.free(e.path);

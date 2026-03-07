@@ -920,7 +920,7 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                             alloc: std.mem.Allocator,
                             arr: std.json.Value,
                         ) ![]const types.ExternalToolConfig {
-                            if (arr != .array) return &.{};
+                            if (arr != .array) return error.InvalidConfig;
                             const items = arr.array.items;
                             var list: std.ArrayListUnmanaged(types.ExternalToolConfig) = .empty;
                             errdefer {

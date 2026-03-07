@@ -29,6 +29,66 @@ const Allocator = std.mem.Allocator;
 
 const log = std.log.scoped(.loader_script);
 
+/// Maximum time (in nanoseconds) to wait for a script subprocess.
+/// Discovery (--nullclaw-list): 30 seconds.
+/// Execution (--nullclaw-call): 120 seconds.
+const list_timeout_ns: u64 = 30 * std.time.ns_per_s;
+const call_timeout_ns: u64 = 120 * std.time.ns_per_s;
+
+/// Poll interval when checking if a child has exited.
+const poll_interval_ns: u64 = 50 * std.time.ns_per_ms; // 50 ms
+
+/// Wait for a child process with a timeout.  Spawns a watchdog thread
+/// that sends SIGKILL after `timeout_ns`.  The main thread calls the
+/// normal `child.wait()` which will return once the child exits (or is
+/// killed).  Returns `error.ScriptTimeout` if the child was killed.
+fn waitWithTimeout(child: *std.process.Child, timeout_ns: u64) !std.process.Child.Term {
+    const builtin = @import("builtin");
+
+    // On Windows fall back to unbounded wait.
+    if (comptime builtin.os.tag == .windows) {
+        return child.wait();
+    }
+
+    const pid = child.id;
+    var done = std.atomic.Value(bool).init(false);
+
+    const watchdog = std.Thread.spawn(.{}, struct {
+        fn run(p: std.posix.pid_t, d: *std.atomic.Value(bool), ns: u64) void {
+            // Sleep in small increments so we can bail early once done.
+            var remaining: u64 = ns;
+            const step: u64 = 100 * std.time.ns_per_ms; // 100ms
+            while (remaining > 0) {
+                if (d.load(.acquire)) return; // child already exited
+                const sleep_ns = @min(remaining, step);
+                std.Thread.sleep(sleep_ns);
+                remaining -|= sleep_ns;
+            }
+            if (!d.load(.acquire)) {
+                std.posix.kill(p, std.posix.SIG.KILL) catch {};
+            }
+        }
+    }.run, .{ pid, &done, timeout_ns }) catch {
+        // Cannot spawn watchdog — fall back to unbounded wait.
+        return child.wait();
+    };
+
+    const term = child.wait() catch |err| {
+        done.store(true, .release);
+        watchdog.join();
+        return err;
+    };
+    done.store(true, .release);
+    watchdog.join();
+
+    // Detect if the child was killed by our watchdog (SIGKILL).
+    switch (term) {
+        .Signal => |sig| if (sig == std.posix.SIG.KILL) return error.ScriptTimeout,
+        else => {},
+    }
+    return term;
+}
+
 // ── Temp-file helpers ───────────────────────────────────────────
 //
 // Scripts write their output to a temp file instead of stdout so that
@@ -150,7 +210,13 @@ pub const ScriptToolWrapper = struct {
         child.stderr_behavior = .Ignore;
         try child.spawn();
 
-        const term = child.wait() catch return ToolResult.fail("script wait failed");
+        const term = waitWithTimeout(&child, call_timeout_ns) catch |err| {
+            if (err == error.ScriptTimeout) {
+                log.err("script '{s}' timed out after {d}s", .{ self.script_path, call_timeout_ns / std.time.ns_per_s });
+                return ToolResult.fail(try allocator.dupe(u8, "script execution timed out"));
+            }
+            return ToolResult.fail(try allocator.dupe(u8, "script wait failed"));
+        };
         const success = switch (term) {
             .Exited => |code| code == 0,
             else => false,
@@ -217,7 +283,7 @@ fn runList(allocator: Allocator, interp: []const u8, script_path: []const u8) ![
     child.stderr_behavior = .Ignore;
     try child.spawn();
 
-    const term = child.wait() catch return error.ScriptListFailed;
+    const term = waitWithTimeout(&child, list_timeout_ns) catch return error.ScriptListFailed;
     switch (term) {
         .Exited => |code| if (code != 0) return error.ScriptListFailed,
         else => return error.ScriptListFailed,

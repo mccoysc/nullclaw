@@ -113,7 +113,7 @@ pub const SoToolWrapper = struct {
         const ok = self.execute_fn(args_z.ptr, out_buf.ptr, out_buf.len, &out_len);
         if (out_len > out_buf.len) {
             log.err("SO plugin returned out_len={} > out_cap={}", .{ out_len, out_buf.len });
-            return ToolResult.fail("plugin reported invalid output length");
+            return ToolResult.fail(try allocator.dupe(u8, "plugin reported invalid output length"));
         }
         const output = try allocator.dupe(u8, out_buf[0..out_len]);
         return if (ok) ToolResult.ok(output) else ToolResult.fail(output);
@@ -192,7 +192,7 @@ pub fn openSo(allocator: Allocator, path: []const u8) !struct {
 
     if (count == 0) {
         log.warn("'{s}' exported zero tools", .{path});
-        return .{ .handle = handle, .metas = &.{} };
+        return .{ .handle = handle, .metas = try allocator.alloc(SoToolMeta, 0) };
     }
 
     // Duplicate all strings so they survive potential reuse after handle.deinit().
