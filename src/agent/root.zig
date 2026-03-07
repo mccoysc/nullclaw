@@ -241,7 +241,7 @@ pub const Agent = struct {
     /// the start of each turn to detect staleness and trigger a refresh of
     /// tool_specs + tools snapshot.  Replaces the old boolean tool_specs_dirty
     /// flag which was never set to true.
-    cached_registry_generation: u64 = 0,
+    cached_registry_generation: u32 = 0,
     mem: ?Memory,
     bootstrap: ?bootstrap_mod.BootstrapProvider = null,
     session_store: ?memory_mod.SessionStore = null,

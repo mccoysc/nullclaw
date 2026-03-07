@@ -89,7 +89,7 @@ pub const ToolRegistry = struct {
     // ── generation counter — monotonically increasing on every mutation ──
     // Agents compare their cached generation to detect staleness and
     // rebuild tool_specs + tools snapshot at the start of each turn.
-    generation: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    generation: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
     // ── SO reference counting ─────────────────────────────────────
     active_so_calls: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
