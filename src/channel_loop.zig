@@ -330,6 +330,10 @@ pub const ChannelRuntime = struct {
     session_mgr: session_mod.SessionManager,
     provider_bundle: provider_runtime.RuntimeProviderBundle,
     tools: []const tools_mod.Tool,
+    /// Non-null when plugins are configured. Owns all tools (builtin + plugin).
+    /// When set, `tools` is a borrowed view into the registry — do NOT call
+    /// deinitTools on it; the registry frees them on deinit.
+    tool_registry: ?*tools_mod.ToolRegistry = null,
     mem_rt: ?memory_mod.MemoryRuntime,
     bootstrap_provider: ?bootstrap_mod.BootstrapProvider,
     noop_obs: *observability.NoopObserver,
@@ -401,8 +405,47 @@ pub const ChannelRuntime = struct {
         ) catch null;
         errdefer if (bootstrap_provider) |bp| bp.deinit();
 
-        // Tools
-        const tools = tools_mod.allTools(allocator, config.workspace_dir, .{
+        // Tools — if external plugins are configured use buildInitialRegistry so
+        // that plugin tools are loaded and hot-reload can be started.  Otherwise
+        // fall back to the lighter-weight allTools() path.
+        const plugins = &config.tools.plugins;
+        const has_plugins = plugins.add.len > 0 or plugins.overwrite.len > 0;
+
+        var tool_registry: ?*tools_mod.ToolRegistry = null;
+        const tools: []const tools_mod.Tool = if (has_plugins) blk: {
+            const reg = try tools_mod.buildInitialRegistry(allocator, config.workspace_dir, .{
+                .http_enabled = config.http_request.enabled,
+                .http_allowed_domains = config.http_request.allowed_domains,
+                .http_max_response_size = config.http_request.max_response_size,
+                .http_timeout_secs = config.http_request.timeout_secs,
+                .web_search_base_url = config.http_request.search_base_url,
+                .web_search_provider = config.http_request.search_provider,
+                .web_search_fallback_providers = config.http_request.search_fallback_providers,
+                .browser_enabled = config.browser.enabled,
+                .screenshot_enabled = true,
+                .mcp_tools = mcp_tools,
+                .agents = config.agents,
+                .fallback_api_key = resolved_key,
+                .tools_config = config.tools,
+                .allowed_paths = config.autonomy.allowed_paths,
+                .policy = security_policy,
+                .subagent_manager = subagent_manager,
+                .bootstrap_provider = bootstrap_provider,
+                .backend_name = config.memory.backend,
+            });
+            errdefer {
+                reg.deinit();
+                allocator.destroy(reg);
+            }
+            // Borrow a slice of Tool handles for schedule/memory binding.
+            // The slice buffer is heap-allocated; the tools themselves are owned
+            // by the registry and must NOT be freed by deinitTools.
+            const buf = try allocator.alloc(tools_mod.Tool, reg.count());
+            const copied = reg.copySlice(buf);
+            std.debug.assert(copied == buf.len);
+            tool_registry = reg;
+            break :blk buf;
+        } else tools_mod.allTools(allocator, config.workspace_dir, .{
             .http_enabled = config.http_request.enabled,
             .http_allowed_domains = config.http_request.allowed_domains,
             .http_max_response_size = config.http_request.max_response_size,
@@ -422,7 +465,11 @@ pub const ChannelRuntime = struct {
             .bootstrap_provider = bootstrap_provider,
             .backend_name = config.memory.backend,
         }) catch &.{};
-        errdefer if (tools.len > 0) tools_mod.deinitTools(allocator, tools);
+        errdefer if (tool_registry) |reg| {
+            allocator.free(tools);
+            reg.deinit();
+            allocator.destroy(reg);
+        } else if (tools.len > 0) tools_mod.deinitTools(allocator, tools);
 
         // Noop observer (heap for vtable stability)
         const noop_obs = try allocator.create(observability.NoopObserver);
@@ -433,6 +480,8 @@ pub const ChannelRuntime = struct {
         // Session manager
         var session_mgr = session_mod.SessionManager.init(allocator, config, provider_i, tools, mem_opt, obs, if (mem_rt) |rt| rt.session_store else null, if (mem_rt) |*rt| rt.response_cache else null);
         session_mgr.policy = security_policy;
+        // Wire registry so new sessions get agent.registry set automatically.
+        session_mgr.tool_registry = tool_registry;
 
         // Self — heap-allocated so pointers remain stable
         const self = try allocator.create(ChannelRuntime);
@@ -442,6 +491,7 @@ pub const ChannelRuntime = struct {
             .session_mgr = session_mgr,
             .provider_bundle = runtime_provider,
             .tools = tools,
+            .tool_registry = tool_registry,
             .mem_rt = mem_rt,
             .bootstrap_provider = bootstrap_provider,
             .noop_obs = noop_obs,
@@ -456,6 +506,17 @@ pub const ChannelRuntime = struct {
             self.session_mgr.mem_rt = rt;
             tools_mod.bindMemoryRuntime(tools, rt);
         }
+
+        // Start plugin hot-reload if plugins are configured and an interval is set.
+        if (tool_registry) |reg| {
+            const interval = config.tools.plugins.hot_reload_interval_secs;
+            if (interval > 0) {
+                reg.startHotReload(config.config_path, interval) catch |err| {
+                    log.warn("plugin hot-reload start failed: {}", .{err});
+                };
+            }
+        }
+
         return self;
     }
 
@@ -497,7 +558,14 @@ pub const ChannelRuntime = struct {
     pub fn deinit(self: *ChannelRuntime) void {
         const alloc = self.allocator;
         self.session_mgr.deinit();
-        if (self.tools.len > 0) tools_mod.deinitTools(alloc, self.tools);
+        if (self.tool_registry) |reg| {
+            // Registry owns the tool objects; only free the borrowed slice buffer.
+            alloc.free(self.tools);
+            reg.deinit();
+            alloc.destroy(reg);
+        } else if (self.tools.len > 0) {
+            tools_mod.deinitTools(alloc, self.tools);
+        }
         if (self.bootstrap_provider) |bp| bp.deinit();
         if (self.subagent_manager) |mgr| {
             mgr.deinit();
@@ -1403,4 +1471,112 @@ test "telegram offset persistence helper retries after write failure" {
     try std.testing.expectEqual(@as(i64, 101), persisted_update_id);
     const restored = loadTelegramUpdateOffset(allocator, &cfg, "main", "12345:test-token");
     try std.testing.expectEqual(@as(?i64, 101), restored);
+}
+
+// ── Plugin integration tests ──────────────────────────────────────────────────
+// These tests go through the full production path:
+//   Config with tools.plugins → ChannelRuntime.init → buildInitialRegistry
+//   → SessionManager.tool_registry → getOrCreate → agent.registry
+// This is exactly how a real user loads plugins at runtime.
+
+test "ChannelRuntime: Python plugin loaded via config.tools.plugins and wired into agent" {
+    const allocator = std.testing.allocator;
+    const config_types = @import("config_types.zig");
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(workspace);
+    const config_path = try std.fs.path.join(allocator, &.{ workspace, "config.json" });
+    defer allocator.free(config_path);
+
+    // Resolve example_plugin.py from repo root (CWD when running zig build test).
+    const py_path = std.fs.cwd().realpathAlloc(
+        allocator,
+        "examples/plugins/example_plugin.py",
+    ) catch |err| {
+        if (err == error.FileNotFound) return; // example file not present
+        return err;
+    };
+    defer allocator.free(py_path);
+
+    // Build a Config that adds the Python plugin.
+    var plugin_entry = [_]config_types.ExternalToolConfig{
+        .{ .kind = .python, .path = py_path },
+    };
+    const tools_cfg = config_types.ToolsConfig{
+        .plugins = .{
+            .add = &plugin_entry,
+            .hot_reload_interval_secs = 0, // disable hot-reload in tests
+        },
+    };
+
+    var allowed_paths = [_][]const u8{workspace};
+    const cfg = Config{
+        .workspace_dir = workspace,
+        .config_path = config_path,
+        .allocator = allocator,
+        .autonomy = .{ .allowed_paths = &allowed_paths },
+        .tools = tools_cfg,
+    };
+
+    var runtime = ChannelRuntime.init(allocator, &cfg) catch |err| {
+        if (err == error.InterpreterNotFound) return; // python3 not in PATH
+        return err;
+    };
+    defer runtime.deinit();
+
+    // Registry must be wired.
+    try std.testing.expect(runtime.tool_registry != null);
+    try std.testing.expect(runtime.session_mgr.tool_registry != null);
+
+    // Plugin tools must be visible in the registry.
+    const reg = runtime.tool_registry.?;
+    // example_plugin.py exports py_upper and py_word_count.
+    try std.testing.expect(reg.count() > 0);
+    var tool_buf: [128]tools_mod.Tool = undefined;
+    const n = reg.copySlice(&tool_buf);
+    var found_upper = false;
+    for (tool_buf[0..n]) |t| {
+        if (std.mem.eql(u8, t.name(), "py_upper")) {
+            found_upper = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_upper);
+
+    // Verify registry was propagated into SessionManager — every new session
+    // will have agent.registry set automatically.
+    try std.testing.expect(runtime.session_mgr.tool_registry != null);
+    try std.testing.expect(runtime.session_mgr.tool_registry.? == reg);
+
+    // Execute py_upper via the registry's tool handle — the same vtable path
+    // that Agent.executeTool() calls internally during a real conversation turn.
+    var tool_buf2: [128]tools_mod.Tool = undefined;
+    const n2 = reg.copySlice(&tool_buf2);
+    var py_upper_tool: ?tools_mod.Tool = null;
+    for (tool_buf2[0..n2]) |t| {
+        if (std.mem.eql(u8, t.name(), "py_upper")) {
+            py_upper_tool = t;
+            break;
+        }
+    }
+    try std.testing.expect(py_upper_tool != null);
+
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        "{\"text\":\"hello from config\"}",
+        .{},
+    );
+    defer parsed.deinit();
+
+    const result = try py_upper_tool.?.execute(allocator, parsed.value.object);
+    defer if (result.output.len > 0) allocator.free(result.output);
+    defer if (result.error_msg) |e| allocator.free(e);
+
+    try std.testing.expect(result.success);
+    const out = std.mem.trimRight(u8, result.output, "\r\n");
+    try std.testing.expectEqualStrings("HELLO FROM CONFIG", out);
 }

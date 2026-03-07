@@ -291,8 +291,9 @@ test "loader_so: e2e compile and execute example_plugin.c" {
 
         const result = try t.execute(allocator, parsed.value.object);
         defer if (result.output.len > 0) allocator.free(result.output);
-        // error_msg is heap-allocated on failure (allocator.dupe in executeImpl);
-        // on success it is null — the defer is a safe no-op.
+        // SoToolWrapper.executeImpl always heap-allocates its output via
+        // allocator.dupe — on success it ends up in result.output, on failure
+        // in result.error_msg.  Both are safe to free here.
         defer if (result.error_msg) |e| allocator.free(e);
 
         try std.testing.expect(result.success);

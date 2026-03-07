@@ -73,8 +73,11 @@ def main() -> None:
 
     if "--nullclaw-call" in argv:
         idx = argv.index("--nullclaw-call")
-        tool_name = argv[idx + 1] if idx + 1 < len(argv) else ""
-        raw_args  = argv[idx + 2] if idx + 2 < len(argv) else "{}"
+        if idx + 2 >= len(argv):
+            sys.stderr.write("usage: --nullclaw-call <tool_name> '<args_json>'\n")
+            sys.exit(1)
+        tool_name = argv[idx + 1]
+        raw_args  = argv[idx + 2]
 
         handler = HANDLERS.get(tool_name)
         if handler is None:

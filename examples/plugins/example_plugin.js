@@ -65,9 +65,13 @@ if (argv.includes('--nullclaw-list')) {
   process.stdout.write(JSON.stringify(TOOLS) + '\n');
 
 } else if (argv.includes('--nullclaw-call')) {
-  const idx      = argv.indexOf('--nullclaw-call');
-  const toolName = argv[idx + 1] || '';
-  const rawArgs  = argv[idx + 2] || '{}';
+  const idx = argv.indexOf('--nullclaw-call');
+  if (idx + 2 >= argv.length) {
+    process.stderr.write('usage: --nullclaw-call <tool_name> \'<args_json>\'\n');
+    process.exit(1);
+  }
+  const toolName = argv[idx + 1];
+  const rawArgs  = argv[idx + 2];
 
   const handler = HANDLERS[toolName];
   if (!handler) {

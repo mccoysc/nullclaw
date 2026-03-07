@@ -91,6 +91,12 @@ pub const SessionManager = struct {
     config: *const Config,
     provider: Provider,
     tools: []const Tool,
+    /// Optional dynamic tool registry. When non-null, every new session's
+    /// agent has its `registry` field set to this pointer so that tool
+    /// dispatch goes through the registry (enabling plugin tools and SO
+    /// ref-counting).  The registry is NOT owned by SessionManager — it is
+    /// owned by ChannelRuntime.
+    tool_registry: ?*tools_mod.ToolRegistry = null,
     mem: ?Memory,
     session_store: ?memory_mod.SessionStore = null,
     response_cache: ?*memory_mod.cache.ResponseCache = null,
@@ -468,6 +474,8 @@ pub const SessionManager = struct {
         agent.response_cache = self.response_cache;
         agent.mem_rt = self.mem_rt;
         agent.memory_session_id = owned_key;
+        // Wire dynamic registry so agent dispatches through plugin tools.
+        if (self.tool_registry) |reg| agent.registry = reg;
         if (self.config.diagnostics.token_usage_ledger_enabled) {
             agent.usage_record_callback = usageRecordForwarder;
             agent.usage_record_ctx = @ptrCast(self);

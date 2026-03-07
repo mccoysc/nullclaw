@@ -548,8 +548,8 @@ pub const ToolRegistry = struct {
             '\t' => try buf.appendSlice(allocator, "\\t"),
             else => {
                 if (c < 0x20) {
-                    // "\\u" + 4 hex digits = 6 bytes exactly; buffer is sized accordingly.
-                    comptime std.debug.assert("\\u001f".len == 6);
+                    // "\\u" (2 chars) + 4 hex digits = 6 bytes exactly.
+                    comptime std.debug.assert(2 + 4 == 6);
                     var tmp: [6]u8 = undefined;
                     const s2 = std.fmt.bufPrint(&tmp, "\\u{x:0>4}", .{c}) catch unreachable;
                     try buf.appendSlice(allocator, s2);
@@ -590,7 +590,7 @@ pub const ToolRegistry = struct {
 
     fn hotReloadLoop(self: *ToolRegistry) void {
         while (!self.reload_stop.load(.acquire)) {
-            std.time.sleep(self.reload_interval_secs * std.time.ns_per_s);
+            std.Thread.sleep(self.reload_interval_secs * std.time.ns_per_s);
             if (self.reload_stop.load(.acquire)) break;
 
             const cfg_path = self.config_path orelse continue;
