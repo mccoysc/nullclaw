@@ -1072,8 +1072,15 @@ pub const Agent = struct {
                 const new_tools = self.allocator.alloc(Tool, n) catch null;
                 if (new_tools) |buf| {
                     const filled = reg.copySlice(buf);
+                    // When the registry shrinks between count() and copySlice(),
+                    // filled < n.  We must realloc so deinit frees the correct
+                    // length (freeing a sub-slice of a larger alloc is UB/panic).
+                    const final_tools = if (filled < buf.len)
+                        self.allocator.realloc(buf, filled) catch buf[0..filled]
+                    else
+                        buf;
                     if (self.tools_owned) self.allocator.free(self.tools);
-                    self.tools = buf[0..filled];
+                    self.tools = final_tools;
                     self.tools_owned = true;
                 }
             }

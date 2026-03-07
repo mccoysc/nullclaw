@@ -482,7 +482,10 @@ pub const SessionManager = struct {
             const filled = reg.copySlice(temp);
             break :blk try self.allocator.dupe(Tool, temp[0..filled]);
         } else self.tools;
-        errdefer if (self.tool_registry != null) self.allocator.free(tools_for_session);
+        // Use a nullable sentinel so we can cancel the errdefer once ownership
+        // transfers to the agent (agent.deinit will free it via tools_owned).
+        var tools_errcleanup: ?[]const Tool = if (self.tool_registry != null) tools_for_session else null;
+        errdefer if (tools_errcleanup) |t| self.allocator.free(t);
 
         var agent = try Agent.fromConfigWithChannelModel(
             self.allocator,
@@ -494,7 +497,9 @@ pub const SessionManager = struct {
             mo.model,
         );
         // Transfer ownership: agent.deinit() frees the snapshot buffer.
+        // Disable the errdefer so we don't double-free on later errors.
         if (self.tool_registry != null) agent.tools_owned = true;
+        tools_errcleanup = null;
         agent.policy = self.policy;
         agent.session_store = self.session_store;
         agent.response_cache = self.response_cache;
