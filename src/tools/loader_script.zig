@@ -262,8 +262,9 @@ pub fn loadScript(
         try list.append(allocator, w.tool());
     }
 
+    const result = list.toOwnedSlice(allocator);
     allocator.free(interp);
-    return list.toOwnedSlice(allocator);
+    return result;
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
