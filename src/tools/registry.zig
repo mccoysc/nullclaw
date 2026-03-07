@@ -510,53 +510,55 @@ pub const ToolRegistry = struct {
     pub fn writeCurrentToolsList(self: *ToolRegistry) void {
         const out_path = self.current_tools_list_path orelse return;
 
-        var buf = std.ArrayList(u8).init(self.allocator);
-        defer buf.deinit();
-        const w = buf.writer();
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(self.allocator);
 
         self.mutex.lock();
-        w.writeAll("[\n") catch {};
+        buf.appendSlice(self.allocator, "[\n") catch {};
         var first = true;
         for (self.entries.items) |e| {
-            if (!first) w.writeAll(",\n") catch {};
+            if (!first) buf.appendSlice(self.allocator, ",\n") catch {};
             first = false;
-            w.writeAll("  {") catch {};
-            w.print("\"name\":", .{}) catch {};
-            writeJsonString(w, e.tool.name()) catch {};
-            w.writeAll(",\"description\":", .{}) catch {};
-            writeJsonString(w, e.tool.description()) catch {};
-            w.writeAll(",\"params_json\":", .{}) catch {};
-            writeJsonString(w, e.tool.parametersJson()) catch {};
-            w.writeAll(",\"source\":", .{}) catch {};
-            writeJsonString(w, e.source) catch {};
-            w.writeByte('}') catch {};
+            buf.appendSlice(self.allocator, "  {\"name\":") catch {};
+            appendJsonString(&buf, self.allocator, e.tool.name()) catch {};
+            buf.appendSlice(self.allocator, ",\"description\":") catch {};
+            appendJsonString(&buf, self.allocator, e.tool.description()) catch {};
+            buf.appendSlice(self.allocator, ",\"params_json\":") catch {};
+            appendJsonString(&buf, self.allocator, e.tool.parametersJson()) catch {};
+            buf.appendSlice(self.allocator, ",\"source\":") catch {};
+            appendJsonString(&buf, self.allocator, e.source) catch {};
+            buf.append(self.allocator, '}') catch {};
         }
         self.mutex.unlock();
 
-        w.writeAll("\n]\n") catch {};
+        buf.appendSlice(self.allocator, "\n]\n") catch {};
 
         std.fs.cwd().writeFile(.{ .sub_path = out_path, .data = buf.items }) catch |err| {
             log.warn("writeCurrentToolsList '{s}': {}", .{ out_path, err });
         };
     }
 
-    fn writeJsonString(w: anytype, s: []const u8) !void {
-        try w.writeByte('"');
+    fn appendJsonString(buf: *std.ArrayList(u8), allocator: Allocator, s: []const u8) !void {
+        try buf.append(allocator, '"');
         for (s) |c| switch (c) {
-            '"' => try w.writeAll("\\\""),
-            '\\' => try w.writeAll("\\\\"),
-            '\n' => try w.writeAll("\\n"),
-            '\r' => try w.writeAll("\\r"),
-            '\t' => try w.writeAll("\\t"),
+            '"' => try buf.appendSlice(allocator, "\\\""),
+            '\\' => try buf.appendSlice(allocator, "\\\\"),
+            '\n' => try buf.appendSlice(allocator, "\\n"),
+            '\r' => try buf.appendSlice(allocator, "\\r"),
+            '\t' => try buf.appendSlice(allocator, "\\t"),
             else => {
                 if (c < 0x20) {
-                    try w.print("\\u{x:0>4}", .{c});
+                    // "\\u" + 4 hex digits = 6 bytes exactly; buffer is sized accordingly.
+                    comptime std.debug.assert("\\u001f".len == 6);
+                    var tmp: [6]u8 = undefined;
+                    const s2 = std.fmt.bufPrint(&tmp, "\\u{x:0>4}", .{c}) catch unreachable;
+                    try buf.appendSlice(allocator, s2);
                 } else {
-                    try w.writeByte(c);
+                    try buf.append(allocator, c);
                 }
             },
         };
-        try w.writeByte('"');
+        try buf.append(allocator, '"');
     }
 
     // ─────────────────────────────────────────────────────────────
@@ -603,7 +605,9 @@ pub const ToolRegistry = struct {
 
     fn hotReloadFromFile(self: *ToolRegistry, cfg_path: []const u8) void {
         const data = std.fs.cwd().readFileAlloc(
-            self.allocator, cfg_path, 4 * 1024 * 1024,
+            self.allocator,
+            cfg_path,
+            4 * 1024 * 1024,
         ) catch |err| {
             log.err("hot-reload: read '{s}': {}", .{ cfg_path, err });
             return;
@@ -611,7 +615,10 @@ pub const ToolRegistry = struct {
         defer self.allocator.free(data);
 
         const parsed = std.json.parseFromSlice(
-            std.json.Value, self.allocator, data, .{},
+            std.json.Value,
+            self.allocator,
+            data,
+            .{},
         ) catch |err| {
             log.err("hot-reload: JSON parse: {}", .{err});
             return;
@@ -625,14 +632,16 @@ pub const ToolRegistry = struct {
         if (plugins_v != .object) return;
 
         const overwrite = parsePluginArray(
-            self.allocator, plugins_v.object.get("overwrite"),
+            self.allocator,
+            plugins_v.object.get("overwrite"),
         ) catch return;
         defer {
             for (overwrite) |e| self.allocator.free(e.path);
             self.allocator.free(overwrite);
         }
         const add_arr = parsePluginArray(
-            self.allocator, plugins_v.object.get("add"),
+            self.allocator,
+            plugins_v.object.get("add"),
         ) catch return;
         defer {
             for (add_arr) |e| self.allocator.free(e.path);
@@ -754,4 +763,119 @@ test "registry SO ref counting" {
     try std.testing.expectEqual(@as(u32, 1), reg.active_so_calls.load(.acquire));
     reg.releaseSoCall();
     try std.testing.expectEqual(@as(u32, 0), reg.active_so_calls.load(.acquire));
+}
+
+// ── End-to-end integration tests ─────────────────────────────────
+
+// applyPlugins with examples/plugins/example_plugin.py:
+// verifies that Python tools are added to the registry and execute correctly.
+test "registry: applyPlugins adds Python tools from example_plugin.py" {
+    const allocator = std.testing.allocator;
+
+    const rel = "examples/plugins/example_plugin.py";
+    const py_path = std.fs.cwd().realpathAlloc(allocator, rel) catch
+        try allocator.dupe(u8, rel);
+    defer allocator.free(py_path);
+
+    var reg = ToolRegistry.init(allocator);
+    defer reg.deinit();
+
+    const cfg = ToolPluginsConfig{
+        .add = &.{.{ .kind = .python, .path = py_path }},
+    };
+    reg.applyPlugins(cfg) catch |err| {
+        if (err == error.InterpreterNotFound) return; // python3 not in PATH
+        return err;
+    };
+
+    // example_plugin.py exposes py_upper and py_word_count.
+    try std.testing.expectEqual(@as(usize, 2), reg.count());
+
+    // Copy tools to a buffer to execute outside the mutex.
+    var tool_buf: [4]Tool = undefined;
+    const n = reg.copySlice(&tool_buf);
+    try std.testing.expectEqual(@as(usize, 2), n);
+
+    // Verify names via copySlice result.
+    try std.testing.expectEqualStrings("py_upper", tool_buf[0].name());
+    try std.testing.expectEqualStrings("py_word_count", tool_buf[1].name());
+
+    // Execute py_upper (first tool).
+    {
+        const parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            allocator,
+            "{\"text\":\"hello registry\"}",
+            .{},
+        );
+        defer parsed.deinit();
+
+        const result = try tool_buf[0].execute(allocator, parsed.value.object);
+        defer if (result.output.len > 0) allocator.free(result.output);
+        defer if (result.error_msg) |e| allocator.free(e);
+
+        try std.testing.expect(result.success);
+        const out = std.mem.trimRight(u8, result.output, "\r\n");
+        try std.testing.expectEqualStrings("HELLO REGISTRY", out);
+    }
+}
+
+// applyPlugins with example_plugin.py, then writeCurrentToolsList:
+// verifies JSON output contains expected tool names.
+test "registry: writeCurrentToolsList produces valid JSON after applyPlugins" {
+    const allocator = std.testing.allocator;
+
+    const rel = "examples/plugins/example_plugin.py";
+    const py_path = std.fs.cwd().realpathAlloc(allocator, rel) catch
+        try allocator.dupe(u8, rel);
+    defer allocator.free(py_path);
+
+    var reg = ToolRegistry.init(allocator);
+    defer reg.deinit();
+
+    // Use a tmpDir for the output file.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+
+    const out_file = try std.fmt.allocPrint(allocator, "{s}/tools.json", .{tmp_path});
+    defer allocator.free(out_file);
+    try reg.setCurrentToolsListPath(out_file);
+
+    const cfg = ToolPluginsConfig{
+        .add = &.{.{ .kind = .python, .path = py_path }},
+    };
+    reg.applyPlugins(cfg) catch |err| {
+        if (err == error.InterpreterNotFound) return;
+        return err;
+    };
+
+    // Read and parse the generated JSON.
+    const json_data = try std.fs.cwd().readFileAlloc(allocator, out_file, 64 * 1024);
+    defer allocator.free(json_data);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_data, .{});
+    defer parsed.deinit();
+
+    try std.testing.expect(parsed.value == .array);
+    const arr = parsed.value.array.items;
+    try std.testing.expectEqual(@as(usize, 2), arr.len);
+
+    // Verify each entry has the required fields.
+    for (arr) |entry| {
+        try std.testing.expect(entry == .object);
+        try std.testing.expect(entry.object.contains("name"));
+        try std.testing.expect(entry.object.contains("description"));
+        try std.testing.expect(entry.object.contains("params_json"));
+        try std.testing.expect(entry.object.contains("source"));
+        // source must start with "script:"
+        const src = entry.object.get("source").?;
+        try std.testing.expect(src == .string);
+        try std.testing.expect(std.mem.startsWith(u8, src.string, "script:"));
+    }
+
+    // First tool must be py_upper.
+    const name0 = arr[0].object.get("name").?;
+    try std.testing.expectEqualStrings("py_upper", name0.string);
 }
