@@ -241,11 +241,14 @@ pub const ExternalToolConfig = struct {
 /// Dynamic plugin section inside ToolsConfig.
 ///
 /// Processing order on startup / hot-reload:
-///   1. `overwrite` — for each exported tool whose name matches an existing
-///      registry entry, replace it (freeing old resources). Unknown names are
-///      logged and silently ignored.
+///   1. `overwrite` — if any entries are present, load ALL tools from ALL
+///      overwrite entries, drain in-flight SO calls, wipe the entire existing
+///      registry (every tool and every SO slot are freed), then register the
+///      freshly-loaded set.  If `overwrite` is empty this phase is skipped
+///      and existing tools are kept as-is.
 ///   2. `add` — append (or replace if same name) every exported tool into the
-///      registry.
+///      registry.  Same-name replacement follows the normal release logic
+///      (SO drain + ref-count wait if the old tool is SO-backed).
 pub const ToolPluginsConfig = struct {
     overwrite: []const ExternalToolConfig = &.{},
     add: []const ExternalToolConfig = &.{},
