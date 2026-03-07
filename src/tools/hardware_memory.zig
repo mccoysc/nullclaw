@@ -196,10 +196,10 @@ test "hardware_memory missing action returns error" {
 }
 
 test "hardware_memory unsupported board" {
-    const boards = [_][]const u8{"rpi-gpio"};
+    const boards = [_][]const u8{"esp32"};
     var hm = HardwareMemoryTool{ .boards = &boards };
     const t = hm.tool();
-    const parsed = try root.parseTestArgs("{\"action\": \"read\", \"board\": \"rpi-gpio\"}");
+    const parsed = try root.parseTestArgs("{\"action\": \"read\", \"board\": \"esp32\"}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     defer if (result.error_msg) |e| std.testing.allocator.free(e);
@@ -295,6 +295,6 @@ test "chipForBoard known" {
 }
 
 test "chipForBoard unknown" {
-    try std.testing.expect(chipForBoard("rpi-gpio") == null);
+    try std.testing.expect(chipForBoard("esp32") == null);
     try std.testing.expect(chipForBoard("unknown") == null);
 }

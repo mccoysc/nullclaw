@@ -27,6 +27,8 @@ const known_boards: []const BoardInfo = &.{
     .{ .vid = 0x2341, .pid = 0x0042, .name = "arduino-mega", .architecture = "AVR ATmega2560" },
     .{ .vid = 0x10c4, .pid = 0xea60, .name = "cp2102", .architecture = "USB-UART bridge" },
     .{ .vid = 0x10c4, .pid = 0xea70, .name = "cp2102n", .architecture = "USB-UART bridge" },
+    .{ .vid = 0x1a86, .pid = 0x7523, .name = "esp32", .architecture = "ESP32 (CH340)" },
+    .{ .vid = 0x1a86, .pid = 0x55d4, .name = "esp32", .architecture = "ESP32 (CH340)" },
 };
 
 /// Look up a board by VID and PID.
@@ -626,6 +628,12 @@ test "lookupBoard finds cp2102" {
     try std.testing.expectEqualStrings("cp2102", b.?.name);
 }
 
+test "lookupBoard finds esp32" {
+    const b = lookupBoard(0x1a86, 0x7523);
+    try std.testing.expect(b != null);
+    try std.testing.expectEqualStrings("esp32", b.?.name);
+}
+
 test "lookupBoard returns null for unknown VID/PID" {
     try std.testing.expect(lookupBoard(0x0000, 0x0000) == null);
 }
@@ -639,8 +647,8 @@ test "knownBoards is not empty" {
     try std.testing.expect(knownBoards().len > 0);
 }
 
-test "knownBoards has at least 7 entries" {
-    try std.testing.expectEqual(@as(usize, 7), knownBoards().len);
+test "knownBoards has at least 9 entries" {
+    try std.testing.expectEqual(@as(usize, 9), knownBoards().len);
 }
 
 test "all known boards have non-empty name" {
