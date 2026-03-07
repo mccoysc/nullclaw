@@ -47,7 +47,7 @@ jobs:
             target: wasm32-wasi
             zig_target: wasm32-wasi
             ext: ".wasm"
-            enabled: false  # wasm release disabled by default; set to true to re-enable
+            disabled: true  # wasm release disabled by default; set to false to re-enable
 
     steps:
       - uses: actions/checkout@v4
@@ -58,11 +58,11 @@ jobs:
           version: 0.15.2
 
       - name: Build ReleaseSmall
-        if: ${{ matrix.enabled != false }}
+        if: ${{ matrix.disabled != true }}
         run: zig build -Doptimize=ReleaseSmall ${{ matrix.zig_target && format('-Dtarget={0}', matrix.zig_target) || '' }}
 
       - name: Upload artifact
-        if: ${{ matrix.enabled != false }}
+        if: ${{ matrix.disabled != true }}
         uses: actions/upload-artifact@v4
         with:
           name: nullclaw-${{ matrix.target }}
