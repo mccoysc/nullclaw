@@ -14,7 +14,6 @@
 - [开发指南](./development.md)
 - [Skills 使用指南](./skills.md)
 - [配置热重载](./config-hot-reload.md)
-- [ESP32 使用指南](./esp32.md)
 
 ## 先看这 3 条
 
