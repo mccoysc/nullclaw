@@ -1135,6 +1135,7 @@ fn runCapabilities(allocator: std.mem.Allocator, sub_args: []const []const u8) !
         if (pl.add.len > 0 or pl.overwrite.len > 0) {
             if (yc.tools.buildInitialRegistry(allocator, cfg.workspace_dir, .{
                 .tools_config = cfg.tools,
+                .current_tools_list_path = cfg.tools.plugins.current_tools_list_path,
             })) |reg| {
                 tool_registry = reg;
                 const buf = allocator.alloc(yc.tools.Tool, reg.count()) catch null;

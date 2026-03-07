@@ -259,6 +259,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
             .subagent_manager = &subagent_manager,
             .bootstrap_provider = bootstrap_provider,
             .backend_name = cfg.memory.backend,
+            .current_tools_list_path = cfg.tools.plugins.current_tools_list_path,
         });
         errdefer {
             reg.deinit();

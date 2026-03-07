@@ -432,6 +432,7 @@ pub const ChannelRuntime = struct {
                 .subagent_manager = subagent_manager,
                 .bootstrap_provider = bootstrap_provider,
                 .backend_name = config.memory.backend,
+                .current_tools_list_path = config.tools.plugins.current_tools_list_path,
             });
             errdefer {
                 reg.deinit();

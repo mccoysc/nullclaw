@@ -946,6 +946,10 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                         self.tools.plugins.add = try parseEntries(self.allocator, arr);
                     if (pl.object.get("overwrite")) |arr|
                         self.tools.plugins.overwrite = try parseEntries(self.allocator, arr);
+                    if (pl.object.get("current_tools_list_path")) |v| {
+                        if (v == .string)
+                            self.tools.plugins.current_tools_list_path = try self.allocator.dupe(u8, v.string);
+                    }
                 }
             }
             // tools.media.audio → self.audio_media
