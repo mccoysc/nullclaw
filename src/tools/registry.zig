@@ -339,6 +339,15 @@ pub const ToolRegistry = struct {
             self.allocator.free(loaded.slot_ids);
         }
 
+        // Guard — abort if every plugin load failed (new_entries is empty).
+        // Proceeding would wipe built-ins + all existing plugins, leaving the
+        // agent with zero tools.  Keep the current registry as a safe fallback.
+        if (new_entries.items.len == 0) {
+            log.warn("overwrite: all plugin loads failed; keeping existing registry", .{});
+            new_entries.deinit(self.allocator);
+            return;
+        }
+
         // Step 3 — drain in-flight SO calls if any current entry is SO-backed.
         {
             self.mutex.lock();
