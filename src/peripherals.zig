@@ -805,8 +805,8 @@ pub const NucleoFlash = struct {
         child.spawn() catch return Peripheral.PeripheralError.IoError;
         // Drain stderr to avoid pipe deadlock
         if (child.stderr) |*err_pipe| {
-            const data = err_pipe.readToEndAlloc(self.allocator, 64 * 1024) catch null;
-            if (data) |d| self.allocator.free(d);
+            const err_output = err_pipe.readToEndAlloc(self.allocator, 64 * 1024) catch null;
+            if (err_output) |d| self.allocator.free(d);
         }
         const term = child.wait() catch return Peripheral.PeripheralError.IoError;
         const exited_ok = switch (term) {
