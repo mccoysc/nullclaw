@@ -2,19 +2,21 @@
 //!
 //! # Discovery protocol
 //!
-//!   python3 script.py --nullclaw-list
-//!   node   script.js  --nullclaw-list
+//!   python3 script.py --nullclaw-list --nullclaw-output /tmp/nc_XXXX
+//!   node   script.js  --nullclaw-list --nullclaw-output /tmp/nc_XXXX
 //!
-//!   Script prints a JSON array to stdout and exits 0:
+//!   Script writes a JSON array to the file specified by --nullclaw-output
+//!   and exits 0:
 //!     [{"name":"tool_name","description":"...","params_json":"{...}"}]
 //!
 //! # Execution protocol (one subprocess per call)
 //!
-//!   python3 script.py --nullclaw-call <tool_name> '<args_json>'
-//!   node   script.js  --nullclaw-call <tool_name> '<args_json>'
+//!   python3 script.py --nullclaw-call <tool_name> '<args_json>' --nullclaw-output /tmp/nc_XXXX
+//!   node   script.js  --nullclaw-call <tool_name> '<args_json>' --nullclaw-output /tmp/nc_XXXX
 //!
-//!   Script prints result to stdout and exits 0 for success, non-zero for failure.
-//!   Only stdout is used as the tool output.
+//!   Script writes result to the --nullclaw-output file and exits 0 for
+//!   success, non-zero for failure.  Using a temp file instead of stdout
+//!   avoids contamination from dependency import noise on stdout.
 //!
 //! No function-pointer lifetime issues — subprocess per call, no ref counting needed.
 
@@ -26,6 +28,32 @@ const JsonObjectMap = root.JsonObjectMap;
 const Allocator = std.mem.Allocator;
 
 const log = std.log.scoped(.loader_script);
+
+// ── Temp-file helpers ───────────────────────────────────────────
+//
+// Scripts write their output to a temp file instead of stdout so that
+// noisy dependency imports (which may print to stdout) do not
+// contaminate the actual tool output.
+
+/// Create a unique temp file path like "/tmp/nullclaw_XXXXXXXXXXXXXXXX".
+fn makeTmpPath(allocator: Allocator) ![]const u8 {
+    var rand_buf: [8]u8 = undefined;
+    std.crypto.random.bytes(&rand_buf);
+    const hex = std.fmt.bytesToHex(rand_buf, .lower);
+    return std.fmt.allocPrint(allocator, "/tmp/nullclaw_{s}", .{&hex});
+}
+
+/// Read the entire contents of a temp file.
+fn readTmpFile(allocator: Allocator, path: []const u8) ![]u8 {
+    const file = try std.fs.openFileAbsolute(path, .{});
+    defer file.close();
+    return file.readToEndAlloc(allocator, 4 * 1024 * 1024);
+}
+
+/// Best-effort delete of a temp file.
+fn deleteTmpFile(path: []const u8) void {
+    std.fs.deleteFileAbsolute(path) catch {};
+}
 
 pub const ScriptKind = enum { python, node };
 
@@ -91,24 +119,25 @@ pub const ScriptToolWrapper = struct {
         );
         defer allocator.free(args_json);
 
+        // Create a temp file for the script to write its output into.
+        const tmp_path = makeTmpPath(allocator) catch
+            return ToolResult.fail("failed to create temp output path");
+        defer allocator.free(tmp_path);
+        defer deleteTmpFile(tmp_path);
+
         const argv = [_][]const u8{
             self.interp,
             self.script_path,
             "--nullclaw-call",
             self.name_buf,
             args_json,
+            "--nullclaw-output",
+            tmp_path,
         };
         var child = std.process.Child.init(&argv, allocator);
-        child.stdout_behavior = .Pipe;
+        child.stdout_behavior = .Ignore;
         child.stderr_behavior = .Ignore;
         try child.spawn();
-
-        const stdout = child.stdout.?.readToEndAlloc(allocator, 4 * 1024 * 1024) catch {
-            _ = child.kill() catch {};
-            _ = child.wait() catch {};
-            return ToolResult.fail("script stdout read failed");
-        };
-        errdefer allocator.free(stdout);
 
         const term = child.wait() catch return ToolResult.fail("script wait failed");
         const success = switch (term) {
@@ -116,9 +145,18 @@ pub const ScriptToolWrapper = struct {
             else => false,
         };
 
-        // stdout is now owned by ToolResult
-        if (success) return ToolResult.ok(stdout);
-        return ToolResult.fail(stdout);
+        // Read output from the temp file.
+        const output = readTmpFile(allocator, tmp_path) catch |err| {
+            if (success) {
+                log.warn("script succeeded but output file unreadable: {}", .{err});
+                return ToolResult.fail("script output file unreadable");
+            }
+            return ToolResult.fail("script failed (no output)");
+        };
+        errdefer allocator.free(output);
+
+        if (success) return ToolResult.ok(output);
+        return ToolResult.fail(output);
     }
 
     fn nameImpl(ptr: *anyopaque) []const u8 {
@@ -157,18 +195,16 @@ pub const DiscoveredTool = struct {
 };
 
 fn runList(allocator: Allocator, interp: []const u8, script_path: []const u8) ![]DiscoveredTool {
-    const argv = [_][]const u8{ interp, script_path, "--nullclaw-list" };
+    // Create a temp file for the script to write its tool list into.
+    const tmp_path = makeTmpPath(allocator) catch return error.ScriptListFailed;
+    defer allocator.free(tmp_path);
+    defer deleteTmpFile(tmp_path);
+
+    const argv = [_][]const u8{ interp, script_path, "--nullclaw-list", "--nullclaw-output", tmp_path };
     var child = std.process.Child.init(&argv, allocator);
-    child.stdout_behavior = .Pipe;
+    child.stdout_behavior = .Ignore;
     child.stderr_behavior = .Ignore;
     try child.spawn();
-
-    const stdout = child.stdout.?.readToEndAlloc(allocator, 1 * 1024 * 1024) catch {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
-        return error.ScriptListFailed;
-    };
-    defer allocator.free(stdout);
 
     const term = child.wait() catch return error.ScriptListFailed;
     switch (term) {
@@ -176,10 +212,14 @@ fn runList(allocator: Allocator, interp: []const u8, script_path: []const u8) ![
         else => return error.ScriptListFailed,
     }
 
+    // Read the tool list from the temp file.
+    const file_content = readTmpFile(allocator, tmp_path) catch return error.ScriptListFailed;
+    defer allocator.free(file_content);
+
     const parsed = std.json.parseFromSlice(
         std.json.Value,
         allocator,
-        stdout,
+        file_content,
         .{},
     ) catch return error.ScriptInvalidJson;
     defer parsed.deinit();
@@ -262,8 +302,11 @@ pub fn loadScript(
         try list.append(allocator, w.tool());
     }
 
+    // Free interp AFTER toOwnedSlice to avoid double-free if toOwnedSlice
+    // fails (errdefer at top also frees interp on error paths).
+    const result = list.toOwnedSlice(allocator);
     allocator.free(interp);
-    return list.toOwnedSlice(allocator);
+    return result;
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
@@ -303,9 +346,9 @@ fn examplePath(allocator: Allocator, filename: []const u8) ![]const u8 {
 }
 
 /// Helper: free a ToolResult produced by a ScriptToolWrapper.
-/// On success the output is heap-allocated; on failure the error_msg may be
-/// a heap-allocated stdout copy or a static literal — we only free when we
-/// know the test reached the success assertion.
+/// On success the output is heap-allocated (read from temp file); on failure
+/// the error_msg may be a static literal — we only free when we know the
+/// test reached the success assertion.
 fn freeToolResult(allocator: Allocator, result: root.ToolResult) void {
     if (result.output.len > 0) allocator.free(result.output);
     if (result.error_msg) |e| allocator.free(e);
@@ -345,7 +388,7 @@ test "loader_script: e2e Python discovers and executes tools from example_plugin
         defer freeToolResult(allocator, result);
 
         try std.testing.expect(result.success);
-        // Strip trailing newline that the Python script appends.
+        // Temp-file output has no trailing newline; trimRight is a no-op safety net.
         const out = std.mem.trimRight(u8, result.output, "\r\n");
         try std.testing.expectEqualStrings("HELLO WORLD", out);
     }

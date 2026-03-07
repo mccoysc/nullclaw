@@ -12,12 +12,15 @@
  *     }
  *
  * Discovery protocol (called once at load time):
- *     node example_plugin.js --nullclaw-list
- *     → stdout: JSON array of tool descriptors, exit 0
+ *     node example_plugin.js --nullclaw-list --nullclaw-output /tmp/nc_XXXX
+ *     → writes JSON array of tool descriptors to the output file, exit 0
  *
  * Execution protocol (called per tool invocation):
- *     node example_plugin.js --nullclaw-call <tool_name> '<args_json>'
- *     → stdout: tool output, exit 0 = success, non-zero = failure
+ *     node example_plugin.js --nullclaw-call <tool_name> '<args_json>' --nullclaw-output /tmp/nc_XXXX
+ *     → writes tool result to the output file, exit 0 = success, non-zero = failure
+ *
+ * Output is written to the file specified by --nullclaw-output instead of
+ * stdout so that noisy dependency imports do not contaminate the result.
  */
 
 'use strict';
@@ -57,12 +60,31 @@ function js_char_count(args) {
 
 const HANDLERS = { js_reverse, js_char_count };
 
+// ── Helpers ─────────────────────────────────────────────────────
+
+const fs = require('fs');
+
+function getOutputPath(argv) {
+  const idx = argv.indexOf('--nullclaw-output');
+  if (idx !== -1 && idx + 1 < argv.length) return argv[idx + 1];
+  return null;
+}
+
+function writeOutput(argv, data) {
+  const path = getOutputPath(argv);
+  if (path) {
+    fs.writeFileSync(path, data, 'utf-8');
+  } else {
+    process.stdout.write(data + '\n');
+  }
+}
+
 // ── Entry point ──────────────────────────────────────────────────
 
 const argv = process.argv.slice(2);
 
 if (argv.includes('--nullclaw-list')) {
-  process.stdout.write(JSON.stringify(TOOLS) + '\n');
+  writeOutput(argv, JSON.stringify(TOOLS));
 
 } else if (argv.includes('--nullclaw-call')) {
   const idx = argv.indexOf('--nullclaw-call');
@@ -87,13 +109,13 @@ if (argv.includes('--nullclaw-list')) {
     process.exit(1);
   }
 
-  process.stdout.write(String(result) + '\n');
+  writeOutput(argv, String(result));
 
 } else {
   process.stderr.write(
     'Usage:\n' +
-    '  --nullclaw-list\n' +
-    '  --nullclaw-call <tool_name> \'<args_json>\'\n'
+    '  --nullclaw-list [--nullclaw-output <path>]\n' +
+    '  --nullclaw-call <tool_name> \'<args_json>\' [--nullclaw-output <path>]\n'
   );
   process.exit(1);
 }

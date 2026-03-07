@@ -12,12 +12,15 @@ Register in ~/.nullclaw/config.json:
     }
 
 Discovery protocol (called once at load time):
-    python3 example_plugin.py --nullclaw-list
-    → stdout: JSON array of tool descriptors, exit 0
+    python3 example_plugin.py --nullclaw-list --nullclaw-output /tmp/nc_XXXX
+    → writes JSON array of tool descriptors to the output file, exit 0
 
 Execution protocol (called per tool invocation):
-    python3 example_plugin.py --nullclaw-call <tool_name> '<args_json>'
-    → stdout: tool output, exit 0 = success, non-zero = failure
+    python3 example_plugin.py --nullclaw-call <tool_name> '<args_json>' --nullclaw-output /tmp/nc_XXXX
+    → writes tool result to the output file, exit 0 = success, non-zero = failure
+
+Output is written to the file specified by --nullclaw-output instead of stdout
+so that noisy dependency imports do not contaminate the result.
 """
 
 import json
@@ -62,13 +65,33 @@ HANDLERS = {
     "py_word_count": py_word_count,
 }
 
+# ── Helpers ───────────────────────────────────────────────────────
+
+def _get_output_path(argv):
+    """Extract --nullclaw-output <path> from argv, or None."""
+    if "--nullclaw-output" in argv:
+        idx = argv.index("--nullclaw-output")
+        if idx + 1 < len(argv):
+            return argv[idx + 1]
+    return None
+
+
+def _write_output(argv, data):
+    """Write data to the --nullclaw-output file, or stdout as fallback."""
+    path = _get_output_path(argv)
+    if path:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(data)
+    else:
+        print(data)
+
 # ── Entry point ───────────────────────────────────────────────────
 
-def main() -> None:
+def main():
     argv = sys.argv[1:]
 
     if "--nullclaw-list" in argv:
-        print(json.dumps(TOOLS))
+        _write_output(argv, json.dumps(TOOLS))
         return
 
     if "--nullclaw-call" in argv:
@@ -96,13 +119,13 @@ def main() -> None:
             sys.stderr.write(f"tool error: {exc}\n")
             sys.exit(1)
 
-        print(result)
+        _write_output(argv, result)
         return
 
     sys.stderr.write(
         "Usage:\n"
-        "  --nullclaw-list\n"
-        "  --nullclaw-call <tool_name> '<args_json>'\n"
+        "  --nullclaw-list [--nullclaw-output <path>]\n"
+        "  --nullclaw-call <tool_name> '<args_json>' [--nullclaw-output <path>]\n"
     )
     sys.exit(1)
 

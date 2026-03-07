@@ -75,11 +75,12 @@ typedef struct {
 
 | Step      | Command                                                        |
 |-----------|----------------------------------------------------------------|
-| Discovery | `python3 plugin.py --nullclaw-list`                            |
-| Execute   | `python3 plugin.py --nullclaw-call <tool_name> '<args_json>'` |
+| Discovery | `python3 plugin.py --nullclaw-list --nullclaw-output <path>`                            |
+| Execute   | `python3 plugin.py --nullclaw-call <tool_name> '<args_json>' --nullclaw-output <path>` |
 
-- Discovery prints a JSON array to stdout and exits 0.
-- Execution prints the result to stdout; exit 0 = success, non-zero = failure.
+- Discovery writes a JSON array to the `--nullclaw-output` file and exits 0.
+- Execution writes the result to the `--nullclaw-output` file; exit 0 = success, non-zero = failure.
+- Using a file instead of stdout avoids contamination from noisy dependency imports.
 
 ### Register
 
@@ -105,10 +106,10 @@ typedef struct {
 
 Same as Python, with `node` replacing `python3`:
 
-| Step      | Command                                                      |
-|-----------|--------------------------------------------------------------|
-| Discovery | `node plugin.js --nullclaw-list`                             |
-| Execute   | `node plugin.js --nullclaw-call <tool_name> '<args_json>'`  |
+| Step      | Command                                                                            |
+|-----------|------------------------------------------------------------------------------------|
+| Discovery | `node plugin.js --nullclaw-list --nullclaw-output <path>`                          |
+| Execute   | `node plugin.js --nullclaw-call <tool_name> '<args_json>' --nullclaw-output <path>`|
 
 ### Register
 
