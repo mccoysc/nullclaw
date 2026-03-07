@@ -452,7 +452,8 @@ pub const ArduinoPeripheral = struct {
         upload_child.stderr_behavior = .Pipe;
         upload_child.spawn() catch return Peripheral.PeripheralError.FlashFailed;
         if (upload_child.stderr) |*err_pipe| {
-            _ = err_pipe.readToEndAlloc(allocator, 64 * 1024) catch {};
+            const data = err_pipe.readToEndAlloc(allocator, 64 * 1024) catch null;
+            if (data) |d| allocator.free(d);
         }
         const upload_term = upload_child.wait() catch return Peripheral.PeripheralError.FlashFailed;
         const upload_ok = switch (upload_term) {
