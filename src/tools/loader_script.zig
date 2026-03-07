@@ -108,7 +108,7 @@ pub const ScriptToolWrapper = struct {
             _ = child.wait() catch {};
             return ToolResult.fail("script stdout read failed");
         };
-        errdefer allocator.free(stdout);
+        defer allocator.free(stdout);
 
         const term = child.wait() catch return ToolResult.fail("script wait failed");
         const success = switch (term) {
