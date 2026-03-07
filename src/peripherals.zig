@@ -433,7 +433,8 @@ pub const ArduinoPeripheral = struct {
         compile_child.spawn() catch return Peripheral.PeripheralError.FlashFailed;
         // Drain stderr to avoid pipe deadlock
         if (compile_child.stderr) |*err_pipe| {
-            _ = err_pipe.readToEndAlloc(allocator, 64 * 1024) catch {};
+            const data = err_pipe.readToEndAlloc(allocator, 64 * 1024) catch null;
+            if (data) |d| allocator.free(d);
         }
         const compile_term = compile_child.wait() catch return Peripheral.PeripheralError.FlashFailed;
         const compile_ok = switch (compile_term) {
