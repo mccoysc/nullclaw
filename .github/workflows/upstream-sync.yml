@@ -53,7 +53,11 @@ jobs:
           GH_TOKEN: ${{ secrets.ACTION_TOKEN }}
         run: |
           # Extract upstream owner/repo
-          UPSTREAM_REPO_PATH=$(echo "$UPSTREAM_REPO" | sed -E 's|.*github.com/([^/]+/[^/]+)(\.git)?|\1|')
+          # Remove protocol and domain
+          REPO_PATH=$(echo "$UPSTREAM_REPO" | sed -E 's|.*github.com/||')
+          # Remove .git suffix if present
+          UPSTREAM_REPO_PATH=${REPO_PATH%.git}
+          
           UPSTREAM_OWNER=$(echo "$UPSTREAM_REPO_PATH" | cut -d/ -f1)
           echo "upstream_owner=$UPSTREAM_OWNER" >> "$GITHUB_OUTPUT"
           echo "upstream_repo_path=$UPSTREAM_REPO_PATH" >> "$GITHUB_OUTPUT"
