@@ -16,6 +16,7 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  workflows: write   # required to push branches that contain workflow files
 
 jobs:
   sync:
