@@ -54,18 +54,19 @@ pub const WebFetchTool = struct {
         // resolve once, validate global address, and connect directly to it.
         const host = net_security.extractHost(url) orelse
             return ToolResult.fail("Invalid URL: cannot extract host");
-        const connect_host = net_security.resolveConnectHost(allocator, host, resolved_port) catch |err| switch (err) {
-            error.LocalAddressBlocked => return ToolResult.fail("Blocked local/private host"),
-            else => return ToolResult.fail("Unable to verify host safety"),
-        };
-        defer allocator.free(connect_host);
 
-        // Keep security surface aligned with http_request.
+        // Check domain allowlist before DNS resolution (input validation before network I/O).
         if (self.allowed_domains.len > 0) {
             if (!net_security.hostMatchesAllowlist(host, self.allowed_domains)) {
                 return ToolResult.fail("Host is not in http_request.allowed_domains");
             }
         }
+
+        const connect_host = net_security.resolveConnectHost(allocator, host, resolved_port) catch |err| switch (err) {
+            error.LocalAddressBlocked => return ToolResult.fail("Blocked local/private host"),
+            else => return ToolResult.fail("Unable to verify host safety"),
+        };
+        defer allocator.free(connect_host);
 
         const max_chars = parseMaxCharsWithDefault(args, self.default_max_chars);
 
@@ -506,7 +507,9 @@ test "WebFetchTool local host remains blocked with allowlist configured" {
     defer parsed.deinit();
     const result = try wft.execute(testing.allocator, parsed.value.object);
     try testing.expect(!result.success);
-    try testing.expectEqualStrings("Blocked local/private host", result.error_msg.?);
+    // Allowlist check fires before DNS resolution, so local hosts that are
+    // also outside the allowlist get the allowlist error message.
+    try testing.expectEqualStrings("Host is not in http_request.allowed_domains", result.error_msg.?);
 }
 
 test "buildCurlResolveEntry formats ipv4 connect target" {

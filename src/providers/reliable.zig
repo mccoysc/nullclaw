@@ -95,7 +95,7 @@ pub fn parseRetryAfterMs(err_msg: []const u8) ?u64 {
 
     // 安全的缓冲区大小，避免过大的内存使用
     const max_buffer_size = 1024;
-    
+
     // 分段处理长消息，确保安全处理
     var chunk_start: usize = 0;
     while (chunk_start < err_msg.len) {
@@ -104,7 +104,7 @@ pub fn parseRetryAfterMs(err_msg: []const u8) ?u64 {
         const chunk_size = @min(remaining, max_buffer_size);
         const chunk_end = chunk_start + chunk_size;
         const chunk = err_msg[chunk_start..chunk_end];
-        
+
         // 为当前块创建小写版本
         var lower_buf: [1024]u8 = undefined;
         const check_len = @min(chunk.len, lower_buf.len);
@@ -121,7 +121,7 @@ pub fn parseRetryAfterMs(err_msg: []const u8) ?u64 {
 
                 // 计算原始错误消息中的实际位置
                 const global_start = chunk_start + after_start;
-                
+
                 // 跳过空白字符
                 var start = global_start;
                 while (start < err_msg.len and (err_msg[start] == ' ' or err_msg[start] == '\t')) {
@@ -153,7 +153,7 @@ pub fn parseRetryAfterMs(err_msg: []const u8) ?u64 {
                 }
             }
         }
-        
+
         // 移动到下一个块，但保留一些重叠以防前缀跨块
         const overlap: usize = 20; // 足够容纳最长的前缀
         if (chunk_size <= overlap) {

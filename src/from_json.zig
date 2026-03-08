@@ -288,38 +288,38 @@ fn putValueByDottedKey(
             // 达到最大深度，将剩余部分作为单个键处理
             var combined_buf: [256]u8 = undefined;
             var combined_len: usize = 0;
-            
+
             // 添加当前段
             const seg_len = @min(segment.len, combined_buf.len);
             @memcpy(combined_buf[0..seg_len], segment[0..seg_len]);
             combined_len = seg_len;
-            
+
             // 添加点和下一段
             if (combined_len < combined_buf.len) {
                 combined_buf[combined_len] = '.';
                 combined_len += 1;
             }
-            
+
             const next_len = @min(next_segment.len, combined_buf.len - combined_len);
             if (next_len > 0) {
-                @memcpy(combined_buf[combined_len..combined_len + next_len], next_segment[0..next_len]);
+                @memcpy(combined_buf[combined_len .. combined_len + next_len], next_segment[0..next_len]);
                 combined_len += next_len;
             }
-            
+
             // 处理剩余的段
             while (segments.next()) |remaining| {
                 if (combined_len < combined_buf.len) {
                     combined_buf[combined_len] = '.';
                     combined_len += 1;
                 }
-                
+
                 const rem_len = @min(remaining.len, combined_buf.len - combined_len);
                 if (rem_len > 0) {
-                    @memcpy(combined_buf[combined_len..combined_len + rem_len], remaining[0..rem_len]);
+                    @memcpy(combined_buf[combined_len .. combined_len + rem_len], remaining[0..rem_len]);
                     combined_len += rem_len;
                 }
             }
-            
+
             // 使用组合键存储值
             try current_obj.put(combined_buf[0..combined_len], value);
             return;

@@ -7,37 +7,33 @@ fn findKeyPos(json: []const u8, quoted_key: []const u8) ?usize {
     var search_from: usize = 0;
     var in_string = false;
     var escaped = false;
-    
-    // First pass: find a valid key position (not inside a string value)
+
     for (json, 0..) |c, i| {
         if (escaped) {
             escaped = false;
             continue;
         }
-        
+
         if (c == '\\') {
             escaped = true;
             continue;
         }
-        
+
         if (c == '"') {
+            // When entering a new string, check if it matches the key
+            if (!in_string and i >= search_from) {
+                if (i + quoted_key.len <= json.len and std.mem.eql(u8, json[i .. i + quoted_key.len], quoted_key)) {
+                    const after = json[i + quoted_key.len ..];
+                    var j: usize = 0;
+                    while (j < after.len and (after[j] == ' ' or after[j] == '\t' or after[j] == '\n' or after[j] == '\r')) : (j += 1) {}
+                    if (j < after.len and after[j] == ':') {
+                        return i + quoted_key.len;
+                    }
+                    search_from = i + quoted_key.len;
+                }
+            }
             in_string = !in_string;
             continue;
-        }
-        
-        // Only look for keys when not inside a string value
-        if (!in_string and i >= search_from) {
-            if (i + quoted_key.len <= json.len and std.mem.eql(u8, json[i..i+quoted_key.len], quoted_key)) {
-                // Found potential key, verify it's followed by colon
-                const after = json[i + quoted_key.len..];
-                var j: usize = 0;
-                while (j < after.len and (after[j] == ' ' or after[j] == '\t' or after[j] == '\n' or after[j] == '\r')) : (j += 1) {}
-                if (j < after.len and after[j] == ':') {
-                    return i + quoted_key.len;
-                }
-                // Not a valid key-value pair, continue searching
-                search_from = i + quoted_key.len;
-            }
         }
     }
     return null;
@@ -81,7 +77,7 @@ pub fn parseBoolField(json: []const u8, key: []const u8) ?bool {
     // Check for boolean literals
     if (i + 4 <= after_key.len and std.mem.eql(u8, after_key[i..][0..4], "true")) return true;
     if (i + 5 <= after_key.len and std.mem.eql(u8, after_key[i..][0..5], "false")) return false;
-    
+
     // Reject numeric values that might be silently truncated
     if (i < after_key.len and (after_key[i] == '-' or (after_key[i] >= '0' and after_key[i] <= '9'))) return null;
     return null;

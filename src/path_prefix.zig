@@ -36,14 +36,14 @@ fn normalizeWindowsPrefix(path: []const u8) []const u8 {
             // Path too long for our buffer, return original as fallback
             return path;
         }
-        
+
         // Copy "\\" prefix
         unc_norm_buf[0] = '\\';
         unc_norm_buf[1] = '\\';
-        
+
         // Copy the server\share part
-        @memcpy(unc_norm_buf[2..][0..path.len - 8], path[8..]);
-        
+        @memcpy(unc_norm_buf[2..][0 .. path.len - 8], path[8..]);
+
         return unc_norm_buf[0 .. 2 + path.len - 8];
     }
     // \\?\C:\...  →  C:\...  (local extended path)
