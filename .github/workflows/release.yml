@@ -2,50 +2,11 @@ name: Release
 
 on:
   push:
-    branches: [main]
-  workflow_dispatch:
+    tags: ['v*']
 
 jobs:
-  version:
-    name: Determine version
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    outputs:
-      version: ${{ steps.release_info.outputs.version }}
-      title: ${{ steps.release_info.outputs.title }}
-      tag: ${{ steps.release_info.outputs.tag }}
-      prerelease: ${{ steps.release_info.outputs.prerelease }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Determine release info
-        id: release_info
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        shell: bash
-        run: |
-          DATE=$(date -u +'%Y.%m.%d' | sed 's/\.0\([0-9]\)/.\1/g')
-          DATE_ESCAPED="${DATE//./\\.}"
-          EXISTING=$(gh release list --repo "${{ github.repository }}" --limit 200 --json tagName -q '.[].tagName' 2>/dev/null || true)
-          SEQ=0
-          while IFS= read -r tag; do
-            if [[ "$tag" =~ ^v${DATE_ESCAPED}\.([0-9]+)$ ]]; then
-              N="${BASH_REMATCH[1]}"
-              if (( N >= SEQ )); then
-                SEQ=$((N + 1))
-              fi
-            fi
-          done <<< "$EXISTING"
-          VERSION="${DATE}.${SEQ}"
-          echo "version=${VERSION}" >> $GITHUB_OUTPUT
-          echo "title=v${VERSION}" >> $GITHUB_OUTPUT
-          echo "tag=v${VERSION}" >> $GITHUB_OUTPUT
-          echo "prerelease=false" >> $GITHUB_OUTPUT
-
   build:
     name: Build (${{ matrix.target }})
-    needs: version
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -74,11 +35,11 @@ jobs:
             target: macos-x86_64
             zig_target: x86_64-macos
             ext: ""
-          - os: ubuntu-latest
+          - os: windows-latest
             target: windows-x86_64
             zig_target: x86_64-windows
             ext: ".exe"
-          - os: ubuntu-latest
+          - os: windows-latest
             target: windows-aarch64
             zig_target: aarch64-windows
             ext: ".exe"
@@ -93,7 +54,7 @@ jobs:
           version: 0.15.2
 
       - name: Build ReleaseSmall
-        run: zig build -Doptimize=ReleaseSmall -Dversion=${{ needs.version.outputs.tag }} ${{ matrix.zig_target && format('-Dtarget={0}', matrix.zig_target) || '' }}
+        run: zig build -Doptimize=ReleaseSmall -Dversion=${{ github.ref_name }} ${{ matrix.zig_target && format('-Dtarget={0}', matrix.zig_target) || '' }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -102,42 +63,35 @@ jobs:
           path: zig-out/bin/nullclaw${{ matrix.ext }}
 
   release:
-    needs: [version, build]
+    needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: write
 
     steps:
-      - uses: actions/checkout@v4
-
       - uses: actions/download-artifact@v4
 
       - name: Rename binaries
-        shell: bash
         run: |
-          VERSION="${{ needs.version.outputs.version }}"
-          mv nullclaw-linux-x86_64/nullclaw   nullclaw-${VERSION}-linux-x86_64.bin
-          mv nullclaw-linux-aarch64/nullclaw  nullclaw-${VERSION}-linux-aarch64.bin
-          mv nullclaw-linux-riscv64/nullclaw  nullclaw-${VERSION}-linux-riscv64.bin
-          mv nullclaw-macos-aarch64/nullclaw  nullclaw-${VERSION}-macos-aarch64.bin
-          mv nullclaw-macos-x86_64/nullclaw   nullclaw-${VERSION}-macos-x86_64.bin
-          mv nullclaw-windows-x86_64/nullclaw.exe  nullclaw-${VERSION}-windows-x86_64.exe
-          mv nullclaw-windows-aarch64/nullclaw.exe nullclaw-${VERSION}-windows-aarch64.exe
+          mv nullclaw-linux-x86_64/nullclaw nullclaw-linux-x86_64.bin
+          mv nullclaw-linux-aarch64/nullclaw nullclaw-linux-aarch64.bin
+          mv nullclaw-linux-riscv64/nullclaw nullclaw-linux-riscv64.bin
+          mv nullclaw-macos-aarch64/nullclaw nullclaw-macos-aarch64.bin
+          mv nullclaw-macos-x86_64/nullclaw nullclaw-macos-x86_64.bin
+          mv nullclaw-windows-x86_64/nullclaw.exe nullclaw-windows-x86_64.exe
+          mv nullclaw-windows-aarch64/nullclaw.exe nullclaw-windows-aarch64.exe
 
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ needs.version.outputs.tag }}
-          name: ${{ needs.version.outputs.title }}
-          prerelease: ${{ needs.version.outputs.prerelease }}
           files: |
-            nullclaw-${{ needs.version.outputs.version }}-linux-x86_64.bin
-            nullclaw-${{ needs.version.outputs.version }}-linux-aarch64.bin
-            nullclaw-${{ needs.version.outputs.version }}-linux-riscv64.bin
-            nullclaw-${{ needs.version.outputs.version }}-macos-aarch64.bin
-            nullclaw-${{ needs.version.outputs.version }}-macos-x86_64.bin
-            nullclaw-${{ needs.version.outputs.version }}-windows-x86_64.exe
-            nullclaw-${{ needs.version.outputs.version }}-windows-aarch64.exe
+            nullclaw-linux-x86_64.bin
+            nullclaw-linux-aarch64.bin
+            nullclaw-linux-riscv64.bin
+            nullclaw-macos-aarch64.bin
+            nullclaw-macos-x86_64.bin
+            nullclaw-windows-x86_64.exe
+            nullclaw-windows-aarch64.exe
           generate_release_notes: true
 
   docker:
