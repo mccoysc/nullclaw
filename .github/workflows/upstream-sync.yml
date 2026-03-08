@@ -142,7 +142,12 @@ jobs:
           TARGET_PR=$(echo "$EXISTING_PRS" | jq -r ".[] | select(.title | contains(\"$LATEST_TAG\")) | .number" | head -1)
           
           # Close PRs for older releases
-          OTHER_PRS=$(echo "$EXISTING_PRS" | jq -r ".[] | select(.number != $TARGET_PR) | .number")
+          if [ -n "$TARGET_PR" ]; then
+            OTHER_PRS=$(echo "$EXISTING_PRS" | jq -r ".[] | select(.number != $TARGET_PR) | .number")
+          else
+            OTHER_PRS=$(echo "$EXISTING_PRS" | jq -r ".[] | .number")
+          fi
+
           for pr in $OTHER_PRS; do
              echo "Closing outdated PR #$pr"
              gh pr close "$pr" --comment "Closing in favor of newer release $LATEST_TAG"
