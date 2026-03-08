@@ -12,6 +12,7 @@ jobs:
       run:
         shell: bash
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
@@ -34,14 +35,15 @@ jobs:
             target: macos-x86_64
             zig_target: x86_64-macos
             ext: ""
-          - os: windows-latest
+          - os: ubuntu-latest
             target: windows-x86_64
             zig_target: x86_64-windows
             ext: ".exe"
-          - os: windows-latest
+          - os: ubuntu-latest
             target: windows-aarch64
             zig_target: aarch64-windows
             ext: ".exe"
+          # wasm32-wasi: disabled; add back here to re-enable wasm release
 
     steps:
       - uses: actions/checkout@v4
@@ -52,7 +54,7 @@ jobs:
           version: 0.15.2
 
       - name: Build ReleaseSmall
-        run: zig build -Doptimize=ReleaseSmall ${{ matrix.zig_target && format('-Dtarget={0}', matrix.zig_target) || '' }}
+        run: zig build -Doptimize=ReleaseSmall -Dversion=${{ github.ref_name }} ${{ matrix.zig_target && format('-Dtarget={0}', matrix.zig_target) || '' }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -71,25 +73,26 @@ jobs:
 
       - name: Rename binaries
         run: |
-          mv nullclaw-linux-x86_64/nullclaw nullclaw-linux-x86_64.bin
-          mv nullclaw-linux-aarch64/nullclaw nullclaw-linux-aarch64.bin
-          mv nullclaw-linux-riscv64/nullclaw nullclaw-linux-riscv64.bin
-          mv nullclaw-macos-aarch64/nullclaw nullclaw-macos-aarch64.bin
-          mv nullclaw-macos-x86_64/nullclaw nullclaw-macos-x86_64.bin
-          mv nullclaw-windows-x86_64/nullclaw.exe nullclaw-windows-x86_64.exe
-          mv nullclaw-windows-aarch64/nullclaw.exe nullclaw-windows-aarch64.exe
+          VERSION="${{ github.ref_name }}"
+          mv nullclaw-linux-x86_64/nullclaw   nullclaw-${VERSION}-linux-x86_64.bin
+          mv nullclaw-linux-aarch64/nullclaw  nullclaw-${VERSION}-linux-aarch64.bin
+          mv nullclaw-linux-riscv64/nullclaw  nullclaw-${VERSION}-linux-riscv64.bin
+          mv nullclaw-macos-aarch64/nullclaw  nullclaw-${VERSION}-macos-aarch64.bin
+          mv nullclaw-macos-x86_64/nullclaw   nullclaw-${VERSION}-macos-x86_64.bin
+          mv nullclaw-windows-x86_64/nullclaw.exe  nullclaw-${VERSION}-windows-x86_64.exe
+          mv nullclaw-windows-aarch64/nullclaw.exe nullclaw-${VERSION}-windows-aarch64.exe
 
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            nullclaw-linux-x86_64.bin
-            nullclaw-linux-aarch64.bin
-            nullclaw-linux-riscv64.bin
-            nullclaw-macos-aarch64.bin
-            nullclaw-macos-x86_64.bin
-            nullclaw-windows-x86_64.exe
-            nullclaw-windows-aarch64.exe
+            nullclaw-${{ github.ref_name }}-linux-x86_64.bin
+            nullclaw-${{ github.ref_name }}-linux-aarch64.bin
+            nullclaw-${{ github.ref_name }}-linux-riscv64.bin
+            nullclaw-${{ github.ref_name }}-macos-aarch64.bin
+            nullclaw-${{ github.ref_name }}-macos-x86_64.bin
+            nullclaw-${{ github.ref_name }}-windows-x86_64.exe
+            nullclaw-${{ github.ref_name }}-windows-aarch64.exe
           generate_release_notes: true
 
   docker:
