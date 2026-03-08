@@ -2502,29 +2502,27 @@ pub const Agent = struct {
                         .content_owned = true,
                     };
                 };
-                // parseSubAgentResponse returns .agent as sentinel when no tag found
+                // parseSubAgentResponse now returns .passthrough when no tag is found
                 // (shouldn't happen since we checked hasValidBehaviorTag, but be safe)
                 if (parsed.action == .agent) {
                     log.warn(
-                        "sub-agent error: behavior tag detected but parse returned sentinel | output={s} instructions={s} hook_content={s}",
+                        "sub-agent: behavior tag detected but parse returned unexpected action, falling back to passthrough | output={s} instructions={s} hook_content={s}",
                         .{
                             response_text,
                             skill_instructions,
                             hook_content,
                         },
                     );
-                    return .{
-                        .action = .agent_error,
-                        .content = result_allocator.dupe(u8, "sub-agent error: could not parse behavior tag") catch "",
-                        .content_owned = true,
-                    };
+                    return .{ .action = .passthrough };
                 }
                 return parsed;
             }
 
-            // No valid behavior tag in response — treat as error immediately (no retries)
+            // No valid behavior tag in response — gracefully fall back to passthrough.
+            // The sub-agent likely intended to pass content through unchanged but did
+            // not emit the required [behavior:passthrough] tag.
             log.warn(
-                "sub-agent error: invalid output format (no behavior tag) | output={s} instructions={s} hook_content={s} iteration={d}",
+                "sub-agent: no behavior tag in response, falling back to passthrough | output={s} instructions={s} hook_content={s} iteration={d}",
                 .{
                     response_text,
                     skill_instructions,
@@ -2532,16 +2530,7 @@ pub const Agent = struct {
                     total_iterations + 1,
                 },
             );
-            const err_msg = std.fmt.allocPrint(
-                result_allocator,
-                "sub-agent produced invalid output (no behavior tag): {s}",
-                .{response_text},
-            ) catch return .{
-                .action = .agent_error,
-                .content = result_allocator.dupe(u8, "sub-agent produced invalid output format") catch "",
-                .content_owned = true,
-            };
-            return .{ .action = .agent_error, .content = err_msg, .content_owned = true };
+            return .{ .action = .passthrough };
         }
 
         // Total iterations exhausted (only reachable via tool call loops)

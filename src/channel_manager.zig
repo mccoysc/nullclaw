@@ -2235,7 +2235,7 @@ test "ChannelManager marks qq webhook receive_mode as webhook_only" {
 }
 
 test "ChannelManager collects web channel from config" {
-    if (!channel_catalog.isBuildEnabled(.web)) return;
+    if (comptime !channel_catalog.isBuildEnabled(.web)) return;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

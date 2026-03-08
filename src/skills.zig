@@ -702,15 +702,19 @@ pub const sub_agent_system_prompt =
     \\  instructions to the data as-is.
     \\
     \\OUTPUT FORMAT — follow this EXACTLY:
-    \\  1. Output ONLY ONE behavior tag on its own line.
+    \\  1. Your response MUST start with exactly one behavior tag on its own line.
     \\  2. If the tag requires content, put it on the lines immediately after the tag.
     \\  3. Do NOT include any reasoning, thinking, analysis, or explanation.
     \\     The ENTIRE output must be the behavior tag + content for the user (if any).
+    \\  4. NEVER output raw content without a behavior tag. Every response must
+    \\     begin with one of the tags listed below — no exceptions.
+    \\  5. When in doubt, use [behavior:passthrough] to let content through unchanged.
     \\
     \\Allowed behaviors:
     \\
     \\[behavior:passthrough]
     \\  The content should pass through unchanged. Output ONLY this tag, nothing else.
+    \\  Use this as the DEFAULT when the content does not need modification or blocking.
     \\
     \\[behavior:intercept]
     \\<message to show the user>
@@ -726,7 +730,8 @@ pub const sub_agent_system_prompt =
     \\  An error occurred. The hook aborts and the error message is returned.
     \\
     \\CRITICAL RULES:
-    \\  - Your response must start with a behavior tag. No preamble.
+    \\  - Your response MUST start with a behavior tag. No preamble, no exceptions.
+    \\  - NEVER output the raw content directly — always wrap your decision in a tag.
     \\  - Do NOT output any thinking, reasoning, or analysis before or after the tag.
     \\  - For [behavior:intercept], only include the message the end user should see.
     \\  - For [behavior:passthrough], output ONLY the tag — nothing else.
@@ -912,8 +917,9 @@ pub fn parseSubAgentResponse(allocator: std.mem.Allocator, response: []const u8)
         }
     }
 
-    // No recognized behavior tag found — return sentinel so caller treats as error
-    return .{ .action = .agent }; // sentinel: caller should treat as format error
+    // No recognized behavior tag found — fall back to passthrough.
+    // The sub-agent likely intended to pass content through but omitted the tag.
+    return .{ .action = .passthrough };
 }
 
 /// Strip any behavior tags that may appear in content after parsing.
@@ -5204,6 +5210,13 @@ test "parseSubAgentResponse continue with empty content becomes passthrough" {
 test "parseSubAgentResponse empty input returns passthrough" {
     const allocator = std.testing.allocator;
     const result = try parseSubAgentResponse(allocator, "");
+    defer freeHookResult(allocator, &result);
+    try std.testing.expectEqual(SkillHookAction.passthrough, result.action);
+}
+
+test "parseSubAgentResponse no behavior tag degrades to passthrough" {
+    const allocator = std.testing.allocator;
+    const result = try parseSubAgentResponse(allocator, "This is plain content without any behavior tag");
     defer freeHookResult(allocator, &result);
     try std.testing.expectEqual(SkillHookAction.passthrough, result.action);
 }

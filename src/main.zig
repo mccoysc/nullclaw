@@ -2823,7 +2823,7 @@ test "hasConfiguredStartableChannels returns true when telegram configured" {
         },
     };
 
-    if (!yc.channel_catalog.isBuildEnabled(.telegram)) return error.SkipZigTest;
+    if (!yc.channel_catalog.isBuildEnabled(.telegram)) return;
     try std.testing.expect(hasConfiguredStartableChannels(&cfg));
 }
 
