@@ -93,49 +93,70 @@ pub fn parseRetryAfterMs(err_msg: []const u8) ?u64 {
         "retry_after ",
     };
 
-    // Case-insensitive search
-    var lower_buf: [4096]u8 = undefined;
-    const check_len = @min(err_msg.len, lower_buf.len);
-    for (err_msg[0..check_len], 0..) |c, idx| {
-        lower_buf[idx] = std.ascii.toLower(c);
-    }
-    const lower = lower_buf[0..check_len];
+    // 安全的缓冲区大小，避免过大的内存使用
+    const max_buffer_size = 1024;
+    
+    // 分段处理长消息，确保安全处理
+    var chunk_start: usize = 0;
+    while (chunk_start < err_msg.len) {
+        // 确定当前块的大小
+        const remaining = err_msg.len - chunk_start;
+        const chunk_size = @min(remaining, max_buffer_size);
+        const chunk_end = chunk_start + chunk_size;
+        const chunk = err_msg[chunk_start..chunk_end];
+        
+        // 为当前块创建小写版本
+        var lower_buf: [1024]u8 = undefined;
+        const check_len = @min(chunk.len, lower_buf.len);
+        for (chunk[0..check_len], 0..) |c, idx| {
+            lower_buf[idx] = std.ascii.toLower(c);
+        }
+        const lower = lower_buf[0..check_len];
 
-    for (prefixes) |prefix| {
-        if (std.mem.indexOf(u8, lower, prefix)) |pos| {
-            const after_start = pos + prefix.len;
-            if (after_start >= check_len) continue;
+        // 在当前块中搜索前缀
+        for (prefixes) |prefix| {
+            if (std.mem.indexOf(u8, lower, prefix)) |pos| {
+                const after_start = pos + prefix.len;
+                if (after_start >= check_len) continue;
 
-            // Skip whitespace
-            var start = after_start;
-            while (start < check_len and (err_msg[start] == ' ' or err_msg[start] == '\t')) {
-                start += 1;
-            }
+                // 计算原始错误消息中的实际位置
+                const global_start = chunk_start + after_start;
+                
+                // 跳过空白字符
+                var start = global_start;
+                while (start < err_msg.len and (err_msg[start] == ' ' or err_msg[start] == '\t')) {
+                    start += 1;
+                }
 
-            // Parse number
-            var end = start;
-            var has_dot = false;
-            while (end < check_len) {
-                if (std.ascii.isDigit(err_msg[end])) {
-                    end += 1;
-                } else if (err_msg[end] == '.' and !has_dot) {
-                    has_dot = true;
-                    end += 1;
-                } else {
-                    break;
+                // 解析数字
+                var end = start;
+                var has_dot = false;
+                while (end < err_msg.len) {
+                    if (std.ascii.isDigit(err_msg[end])) {
+                        end += 1;
+                    } else if (err_msg[end] == '.' and !has_dot) {
+                        has_dot = true;
+                        end += 1;
+                    } else {
+                        break;
+                    }
+                }
+
+                if (end > start) {
+                    const num_str = err_msg[start..end];
+                    if (std.fmt.parseFloat(f64, num_str)) |secs| {
+                        if (std.math.isFinite(secs) and secs >= 0.0) {
+                            const millis = @as(u64, @intFromFloat(secs * 1000.0));
+                            return millis;
+                        }
+                    } else |_| {}
                 }
             }
-
-            if (end > start) {
-                const num_str = err_msg[start..end];
-                if (std.fmt.parseFloat(f64, num_str)) |secs| {
-                    if (std.math.isFinite(secs) and secs >= 0.0) {
-                        const millis = @as(u64, @intFromFloat(secs * 1000.0));
-                        return millis;
-                    }
-                } else |_| {}
-            }
         }
+        
+        // 移动到下一个块，但保留一些重叠以防前缀跨块
+        const overlap = 20; // 足够容纳最长的前缀
+        chunk_start = chunk_end - @min(chunk_size, overlap);
     }
 
     return null;

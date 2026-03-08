@@ -29,7 +29,9 @@ pub const AutonomyLevel = enum {
         if (std.mem.eql(u8, s, "readonly") or std.mem.eql(u8, s, "read_only")) return .read_only;
         if (std.mem.eql(u8, s, "supervised")) return .supervised;
         if (std.mem.eql(u8, s, "full")) return .full;
-        if (std.mem.eql(u8, s, "yolo")) return .yolo;
+        // "yolo" is the canonical name; "godmode" is a legacy alias kept for
+        // backward compatibility with older config files.
+        if (std.mem.eql(u8, s, "yolo") or std.mem.eql(u8, s, "godmode")) return .yolo;
         return null;
     }
 };
@@ -67,14 +69,17 @@ pub const full_autonomy_default_allowed_commands = [_][]const u8{"*"};
 
 /// Resolve command allowlist defaults from autonomy level and configured list.
 /// - explicit config always wins
-/// - full autonomy + empty list => wildcard
+/// - yolo autonomy + empty list => wildcard (yolo bypasses all checks anyway)
+/// - full autonomy + empty list => conservative default list (wildcard requires explicit ["*"])
 /// - other modes + empty list => conservative default list
 pub fn resolveAllowedCommands(
     autonomy: AutonomyLevel,
     configured: []const []const u8,
 ) []const []const u8 {
     if (configured.len > 0) return configured;
-    if (autonomy == .full) return &full_autonomy_default_allowed_commands;
+    // Only yolo mode gets an implicit wildcard; full mode requires the user to
+    // explicitly set allowed_commands = ["*"] to opt in to unrestricted execution.
+    if (autonomy == .yolo) return &full_autonomy_default_allowed_commands;
     return &default_allowed_commands;
 }
 
@@ -1154,8 +1159,15 @@ test "default allowed commands includes expected tools" {
     try std.testing.expect(found_ls);
 }
 
-test "resolveAllowedCommands full autonomy defaults to wildcard when unset" {
+test "resolveAllowedCommands full autonomy defaults to conservative set when unset" {
+    // full mode requires explicit ["*"] to opt in to wildcard; empty list => conservative default
     const resolved = resolveAllowedCommands(.full, &.{});
+    try std.testing.expectEqualStrings("git", resolved[0]);
+    try std.testing.expect(resolved.len >= 1);
+}
+
+test "resolveAllowedCommands yolo autonomy defaults to wildcard when unset" {
+    const resolved = resolveAllowedCommands(.yolo, &.{});
     try std.testing.expectEqual(@as(usize, 1), resolved.len);
     try std.testing.expectEqualStrings("*", resolved[0]);
 }

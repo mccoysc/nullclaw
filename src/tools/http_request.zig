@@ -42,6 +42,12 @@ pub const HttpRequestTool = struct {
             return ToolResult.fail("Only http:// and https:// URLs are allowed");
         }
 
+        // Validate method early — before any network I/O.
+        const method = validateMethod(method_str) orelse {
+            const msg = try std.fmt.allocPrint(allocator, "Unsupported HTTP method: {s}", .{method_str});
+            return ToolResult{ .success = false, .output = "", .error_msg = msg };
+        };
+
         // Build URI
         const uri = std.Uri.parse(url) catch
             return ToolResult.fail("Invalid URL format");
@@ -52,8 +58,7 @@ pub const HttpRequestTool = struct {
         const host = net_security.extractHost(url) orelse
             return ToolResult.fail("Invalid URL: cannot extract host");
 
-        // Check domain allowlist before DNS resolution to avoid leaking
-        // information about disallowed domains via DNS queries.
+        // Check domain allowlist before DNS resolution.
         if (self.allowed_domains.len > 0) {
             if (!net_security.hostMatchesAllowlist(host, self.allowed_domains)) {
                 return ToolResult.fail("Host is not in http_request.allowed_domains");
@@ -67,12 +72,6 @@ pub const HttpRequestTool = struct {
             else => return ToolResult.fail("Unable to verify host safety"),
         };
         defer allocator.free(connect_host);
-
-        // Validate method
-        const method = validateMethod(method_str) orelse {
-            const msg = try std.fmt.allocPrint(allocator, "Unsupported HTTP method: {s}", .{method_str});
-            return ToolResult{ .success = false, .output = "", .error_msg = msg };
-        };
 
         // Parse custom headers from ObjectMap
         const headers_val = root.getValue(args, "headers");

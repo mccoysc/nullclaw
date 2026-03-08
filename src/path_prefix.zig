@@ -18,7 +18,35 @@ pub fn pathStartsWith(path: []const u8, prefix: []const u8) bool {
     return c == '/' or c == '\\';
 }
 
+// Buffer for UNC path normalization
+var unc_norm_buf: [1024]u8 = undefined;
+
 fn normalizeWindowsPrefix(path: []const u8) []const u8 {
+    // \\?\UNC\server\share  →  \\server\share  (UNC extended path)
+    if (path.len >= 8 and
+        path[0] == '\\' and path[1] == '\\' and path[2] == '?' and path[3] == '\\' and
+        (path[4] == 'U' or path[4] == 'u') and
+        (path[5] == 'N' or path[5] == 'n') and
+        (path[6] == 'C' or path[6] == 'c') and
+        path[7] == '\\')
+    {
+        // Replace \\?\UNC\ with \\ so the result is \\server\share
+        // For "\\?\UNC\server\share", we want to return "\\server\share"
+        if (path.len - 8 >= unc_norm_buf.len - 2) {
+            // Path too long for our buffer, return original as fallback
+            return path;
+        }
+        
+        // Copy "\\" prefix
+        unc_norm_buf[0] = '\\';
+        unc_norm_buf[1] = '\\';
+        
+        // Copy the server\share part
+        @memcpy(unc_norm_buf[2..][0..path.len - 8], path[8..]);
+        
+        return unc_norm_buf[0 .. 2 + path.len - 8];
+    }
+    // \\?\C:\...  →  C:\...  (local extended path)
     if (path.len >= 4 and path[0] == '\\' and path[1] == '\\' and path[2] == '?' and path[3] == '\\') {
         return path[4..];
     }
@@ -58,4 +86,12 @@ test "path_prefix windows case-insensitive and separators" {
     try std.testing.expect(pathStartsWith("c:\\windows\\system32\\cmd.exe", "C:\\Windows"));
     try std.testing.expect(pathStartsWith("C:/Windows/System32/cmd.exe", "C:\\Windows"));
     try std.testing.expect(pathStartsWith("\\\\?\\C:\\Windows\\System32\\cmd.exe", "C:\\Windows"));
+}
+
+test "path_prefix windows UNC extended path normalization" {
+    if (comptime @import("builtin").os.tag != .windows) return;
+    // \\?\UNC\server\share\file should match \\server\share
+    try std.testing.expect(pathStartsWith("\\\\?\\UNC\\server\\share\\file.txt", "\\\\server\\share"));
+    // Case-insensitive UNC prefix
+    try std.testing.expect(pathStartsWith("\\\\?\\unc\\server\\share\\file.txt", "\\\\server\\share"));
 }

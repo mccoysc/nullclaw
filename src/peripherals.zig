@@ -354,21 +354,28 @@ pub const ArduinoPeripheral = struct {
                 if (isSerialPathAllowed(self.port_path)) {
                     const file = std.fs.openFileAbsolute(self.port_path, .{ .mode = .read_write }) catch return;
                     self.serial_file = file;
+                    self.connected = true;
+                } else {
+                    // 路径不允许，标记为未连接
+                    self.connected = false;
+                    return Peripheral.PeripheralError.PermissionDenied;
                 }
                 return;
             }
         }
-        // Port not found in listing but arduino-cli exists; mark connected anyway
-        // since the board may not be detected but port may still be valid.
-        self.connected = true;
-
-        // Open serial port for read/write communication
+        // Port not found in listing but arduino-cli exists
+        // 只有当路径通过安全检查时才标记为已连接
         if (isSerialPathAllowed(self.port_path)) {
             const file = std.fs.openFileAbsolute(self.port_path, .{ .mode = .read_write }) catch {
-                // Board detected but serial port not accessible — still mark connected
-                return;
+                // 无法打开端口，标记为未连接
+                self.connected = false;
+                return Peripheral.PeripheralError.IoError;
             };
             self.serial_file = file;
+            self.connected = true;
+        } else {
+            self.connected = false;
+            return Peripheral.PeripheralError.PermissionDenied;
         }
     }
 
