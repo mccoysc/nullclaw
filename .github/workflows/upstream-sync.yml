@@ -5,10 +5,12 @@ name: Upstream Sync
 #
 # The `upstream-sync` branch is the single source-of-truth mirror of
 # upstream/main. It is never committed to directly; only this workflow
-# updates it. A PR from upstream-sync → main lets maintainers review
+# updates it. A PR from upstream-sync -> main lets maintainers review
 # and cherry-pick upstream changes on their own schedule.
 
 on:
+  push:
+    branches: [main]      # run on every merge to main so check suites pass
   schedule:
     - cron: "0 4 * * *"   # daily at 04:00 UTC
   workflow_dispatch:       # allow manual trigger
@@ -20,7 +22,7 @@ permissions:
 
 jobs:
   sync:
-    name: Sync upstream → upstream-sync branch
+    name: Sync upstream -> upstream-sync branch
     runs-on: ubuntu-latest
 
     env:
@@ -66,18 +68,18 @@ jobs:
 
           if [ "$UPSTREAM_SHA" = "$SYNC_SHA" ]; then
             echo "has_new=false" >> "$GITHUB_OUTPUT"
-            echo "No new upstream commits — nothing to do."
+            echo "No new upstream commits - nothing to do."
           else
             echo "has_new=true" >> "$GITHUB_OUTPUT"
             COUNT=$(git rev-list --count "${SYNC_SHA:+$SYNC_SHA..}upstream/$UPSTREAM_BRANCH" 2>/dev/null || echo "?")
-            echo "New upstream commits detected (≈ $COUNT). Will update $SYNC_BRANCH."
+            echo "New upstream commits detected (~$COUNT). Will update $SYNC_BRANCH."
           fi
 
       - name: Update upstream-sync branch
         if: steps.diff_check.outputs.has_new == 'true'
         run: |
           # Hard-reset (or create) the local sync branch to upstream HEAD.
-          # This branch is a pure mirror — no fork-specific commits here.
+          # This branch is a pure mirror - no fork-specific commits here.
           git checkout -B "$SYNC_BRANCH" "upstream/$UPSTREAM_BRANCH"
           git push origin "$SYNC_BRANCH" --force-with-lease
 
