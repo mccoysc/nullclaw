@@ -153,9 +153,12 @@ jobs:
           UPSTREAM_OWNER: ${{ steps.check_release.outputs.upstream_owner }}
           LOG: ${{ steps.notes.outputs.log }}
           WORKFLOW_URL: ${{ github.server_url }}/${{ github.repository }}/actions/workflows/upstream-sync.yml
+          FORK_REPO: ${{ github.repository }}
         run: |
           # Guard: ensure TAG_SHA is not already the same as main HEAD
           MAIN_SHA=$(git rev-parse "origin/main")
+          echo "DEBUG: MAIN_SHA=$MAIN_SHA"
+          echo "DEBUG: TAG_SHA=$TAG_SHA"
           if [ "$TAG_SHA" = "$MAIN_SHA" ]; then
             echo "upstream-sync would equal main — no PR needed."
             exit 0
@@ -165,27 +168,33 @@ jobs:
           # compute a diff even when the two repos have unrelated histories
           # (fork relationship was severed).
           #
-          # Strategy: create a regular (non-merge) commit whose parent is
-          # origin/main HEAD but whose tree is the upstream tag's tree.
-          # This gives GitHub a valid base SHA / head SHA for the PR without
-          # triggering the "already merged" heuristic that GitHub applies to
-          # merge commits whose first parent is the base branch HEAD.
+          # Strategy:
+          #   1. Checkout upstream-sync from main (shares history with main).
+          #   2. Use git read-tree to replace the working tree with the upstream
+          #      tag's tree, then commit. This produces a normal commit (not a
+          #      merge commit) whose parent is main HEAD and whose content is
+          #      the upstream release — giving GitHub a valid PR diff.
           UPSTREAM_TREE=$(git rev-parse "${TAG_SHA}^{tree}")
           MAIN_TREE=$(git rev-parse "origin/main^{tree}")
+          echo "DEBUG: UPSTREAM_TREE=$UPSTREAM_TREE"
+          echo "DEBUG: MAIN_TREE=$MAIN_TREE"
 
           if [ "$UPSTREAM_TREE" = "$MAIN_TREE" ]; then
             echo "Upstream tree is identical to main tree — nothing to sync."
             exit 0
           fi
 
-          # Create a commit: parent = main HEAD, tree = upstream tag tree
-          NEW_COMMIT=$(git commit-tree "$UPSTREAM_TREE" \
-            -p "origin/main" \
-            -m "chore: sync upstream release $LATEST_TAG")
+          # Start upstream-sync from main
+          git checkout -B upstream-sync "origin/main"
 
-          git checkout -B upstream-sync "$NEW_COMMIT"
+          # Replace the entire working tree with the upstream tag's tree
+          git read-tree --reset -u "$UPSTREAM_TREE"
 
-          # Capture the merge commit SHA (not TAG_SHA — we pushed a merge commit)
+          # Commit the result
+          git commit -m "chore: sync upstream release $LATEST_TAG" \
+            --allow-empty
+
+          # Capture the new commit SHA
           SYNC_HEAD=$(git rev-parse HEAD)
           git push origin upstream-sync --force
 
@@ -227,28 +236,53 @@ jobs:
           } > "$PR_BODY_FILE"
 
           # Check for existing PR from upstream-sync branch
-          EXISTING_PR=$(gh pr list --head "upstream-sync" --base main --state open --json number --jq '.[0].number')
+          # Use --repo to be explicit since this repo is no longer a GitHub fork
+          EXISTING_PR=$(gh pr list \
+            --repo "$FORK_REPO" \
+            --head "upstream-sync" \
+            --base main \
+            --state open \
+            --json number \
+            --jq '.[0].number')
+
+          PR_BODY=$(cat "$PR_BODY_FILE")
 
           if [ -n "$EXISTING_PR" ]; then
             echo "Updating existing PR #${EXISTING_PR}."
             gh pr edit "$EXISTING_PR" \
+              --repo "$FORK_REPO" \
               --title "$PR_TITLE" \
               --body-file "$PR_BODY_FILE"
             PR_NUMBER="$EXISTING_PR"
           else
-            echo "Opening new PR: $PR_TITLE"
-            PR_URL=$(gh pr create \
-              --head "upstream-sync" \
-              --base main \
-              --title "$PR_TITLE" \
-              --body-file "$PR_BODY_FILE" \
-              --label "upstream-sync" 2>/dev/null || \
-            gh pr create \
-              --head "upstream-sync" \
-              --base main \
-              --title "$PR_TITLE" \
-              --body-file "$PR_BODY_FILE")
-            PR_NUMBER=$(echo "$PR_URL" | grep -oE '[0-9]+$')
+            echo "Opening new PR via REST API: $PR_TITLE"
+            # Use REST API directly — gh pr create uses GraphQL which rejects
+            # PRs between branches with unrelated histories even when a valid
+            # commit chain exists.
+            # head must be "owner:branch" format for the REST API.
+            FORK_OWNER=$(echo "$FORK_REPO" | cut -d/ -f1)
+            PR_RESPONSE=$(gh api \
+              --method POST \
+              -H "Accept: application/vnd.github+json" \
+              "/repos/${FORK_REPO}/pulls" \
+              -f "title=${PR_TITLE}" \
+              -f "body=${PR_BODY}" \
+              -f "head=${FORK_OWNER}:upstream-sync" \
+              -f "base=main" \
+              --jq '.number' 2>&1) || true
+            echo "REST API response: $PR_RESPONSE"
+            if echo "$PR_RESPONSE" | grep -qE '^[0-9]+$'; then
+              PR_NUMBER="$PR_RESPONSE"
+              # Add label separately
+              gh api \
+                --method POST \
+                -H "Accept: application/vnd.github+json" \
+                "/repos/${FORK_REPO}/issues/${PR_NUMBER}/labels" \
+                -f "labels[]=upstream-sync" 2>/dev/null || true
+            else
+              echo "REST API PR creation failed: $PR_RESPONSE"
+              exit 1
+            fi
           fi
 
           # Check for conflicts
