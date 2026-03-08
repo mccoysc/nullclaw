@@ -818,7 +818,7 @@ fn NonBlockingBase(comptime H: type, comptime MANAGE_HS: bool) type {
 const Loop = switch (@import("builtin").os.tag) {
     .macos, .ios, .tvos, .watchos, .freebsd, .netbsd, .dragonfly, .openbsd => KQueue,
     .linux => EPoll,
-    else => unreachable,
+    else => void, // blockingMode() returns true on unsupported platforms; Loop is never instantiated
 };
 
 const KQueue = struct {
