@@ -103,13 +103,15 @@ jobs:
         run: |
           TAG_SHA="${{ steps.check_release.outputs.tag_sha }}"
           
-          # Check if upstream-sync branch exists and already contains this tag
+          # Check if upstream-sync branch already carries the upstream tag's tree.
+          # We use commit-tree to build the sync commit (not a merge commit), so
+          # TAG_SHA is not an ancestor of upstream-sync. Compare trees instead.
           ALREADY_SYNCED=false
           if git ls-remote --exit-code origin upstream-sync >/dev/null 2>&1; then
              git fetch origin upstream-sync
-             # The branch may be a merge commit (not TAG_SHA itself), so check
-             # whether TAG_SHA is reachable from the current upstream-sync tip.
-             if git merge-base --is-ancestor "$TAG_SHA" "origin/upstream-sync" 2>/dev/null; then
+             SYNC_TREE=$(git rev-parse "origin/upstream-sync^{tree}" 2>/dev/null || echo "")
+             TAG_TREE=$(git rev-parse "${TAG_SHA}^{tree}" 2>/dev/null || echo "")
+             if [ -n "$SYNC_TREE" ] && [ "$SYNC_TREE" = "$TAG_TREE" ]; then
                ALREADY_SYNCED=true
              fi
           fi
@@ -163,27 +165,25 @@ jobs:
           # compute a diff even when the two repos have unrelated histories
           # (fork relationship was severed).
           #
-          # Strategy:
-          #   1. Start upstream-sync from the current main HEAD.
-          #   2. Merge the upstream tag with --allow-unrelated-histories.
-          #      This produces a merge commit that has main as one parent and
-          #      the upstream tag commit as the other, giving GitHub a valid
-          #      base SHA and head SHA for the PR.
-          git checkout -B upstream-sync "origin/main"
-          git merge --allow-unrelated-histories --no-edit \
-            -m "chore: merge upstream release $LATEST_TAG into upstream-sync" \
-            "$TAG_SHA" || {
-            # If merge fails (conflicts), commit the conflicted state so the
-            # PR can still be opened and reviewers can resolve conflicts.
-            git add -A
-            git commit --no-edit -m "chore: merge upstream release $LATEST_TAG (conflicts present)"
-          }
+          # Strategy: create a regular (non-merge) commit whose parent is
+          # origin/main HEAD but whose tree is the upstream tag's tree.
+          # This gives GitHub a valid base SHA / head SHA for the PR without
+          # triggering the "already merged" heuristic that GitHub applies to
+          # merge commits whose first parent is the base branch HEAD.
+          UPSTREAM_TREE=$(git rev-parse "${TAG_SHA}^{tree}")
+          MAIN_TREE=$(git rev-parse "origin/main^{tree}")
 
-          # Verify the merge actually introduced changes vs main
-          if git diff --quiet "origin/main" HEAD; then
-            echo "Merge produced no diff vs main — nothing to sync."
+          if [ "$UPSTREAM_TREE" = "$MAIN_TREE" ]; then
+            echo "Upstream tree is identical to main tree — nothing to sync."
             exit 0
           fi
+
+          # Create a commit: parent = main HEAD, tree = upstream tag tree
+          NEW_COMMIT=$(git commit-tree "$UPSTREAM_TREE" \
+            -p "origin/main" \
+            -m "chore: sync upstream release $LATEST_TAG")
+
+          git checkout -B upstream-sync "$NEW_COMMIT"
 
           # Capture the merge commit SHA (not TAG_SHA — we pushed a merge commit)
           SYNC_HEAD=$(git rev-parse HEAD)
