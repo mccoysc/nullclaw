@@ -32,17 +32,11 @@ const Atomic = @import("portable_atomic.zig").Atomic;
 const log = std.log.scoped(.channel_loop);
 
 /// Set ScheduleTool's default chat_id for delivery context.
-/// After an overwrite hot-reload, a tool named "schedule" might not be a
-/// ScheduleTool (it could be a plugin replacement).  We validate the vtable
-/// pointer before casting to avoid undefined behaviour.
 fn setScheduleToolContext(tools: []const tools_mod.Tool, chat_id: []const u8) void {
     for (tools) |tool| {
         if (std.mem.eql(u8, tool.name(), "schedule")) {
-            // Only cast when the vtable proves this is really a ScheduleTool.
-            if (tool.vtable == &tools_mod.schedule.ScheduleTool.vtable) {
-                const schedule_tool: *tools_mod.schedule.ScheduleTool = @ptrCast(@alignCast(tool.ptr));
-                schedule_tool.setContext("telegram", chat_id);
-            }
+            const schedule_tool: *tools_mod.schedule.ScheduleTool = @ptrCast(@alignCast(tool.ptr));
+            schedule_tool.setContext("telegram", chat_id);
             break;
         }
     }
@@ -54,6 +48,26 @@ fn setScheduleToolContext(tools: []const tools_mod.Tool, chat_id: []const u8) vo
 
 fn shouldSuppressGroupReply(is_group: bool, reply: []const u8) bool {
     return is_group and std.mem.indexOf(u8, reply, "[NO_REPLY]") != null;
+}
+
+fn isStopLikeCommand(content: []const u8) bool {
+    const trimmed = std.mem.trim(u8, content, " \t\r\n");
+    if (trimmed.len < 5 or trimmed[0] != '/') return false;
+
+    const body = trimmed[1..];
+    var split_idx: usize = 0;
+    while (split_idx < body.len) : (split_idx += 1) {
+        const ch = body[split_idx];
+        if (ch == ':' or ch == ' ' or ch == '\t') break;
+    }
+    if (split_idx == 0) return false;
+
+    const raw_name = body[0..split_idx];
+    const name = if (std.mem.indexOfScalar(u8, raw_name, '@')) |mention_sep|
+        raw_name[0..mention_sep]
+    else
+        raw_name;
+    return std.ascii.eqlIgnoreCase(name, "stop") or std.ascii.eqlIgnoreCase(name, "abort");
 }
 
 fn processTelegramMessage(
@@ -71,20 +85,8 @@ fn processTelegramMessage(
     tg_ptr.startTyping(typing_target) catch {};
     defer tg_ptr.stopTyping(typing_target) catch {};
 
-    // Set ScheduleTool context for delivery.
-    // When a registry is present, query it for the live tool list instead of
-    // using the potentially-stale runtime.tools snapshot.
-    if (runtime.tool_registry) |reg| {
-        reg.withSlice(sender, struct {
-            fn f(chat_id: []const u8, tools_slice: []const tools_mod.Tool) void {
-                setScheduleToolContext(tools_slice, chat_id);
-            }
-        }.f) catch |err| {
-            log.warn("withSlice OOM for schedule context: {}", .{err});
-        };
-    } else {
-        setScheduleToolContext(runtime.tools, sender);
-    }
+    // Set ScheduleTool context for delivery
+    setScheduleToolContext(runtime.tools, sender);
 
     // Build conversation context for Telegram
     const conversation_context: ?ConversationContext = .{
@@ -93,18 +95,10 @@ fn processTelegramMessage(
         .group_id = if (is_group) sender else null,
     };
 
-    const reply = runtime.session_mgr.processMessage(session_key, content, conversation_context) catch |err| {
-        // RegistryDraining: plugin replacement in progress — notify the user
-        // instead of silently dropping the message.
-        if (err == error.RegistryDraining) {
-            log.info("message deferred: tool registry draining (plugin replacement in progress)", .{});
-            tg_ptr.sendMessageWithReply(
-                sender,
-                "Plugin tools are being updated, please resend your message in a moment.",
-                reply_to_id,
-            ) catch |send_err| log.err("failed to send drain notice: {}", .{send_err});
-            return;
-        }
+    var stream_ctx = telegram.TelegramChannel.StreamCtx{ .tg_ptr = tg_ptr, .chat_id = sender };
+    const sink = tg_ptr.makeSink(&stream_ctx);
+
+    const reply = runtime.session_mgr.processMessageStreaming(session_key, content, conversation_context, sink) catch |err| {
         log.err("Agent error: {}", .{err});
         const err_msg: []const u8 = switch (err) {
             error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError => "Network error. Please try again.",
@@ -114,16 +108,27 @@ fn processTelegramMessage(
             error.OutOfMemory => "Out of memory.",
             else => "An error occurred. Try again or /new for a fresh session.",
         };
+        if (sink != null) {
+            tg_ptr.channel().sendEvent(sender, "", &.{}, .final) catch {};
+        }
         tg_ptr.sendMessageWithReply(sender, err_msg, reply_to_id) catch |send_err| log.err("failed to send error reply: {}", .{send_err});
         return;
     };
     defer allocator.free(reply);
 
     if (shouldSuppressGroupReply(is_group, reply)) {
+        if (sink != null) {
+            tg_ptr.channel().sendEvent(sender, "", &.{}, .final) catch {};
+        }
         log.info("Smart reply: skipping non-essential message", .{});
         return;
     }
 
+    if (sink != null) {
+        tg_ptr.channel().sendEvent(sender, "", &.{}, .final) catch |err| {
+            log.warn("Draft cleanup error: {}", .{err});
+        };
+    }
     tg_ptr.sendAssistantMessageWithReply(sender, message_sender_id, is_group, reply, reply_to_id) catch |err| {
         log.warn("Send error: {}", .{err});
     };
@@ -172,6 +177,7 @@ fn messageTaskWorker(task_ptr: *MessageTask) void {
     }
     task_ptr.run();
 }
+
 const TELEGRAM_OFFSET_STORE_VERSION: i64 = 1;
 
 fn extractTelegramBotId(bot_token: []const u8) ?[]const u8 {
@@ -359,19 +365,12 @@ pub const ChannelRuntime = struct {
     session_mgr: session_mod.SessionManager,
     provider_bundle: provider_runtime.RuntimeProviderBundle,
     tools: []const tools_mod.Tool,
-    /// Non-null when plugins are configured. Owns all tools (builtin + plugin).
-    /// When set, `tools` is a borrowed view into the registry — do NOT call
-    /// deinitTools on it; the registry frees them on deinit.
-    tool_registry: ?*tools_mod.ToolRegistry = null,
     mem_rt: ?memory_mod.MemoryRuntime,
     bootstrap_provider: ?bootstrap_mod.BootstrapProvider,
     noop_obs: *observability.NoopObserver,
     subagent_manager: ?*subagent_mod.SubagentManager,
     policy_tracker: *security.RateTracker,
     security_policy: *security.SecurityPolicy,
-    /// Previous provider bundles kept alive to avoid dangling pointers in
-    /// sessions that may still reference the old provider.  Freed on deinit.
-    prev_provider_bundles: std.ArrayListUnmanaged(provider_runtime.RuntimeProviderBundle) = .empty,
 
     /// Initialize the runtime from config — mirrors main.zig:702-786 setup.
     pub fn init(allocator: std.mem.Allocator, config: *const Config) !*ChannelRuntime {
@@ -413,7 +412,7 @@ pub const ChannelRuntime = struct {
             .autonomy = config.autonomy.level,
             .workspace_dir = config.workspace_dir,
             .workspace_only = config.autonomy.workspace_only,
-            .allowed_commands = if (config.autonomy.allowed_commands.len > 0) config.autonomy.allowed_commands else &security.default_allowed_commands,
+            .allowed_commands = security.resolveAllowedCommands(config.autonomy.level, config.autonomy.allowed_commands),
             .max_actions_per_hour = config.autonomy.max_actions_per_hour,
             .require_approval_for_medium_risk = config.autonomy.require_approval_for_medium_risk,
             .block_high_risk_commands = config.autonomy.block_high_risk_commands,
@@ -434,48 +433,8 @@ pub const ChannelRuntime = struct {
         ) catch null;
         errdefer if (bootstrap_provider) |bp| bp.deinit();
 
-        // Tools — if external plugins are configured use buildInitialRegistry so
-        // that plugin tools are loaded and hot-reload can be started.  Otherwise
-        // fall back to the lighter-weight allTools() path.
-        const plugins = &config.tools.plugins;
-        const has_plugins = plugins.add.len > 0 or plugins.overwrite.len > 0 or plugins.current_tools_list_path != null;
-
-        var tool_registry: ?*tools_mod.ToolRegistry = null;
-        const tools: []const tools_mod.Tool = if (has_plugins) blk: {
-            const reg = try tools_mod.buildInitialRegistry(allocator, config.workspace_dir, .{
-                .http_enabled = config.http_request.enabled,
-                .http_allowed_domains = config.http_request.allowed_domains,
-                .http_max_response_size = config.http_request.max_response_size,
-                .http_timeout_secs = config.http_request.timeout_secs,
-                .web_search_base_url = config.http_request.search_base_url,
-                .web_search_provider = config.http_request.search_provider,
-                .web_search_fallback_providers = config.http_request.search_fallback_providers,
-                .browser_enabled = config.browser.enabled,
-                .screenshot_enabled = true,
-                .mcp_tools = mcp_tools,
-                .agents = config.agents,
-                .fallback_api_key = resolved_key,
-                .tools_config = config.tools,
-                .allowed_paths = config.autonomy.allowed_paths,
-                .policy = security_policy,
-                .subagent_manager = subagent_manager,
-                .bootstrap_provider = bootstrap_provider,
-                .backend_name = config.memory.backend,
-                .current_tools_list_path = config.tools.plugins.current_tools_list_path,
-            });
-            errdefer {
-                reg.deinit();
-                allocator.destroy(reg);
-            }
-            // Borrow a slice of Tool handles for schedule/memory binding.
-            // The slice buffer is heap-allocated; the tools themselves are owned
-            // by the registry and must NOT be freed by deinitTools.
-            const buf = try allocator.alloc(tools_mod.Tool, reg.count());
-            const copied = reg.copySlice(buf);
-            std.debug.assert(copied == buf.len);
-            tool_registry = reg;
-            break :blk buf;
-        } else tools_mod.allTools(allocator, config.workspace_dir, .{
+        // Tools
+        const tools = tools_mod.allTools(allocator, config.workspace_dir, .{
             .http_enabled = config.http_request.enabled,
             .http_allowed_domains = config.http_request.allowed_domains,
             .http_max_response_size = config.http_request.max_response_size,
@@ -495,11 +454,7 @@ pub const ChannelRuntime = struct {
             .bootstrap_provider = bootstrap_provider,
             .backend_name = config.memory.backend,
         }) catch &.{};
-        errdefer if (tool_registry) |reg| {
-            allocator.free(tools);
-            reg.deinit();
-            allocator.destroy(reg);
-        } else if (tools.len > 0) tools_mod.deinitTools(allocator, tools);
+        errdefer if (tools.len > 0) tools_mod.deinitTools(allocator, tools);
 
         // Noop observer (heap for vtable stability)
         const noop_obs = try allocator.create(observability.NoopObserver);
@@ -510,8 +465,6 @@ pub const ChannelRuntime = struct {
         // Session manager
         var session_mgr = session_mod.SessionManager.init(allocator, config, provider_i, tools, mem_opt, obs, if (mem_rt) |rt| rt.session_store else null, if (mem_rt) |*rt| rt.response_cache else null);
         session_mgr.policy = security_policy;
-        // Wire registry so new sessions get agent.registry set automatically.
-        session_mgr.tool_registry = tool_registry;
 
         // Self — heap-allocated so pointers remain stable
         const self = try allocator.create(ChannelRuntime);
@@ -521,7 +474,6 @@ pub const ChannelRuntime = struct {
             .session_mgr = session_mgr,
             .provider_bundle = runtime_provider,
             .tools = tools,
-            .tool_registry = tool_registry,
             .mem_rt = mem_rt,
             .bootstrap_provider = bootstrap_provider,
             .noop_obs = noop_obs,
@@ -536,75 +488,19 @@ pub const ChannelRuntime = struct {
             self.session_mgr.mem_rt = rt;
             tools_mod.bindMemoryRuntime(tools, rt);
         }
-
-        // Start plugin hot-reload if plugins are configured and an interval is set.
-        if (tool_registry) |reg| {
-            const interval = config.tools.plugins.hot_reload_interval_secs;
-            if (interval > 0) {
-                reg.startHotReload(config.config_path, interval) catch |err| {
-                    log.warn("plugin hot-reload start failed: {}", .{err});
-                };
-            }
-        }
-
         return self;
-    }
-
-    /// Rebuild the provider bundle from the current config (e.g. after an API
-    /// key change).  The old bundle is kept alive in `prev_provider_bundles` so
-    /// that sessions still referencing its vtable pointer remain valid until
-    /// ChannelRuntime is torn down.
-    pub fn rebuildProvider(self: *ChannelRuntime, new_config: *const Config) void {
-        var new_bundle = provider_runtime.RuntimeProviderBundle.init(self.allocator, new_config) catch |err| {
-            log.warn("Provider rebuild failed — sessions still using previous credentials: {s}", .{@errorName(err)});
-            return;
-        };
-
-        // Stash the old bundle so its memory (and vtable pointers) stay valid.
-        self.prev_provider_bundles.append(self.allocator, self.provider_bundle) catch {
-            // If we cannot keep the old bundle alive we must not swap — a
-            // dangling pointer would be worse than a stale API key.
-            new_bundle.deinit();
-            log.warn("Could not stash previous provider bundle; skipping provider update", .{});
-            return;
-        };
-
-        self.provider_bundle = new_bundle;
-        const new_provider = new_bundle.provider();
-
-        // Propagate to session manager + all existing sessions.
-        self.session_mgr.updateProvider(new_provider);
-
-        // Also update the subagent manager's api_key so that background
-        // subagent threads pick up the new credentials.
-        if (self.subagent_manager) |mgr| {
-            mgr.api_key = new_bundle.primaryApiKey();
-            mgr.configured_providers = new_config.providers;
-        }
-
-        log.info("Provider bundle rebuilt — API key / provider config updated for all sessions", .{});
     }
 
     pub fn deinit(self: *ChannelRuntime) void {
         const alloc = self.allocator;
         self.session_mgr.deinit();
-        if (self.tool_registry) |reg| {
-            // Registry owns the tool objects; only free the borrowed slice buffer.
-            alloc.free(self.tools);
-            reg.deinit();
-            alloc.destroy(reg);
-        } else if (self.tools.len > 0) {
-            tools_mod.deinitTools(alloc, self.tools);
-        }
+        if (self.tools.len > 0) tools_mod.deinitTools(alloc, self.tools);
         if (self.bootstrap_provider) |bp| bp.deinit();
         if (self.subagent_manager) |mgr| {
             mgr.deinit();
             alloc.destroy(mgr);
         }
         if (self.mem_rt) |*rt| rt.deinit();
-        // Free stashed provider bundles from hot-reloads, then the current one.
-        for (self.prev_provider_bundles.items) |*bundle| bundle.deinit();
-        self.prev_provider_bundles.deinit(alloc);
         self.provider_bundle.deinit();
         self.policy_tracker.deinit();
         alloc.destroy(self.security_policy);
@@ -740,6 +636,34 @@ pub fn runTelegramLoop(
             if (enable_parallel) {
                 var handled_in_worker = false;
                 parallel_attempt: {
+                    if (isStopLikeCommand(msg.content) and active_worker_threads.get(session_key) != null) {
+                        var interrupt = runtime.session_mgr.requestTurnInterrupt(session_key);
+                        defer interrupt.deinit(allocator);
+                        var dynamic_notice: ?[]u8 = null;
+                        defer if (dynamic_notice) |msg_alloc| allocator.free(msg_alloc);
+                        const immediate_notice: []const u8 = blk_notice: {
+                            if (interrupt.requested and interrupt.active_tool != null) {
+                                dynamic_notice = std.fmt.allocPrint(
+                                    allocator,
+                                    "Stop requested. Sent hard-stop signal to running tool: {s}.",
+                                    .{interrupt.active_tool.?},
+                                ) catch null;
+                                break :blk_notice dynamic_notice orelse "Stop requested. Sent hard-stop signal.";
+                            }
+                            if (interrupt.requested) break :blk_notice "Stop requested. Sent hard-stop signal to in-flight execution.";
+                            break :blk_notice "Stop requested, but no in-flight turn was found for interruption.";
+                        };
+                        tg_ptr.sendMessageWithReply(
+                            msg.sender,
+                            immediate_notice,
+                            reply_to_id,
+                        ) catch |err| {
+                            log.warn("failed to send immediate stop notice: {}", .{err});
+                        };
+                        handled_in_worker = true;
+                        break :parallel_attempt;
+                    }
+
                     // Preserve message order per session_key.
                     if (active_worker_threads.fetchRemove(session_key)) |entry| {
                         var idx: usize = 0;
@@ -984,10 +908,6 @@ pub fn runSignalLoop(
             };
 
             const reply = runtime.session_mgr.processMessage(session_key, msg.content, conversation_context) catch |err| {
-                if (err == error.RegistryDraining) {
-                    log.info("Signal message skipped: tool registry draining", .{});
-                    continue;
-                }
                 log.err("Signal agent error: {}", .{err});
                 const err_msg: []const u8 = switch (err) {
                     error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError => "Network error. Please try again.",
@@ -1189,10 +1109,6 @@ pub fn runMatrixLoop(
             defer mx_ptr.stopTyping(typing_target) catch {};
 
             const reply = runtime.session_mgr.processMessage(session_key, msg.content, null) catch |err| {
-                if (err == error.RegistryDraining) {
-                    log.info("Matrix message skipped: tool registry draining", .{});
-                    continue;
-                }
                 log.err("Matrix agent error: {}", .{err});
                 const err_msg: []const u8 = switch (err) {
                     error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError => "Network error. Please try again.",
@@ -1260,6 +1176,24 @@ test "shouldSuppressGroupReply suppresses only group replies with marker" {
     try std.testing.expect(shouldSuppressGroupReply(true, "ok [NO_REPLY]"));
     try std.testing.expect(!shouldSuppressGroupReply(false, "ok [NO_REPLY]"));
     try std.testing.expect(!shouldSuppressGroupReply(true, "regular reply"));
+}
+
+test "isStopLikeCommand matches stop and abort variants" {
+    try std.testing.expect(isStopLikeCommand("/stop"));
+    try std.testing.expect(isStopLikeCommand("  /stop  "));
+    try std.testing.expect(isStopLikeCommand("/abort"));
+    try std.testing.expect(isStopLikeCommand("/STOP"));
+    try std.testing.expect(isStopLikeCommand("/abort@nullclaw_bot"));
+    try std.testing.expect(isStopLikeCommand("/stop: now"));
+    try std.testing.expect(isStopLikeCommand("/abort please"));
+}
+
+test "isStopLikeCommand rejects non-control commands" {
+    try std.testing.expect(!isStopLikeCommand("stop"));
+    try std.testing.expect(!isStopLikeCommand("/stopping"));
+    try std.testing.expect(!isStopLikeCommand("/aborted"));
+    try std.testing.expect(!isStopLikeCommand("/help"));
+    try std.testing.expect(!isStopLikeCommand(""));
 }
 
 test "ProviderHolder tagged union fields" {
@@ -1509,116 +1443,4 @@ test "telegram offset persistence helper retries after write failure" {
     try std.testing.expectEqual(@as(i64, 101), persisted_update_id);
     const restored = loadTelegramUpdateOffset(allocator, &cfg, "main", "12345:test-token");
     try std.testing.expectEqual(@as(?i64, 101), restored);
-}
-
-// ── Plugin integration tests ──────────────────────────────────────────────────
-// These tests go through the full production path:
-//   Config with tools.plugins → ChannelRuntime.init → buildInitialRegistry
-//   → SessionManager.tool_registry → getOrCreate → agent.registry
-// This is exactly how a real user loads plugins at runtime.
-
-test "ChannelRuntime: Python plugin loaded via config.tools.plugins and wired into agent" {
-    const allocator = std.testing.allocator;
-    const config_types = @import("config_types.zig");
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const workspace = try tmp.dir.realpathAlloc(allocator, ".");
-    defer allocator.free(workspace);
-    const config_path = try std.fs.path.join(allocator, &.{ workspace, "config.json" });
-    defer allocator.free(config_path);
-
-    // Resolve example_plugin.py from repo root (CWD when running zig build test).
-    const py_path = std.fs.cwd().realpathAlloc(
-        allocator,
-        "examples/plugins/example_plugin.py",
-    ) catch |err| {
-        if (err == error.FileNotFound) return; // example file not present
-        return err;
-    };
-    defer allocator.free(py_path);
-
-    // Build a Config that adds the Python plugin.
-    var plugin_entry = [_]config_types.ExternalToolConfig{
-        .{ .kind = .python, .path = py_path },
-    };
-    const tools_cfg = config_types.ToolsConfig{
-        .plugins = .{
-            .add = &plugin_entry,
-            .hot_reload_interval_secs = 0, // disable hot-reload in tests
-        },
-    };
-
-    var allowed_paths = [_][]const u8{workspace};
-    const cfg = Config{
-        .workspace_dir = workspace,
-        .config_path = config_path,
-        .allocator = allocator,
-        .autonomy = .{ .allowed_paths = &allowed_paths },
-        .tools = tools_cfg,
-    };
-
-    var runtime = ChannelRuntime.init(allocator, &cfg) catch |err| {
-        if (err == error.InterpreterNotFound) return; // python3 not in PATH
-        return err;
-    };
-    defer runtime.deinit();
-
-    // Registry must be wired.
-    try std.testing.expect(runtime.tool_registry != null);
-    try std.testing.expect(runtime.session_mgr.tool_registry != null);
-
-    // Plugin tools must be visible in the registry.
-    const reg = runtime.tool_registry.?;
-    // example_plugin.py exports py_upper and py_word_count.
-    const tool_count = reg.count();
-    try std.testing.expect(tool_count > 0);
-    const tool_buf = try allocator.alloc(tools_mod.Tool, tool_count);
-    defer allocator.free(tool_buf);
-    const n = reg.copySlice(tool_buf);
-    var found_upper = false;
-    for (tool_buf[0..n]) |t| {
-        if (std.mem.eql(u8, t.name(), "py_upper")) {
-            found_upper = true;
-            break;
-        }
-    }
-    try std.testing.expect(found_upper);
-
-    // Verify registry was propagated into SessionManager — every new session
-    // will have agent.registry set automatically.
-    try std.testing.expect(runtime.session_mgr.tool_registry != null);
-    try std.testing.expect(runtime.session_mgr.tool_registry.? == reg);
-
-    // Execute py_upper via the registry's tool handle — the same vtable path
-    // that Agent.executeTool() calls internally during a real conversation turn.
-    const tool_count2 = reg.count();
-    const tool_buf2 = try allocator.alloc(tools_mod.Tool, tool_count2);
-    defer allocator.free(tool_buf2);
-    const n2 = reg.copySlice(tool_buf2);
-    var py_upper_tool: ?tools_mod.Tool = null;
-    for (tool_buf2[0..n2]) |t| {
-        if (std.mem.eql(u8, t.name(), "py_upper")) {
-            py_upper_tool = t;
-            break;
-        }
-    }
-    try std.testing.expect(py_upper_tool != null);
-
-    const parsed = try std.json.parseFromSlice(
-        std.json.Value,
-        allocator,
-        "{\"text\":\"hello from config\"}",
-        .{},
-    );
-    defer parsed.deinit();
-
-    const result = try py_upper_tool.?.execute(allocator, parsed.value.object);
-    defer if (result.output.len > 0) allocator.free(result.output);
-    defer if (result.error_msg) |e| allocator.free(e);
-
-    try std.testing.expect(result.success);
-    const out = std.mem.trimRight(u8, result.output, "\r\n");
-    try std.testing.expectEqualStrings("HELLO FROM CONFIG", out);
 }

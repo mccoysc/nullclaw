@@ -8,10 +8,12 @@ const builtin = @import("builtin");
 const log = std.log.scoped(.agent);
 const providers = @import("../providers/root.zig");
 const config_types = @import("../config_types.zig");
+const path_prefix = @import("../path_prefix.zig");
 const Provider = providers.Provider;
 const ChatMessage = providers.ChatMessage;
 const bootstrap_mod = @import("../bootstrap/root.zig");
 const BootstrapProvider = bootstrap_mod.BootstrapProvider;
+const pathStartsWith = path_prefix.pathStartsWith;
 
 const Agent = @import("root.zig").Agent;
 const OwnedMessage = Agent.OwnedMessage;
@@ -455,14 +457,6 @@ fn extractSections(
     }
 
     return try combined.toOwnedSlice(allocator);
-}
-
-fn pathStartsWith(path: []const u8, prefix: []const u8) bool {
-    if (!std.mem.startsWith(u8, path, prefix)) return false;
-    if (path.len == prefix.len) return true;
-    if (prefix.len > 0 and (prefix[prefix.len - 1] == '/' or prefix[prefix.len - 1] == '\\')) return true;
-    const c = path[prefix.len];
-    return c == '/' or c == '\\';
 }
 
 fn openWorkspaceAgentsFileGuarded(

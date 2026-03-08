@@ -2,10 +2,12 @@ const std = @import("std");
 const builtin = @import("builtin");
 const platform = @import("../platform.zig");
 const tools_mod = @import("../tools/root.zig");
+const path_prefix = @import("../path_prefix.zig");
 const Tool = tools_mod.Tool;
 const skills_mod = @import("../skills.zig");
 const bootstrap_mod = @import("../bootstrap/root.zig");
 const BootstrapProvider = bootstrap_mod.BootstrapProvider;
+const pathStartsWith = path_prefix.pathStartsWith;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // System Prompt Builder
@@ -34,16 +36,6 @@ fn workspaceFileDeviceId(file: *const std.fs.File) ?u64 {
 
     const stat = std.posix.fstat(file.handle) catch return null;
     return @as(u64, @intCast(stat.dev));
-}
-
-fn pathStartsWith(path: []const u8, prefix: []const u8) bool {
-    if (!std.mem.startsWith(u8, path, prefix)) return false;
-    if (path.len == prefix.len) return true;
-    if (prefix.len > 0 and (prefix[prefix.len - 1] == '/' or prefix[prefix.len - 1] == '\\')) {
-        return true;
-    }
-    const c = path[prefix.len];
-    return c == '/' or c == '\\';
 }
 
 fn isWorkspaceBootstrapFilenameSafe(filename: []const u8) bool {
@@ -509,15 +501,10 @@ fn appendSkillsSection(
 
     if (skill_list.len == 0) return;
 
-    // Render always=true skills with full instructions first (only prompt-trigger skills)
+    // Render always=true skills with full instructions first
     var has_always = false;
     for (skill_list) |skill| {
-        if (skill.trigger != .prompt) continue; // Only prompt-trigger skills in system prompt
         if (!skill.always or !skill.available) continue;
-        // Skip [action:agent] skills — their instructions are meant for hook
-        // sub-agent processing and contain behavior-tag directives that would
-        // confuse the main LLM if injected into the system prompt.
-        if (skills_mod.parseHookAction(skill.instructions) != null) continue;
         if (!has_always) {
             try w.writeAll("## Skills\n\n");
             has_always = true;
@@ -532,13 +519,10 @@ fn appendSkillsSection(
         }
     }
 
-    // Render summary skills and unavailable skills as XML (only prompt-trigger skills)
+    // Render summary skills and unavailable skills as XML
     var has_summary = false;
     for (skill_list) |skill| {
-        if (skill.trigger != .prompt) continue; // Only prompt-trigger skills in system prompt
         if (skill.always and skill.available) continue; // already rendered above
-        // Skip [action:agent] skills from summary too (see comment above).
-        if (skills_mod.parseHookAction(skill.instructions) != null) continue;
         if (!has_summary) {
             try w.writeAll("## Available Skills\n\n");
             try w.writeAll("Use the read_file tool to load full skill instructions when needed.\n\n");

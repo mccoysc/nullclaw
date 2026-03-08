@@ -437,9 +437,6 @@ fn channelSupervisorThread(
     if (channel_rt) |rt| mgr.setRuntime(rt);
     mgr.setEventBus(event_bus);
 
-    // Enable config hot-reload watching
-    mgr.enableConfigWatch(config.config_path, allocator);
-
     mgr.collectConfiguredChannels() catch |err| {
         state.markError("channels", @errorName(err));
         health.markComponentError("channels", @errorName(err));
@@ -452,9 +449,7 @@ fn channelSupervisorThread(
         return;
     };
 
-    // Always run supervision loop when config watching is enabled
-    // (even with 0 channels, so we can detect newly added channels via hot-reload)
-    if (started > 0 or mgr.config_watch_enabled) {
+    if (started > 0) {
         state.markRunning("channels");
         health.markComponentOk("channels");
         mgr.supervisionLoop(state); // blocks until shutdown
@@ -714,7 +709,7 @@ fn inboundDispatcherThread(
             typing_recipient,
         );
 
-        const use_streaming_outbound = std.mem.eql(u8, msg.channel, "web");
+        const use_streaming_outbound = std.mem.eql(u8, msg.channel, "web") or std.mem.eql(u8, msg.channel, "telegram");
         var streaming_ctx = StreamingOutboundCtx{
             .allocator = allocator,
             .event_bus = event_bus,
@@ -722,18 +717,26 @@ fn inboundDispatcherThread(
             .account_id = outbound_account_id,
             .chat_id = msg.chat_id,
         };
+        var stream_sink: ?streaming.Sink = null;
+        var outbound_tag_filter: streaming.TagFilter = undefined;
+        if (use_streaming_outbound) {
+            const raw_sink = streaming.Sink{
+                .callback = publishStreamingChunk,
+                .ctx = @ptrCast(&streaming_ctx),
+            };
+            if (std.mem.eql(u8, msg.channel, "telegram")) {
+                outbound_tag_filter = streaming.TagFilter.init(raw_sink);
+                stream_sink = outbound_tag_filter.sink();
+            } else {
+                stream_sink = raw_sink;
+            }
+        }
 
         const reply = runtime.session_mgr.processMessageStreaming(
             session_key,
             msg.content,
             null,
-            if (use_streaming_outbound)
-                streaming.Sink{
-                    .callback = publishStreamingChunk,
-                    .ctx = @ptrCast(&streaming_ctx),
-                }
-            else
-                null,
+            stream_sink,
         ) catch |err| {
             log.warn("inbound dispatch process failed: {}", .{err});
 
@@ -1701,7 +1704,7 @@ test "hasSupervisedChannels true for nostr" {
         .owner_pubkey = "a" ** 64,
     };
     config.channels.nostr = &ns_cfg;
-    try std.testing.expectEqual(channel_catalog.isBuildEnabled(.nostr), hasSupervisedChannels(&config));
+    try std.testing.expect(hasSupervisedChannels(&config));
 }
 
 test "stateFilePath derives from config_path" {

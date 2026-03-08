@@ -90,19 +90,11 @@ pub const NamedAgentConfig = config_types.NamedAgentConfig;
 pub const McpServerConfig = config_types.McpServerConfig;
 pub const ModelPricing = config_types.ModelPricing;
 pub const ToolsConfig = config_types.ToolsConfig;
-pub const ExternalToolKind = config_types.ExternalToolKind;
-pub const ExternalToolConfig = config_types.ExternalToolConfig;
-pub const ToolPluginsConfig = config_types.ToolPluginsConfig;
 pub const ProviderEntry = config_types.ProviderEntry;
 pub const AudioMediaConfig = config_types.AudioMediaConfig;
 pub const DmScope = config_types.DmScope;
 pub const IdentityLink = config_types.IdentityLink;
 pub const SessionConfig = config_types.SessionConfig;
-pub const ChannelModelOverride = config_types.ChannelModelOverride;
-pub const MqttEndpointConfig = config_types.MqttEndpointConfig;
-pub const MqttConfig = config_types.MqttConfig;
-pub const RedisStreamEndpointConfig = config_types.RedisStreamEndpointConfig;
-pub const RedisStreamConfig = config_types.RedisStreamConfig;
 pub const NostrConfig = config_types.NostrConfig;
 
 // ── Top-level Config ────────────────────────────────────────────
@@ -122,21 +114,6 @@ pub const Config = struct {
     legacy_default_model_detected: bool = false,
     default_temperature: f64 = 0.7,
     reasoning_effort: ?[]const u8 = null,
-
-    // Global sub-agent and tools reviewer model overrides.
-    // When set, sub-agent / tools-reviewer LLM calls use these instead of the
-    // general default_provider / default_model.  Per-channel overrides take
-    // precedence over these global overrides.
-    sub_agent_provider: ?[]const u8 = null,
-    sub_agent_model: ?[]const u8 = null,
-    sub_agent_temperature: ?f64 = null,
-    sub_agent_max_context_tokens: u64 = 0,
-    sub_agent_base_url: ?[]const u8 = null,
-    tools_reviewer_provider: ?[]const u8 = null,
-    tools_reviewer_model: ?[]const u8 = null,
-    tools_reviewer_temperature: ?f64 = null,
-    tools_reviewer_max_context_tokens: u64 = 0,
-    tools_reviewer_base_url: ?[]const u8 = null,
 
     // Model routing and delegate agents
     model_routes: []const ModelRouteConfig = &.{},
@@ -606,49 +583,6 @@ pub const Config = struct {
         if (self.reasoning_effort) |value| {
             try w.print("  \"reasoning_effort\": \"{s}\",\n", .{value});
         }
-        // Global sub-agent / tools-reviewer model overrides
-        if (self.sub_agent_provider) |v| {
-            try w.print("  \"sub_agent_provider\": ", .{});
-            try writeJsonStr(w, v);
-            try w.print(",\n", .{});
-        }
-        if (self.sub_agent_model) |v| {
-            try w.print("  \"sub_agent_model\": ", .{});
-            try writeJsonStr(w, v);
-            try w.print(",\n", .{});
-        }
-        if (self.sub_agent_temperature) |t| {
-            try w.print("  \"sub_agent_temperature\": {d:.1},\n", .{t});
-        }
-        if (self.sub_agent_max_context_tokens > 0) {
-            try w.print("  \"sub_agent_max_context_tokens\": {d},\n", .{self.sub_agent_max_context_tokens});
-        }
-        if (self.sub_agent_base_url) |v| {
-            try w.print("  \"sub_agent_base_url\": ", .{});
-            try writeJsonStr(w, v);
-            try w.print(",\n", .{});
-        }
-        if (self.tools_reviewer_provider) |v| {
-            try w.print("  \"tools_reviewer_provider\": ", .{});
-            try writeJsonStr(w, v);
-            try w.print(",\n", .{});
-        }
-        if (self.tools_reviewer_model) |v| {
-            try w.print("  \"tools_reviewer_model\": ", .{});
-            try writeJsonStr(w, v);
-            try w.print(",\n", .{});
-        }
-        if (self.tools_reviewer_temperature) |t| {
-            try w.print("  \"tools_reviewer_temperature\": {d:.1},\n", .{t});
-        }
-        if (self.tools_reviewer_max_context_tokens > 0) {
-            try w.print("  \"tools_reviewer_max_context_tokens\": {d},\n", .{self.tools_reviewer_max_context_tokens});
-        }
-        if (self.tools_reviewer_base_url) |v| {
-            try w.print("  \"tools_reviewer_base_url\": ", .{});
-            try writeJsonStr(w, v);
-            try w.print(",\n", .{});
-        }
 
         // models.providers
         if (self.providers.len > 0) {
@@ -802,8 +736,6 @@ pub const Config = struct {
             .compaction_max_source_chars = self.agent.compaction_max_source_chars,
             .status_show_emojis = self.agent.status_show_emojis,
             .message_timeout_secs = self.agent.message_timeout_secs,
-            .sub_agent_max_iterations = self.agent.sub_agent_max_iterations,
-            .sub_agent_review_after = self.agent.sub_agent_review_after,
         }, .{})});
 
         // Channels
@@ -864,48 +796,6 @@ pub const Config = struct {
         try w.print("    \"shell_max_output_bytes\": {d},\n", .{self.tools.shell_max_output_bytes});
         try w.print("    \"max_file_size_bytes\": {d},\n", .{self.tools.max_file_size_bytes});
         try w.print("    \"web_fetch_max_chars\": {d}", .{self.tools.web_fetch_max_chars});
-        // tools.plugins
-        {
-            const pl = self.tools.plugins;
-            const has_plugins = pl.overwrite.len > 0 or pl.add.len > 0 or
-                pl.current_tools_list_path != null or pl.hot_reload_interval_secs != 5;
-            if (has_plugins) {
-                try w.print(",\n    \"plugins\": {{\n", .{});
-                var wrote_field = false;
-                if (pl.overwrite.len > 0) {
-                    try w.print("      \"overwrite\": [", .{});
-                    for (pl.overwrite, 0..) |entry, i| {
-                        try w.print("{{\"kind\": \"{s}\", \"path\": ", .{@tagName(entry.kind)});
-                        try writeJsonStr(w, entry.path);
-                        try w.print("}}", .{});
-                        if (i + 1 < pl.overwrite.len) try w.print(", ", .{});
-                    }
-                    try w.print("]", .{});
-                    wrote_field = true;
-                }
-                if (pl.add.len > 0) {
-                    if (wrote_field) try w.print(",\n", .{}) else wrote_field = true;
-                    try w.print("      \"add\": [", .{});
-                    for (pl.add, 0..) |entry, i| {
-                        try w.print("{{\"kind\": \"{s}\", \"path\": ", .{@tagName(entry.kind)});
-                        try writeJsonStr(w, entry.path);
-                        try w.print("}}", .{});
-                        if (i + 1 < pl.add.len) try w.print(", ", .{});
-                    }
-                    try w.print("]", .{});
-                }
-                if (pl.current_tools_list_path) |p| {
-                    if (wrote_field) try w.print(",\n", .{}) else wrote_field = true;
-                    try w.print("      \"current_tools_list_path\": ", .{});
-                    try writeJsonStr(w, p);
-                }
-                if (pl.hot_reload_interval_secs != 5) {
-                    if (wrote_field) try w.print(",\n", .{});
-                    try w.print("      \"hot_reload_interval_secs\": {d}", .{pl.hot_reload_interval_secs});
-                }
-                try w.print("\n    }}", .{});
-            }
-        }
         // tools.media.audio
         {
             const am = self.audio_media;
@@ -4512,60 +4402,4 @@ test "NostrConfig dm_relays default is auth.nostr1.com" {
     };
     try std.testing.expectEqual(@as(usize, 1), cfg.dm_relays.len);
     try std.testing.expectEqualStrings("wss://auth.nostr1.com", cfg.dm_relays[0]);
-}
-
-test "parseJson parses global sub_agent and tools_reviewer fields" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    const json =
-        \\{
-        \\  "sub_agent_provider": "anthropic",
-        \\  "sub_agent_model": "claude-sonnet-4-20250514",
-        \\  "tools_reviewer_provider": "openrouter",
-        \\  "tools_reviewer_model": "openrouter/google/gemini-2.5-flash"
-        \\}
-    ;
-    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
-    try cfg.parseJson(json);
-
-    try std.testing.expectEqualStrings("anthropic", cfg.sub_agent_provider.?);
-    try std.testing.expectEqualStrings("claude-sonnet-4-20250514", cfg.sub_agent_model.?);
-    try std.testing.expectEqualStrings("openrouter", cfg.tools_reviewer_provider.?);
-    try std.testing.expectEqualStrings("openrouter/google/gemini-2.5-flash", cfg.tools_reviewer_model.?);
-}
-
-test "parseJson sub_agent and tools_reviewer fields default to null" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    const json =
-        \\{"default_temperature": 0.5}
-    ;
-    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
-    try cfg.parseJson(json);
-
-    try std.testing.expect(cfg.sub_agent_provider == null);
-    try std.testing.expect(cfg.sub_agent_model == null);
-    try std.testing.expect(cfg.tools_reviewer_provider == null);
-    try std.testing.expect(cfg.tools_reviewer_model == null);
-}
-
-test "parseJson partial sub_agent fields" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    const json =
-        \\{"sub_agent_model": "my-model"}
-    ;
-    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
-    try cfg.parseJson(json);
-
-    try std.testing.expect(cfg.sub_agent_provider == null);
-    try std.testing.expectEqualStrings("my-model", cfg.sub_agent_model.?);
-    try std.testing.expect(cfg.tools_reviewer_provider == null);
-    try std.testing.expect(cfg.tools_reviewer_model == null);
 }

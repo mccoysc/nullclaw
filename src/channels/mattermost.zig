@@ -4,6 +4,7 @@ const root = @import("root.zig");
 const websocket = @import("../websocket.zig");
 const bus_mod = @import("../bus.zig");
 const config_types = @import("../config_types.zig");
+const url_percent = @import("../url_percent.zig");
 
 const Atomic = @import("../portable_atomic.zig").Atomic;
 
@@ -847,18 +848,8 @@ fn componentAsSlice(component: std.Uri.Component) []const u8 {
     };
 }
 
-fn isUnreserved(c: u8) bool {
-    return std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.' or c == '~';
-}
-
 fn appendUrlEncoded(writer: anytype, text: []const u8) !void {
-    for (text) |c| {
-        if (isUnreserved(c)) {
-            try writer.writeByte(c);
-        } else {
-            try writer.print("%{X:0>2}", .{c});
-        }
-    }
+    try url_percent.appendPercentEncodedWriter(writer, text);
 }
 
 fn parseTarget(target: []const u8) !ParsedTarget {

@@ -736,6 +736,7 @@ fn formatWhoAmI(self: anytype) ![]const u8 {
 
 fn parseReasoningEffort(raw: []const u8) ?[]const u8 {
     if (std.ascii.eqlIgnoreCase(raw, "off")) return "";
+    if (std.ascii.eqlIgnoreCase(raw, "on")) return "medium";
     if (std.ascii.eqlIgnoreCase(raw, "minimal")) return "minimal";
     if (std.ascii.eqlIgnoreCase(raw, "low")) return "low";
     if (std.ascii.eqlIgnoreCase(raw, "medium")) return "medium";
@@ -2418,7 +2419,7 @@ pub fn handleSlashCommand(self: anytype, message: []const u8) !?[]const u8 {
             \\  /model, /models, /model <name>
             \\  /think, /verbose, /reasoning
             \\  /exec, /queue, /usage, /tts, /voice
-            \\  /stop, /compact
+            \\  /stop, /abort, /compact
             \\  /allowlist, /approve, /context
             \\  /export-session, /export
             \\  /session ttl <duration|off>
@@ -2463,7 +2464,7 @@ pub fn handleSlashCommand(self: anytype, message: []const u8) !?[]const u8 {
     if (isSlashName(cmd, "queue")) return try handleQueueCommand(self, cmd.arg);
     if (isSlashName(cmd, "usage")) return try handleUsageCommand(self, cmd.arg);
     if (isSlashName(cmd, "tts") or isSlashName(cmd, "voice")) return try handleTtsCommand(self, cmd.arg);
-    if (isSlashName(cmd, "stop")) return try handleStopCommand(self);
+    if (isSlashName(cmd, "stop") or isSlashName(cmd, "abort")) return try handleStopCommand(self);
     if (isSlashName(cmd, "compact")) {
         if (self.forceCompressHistory()) {
             return try self.allocator.dupe(u8, "Context compacted.");

@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const root = @import("../root.zig");
 const http_util = @import("../../http_util.zig");
+const url_percent = @import("../../url_percent.zig");
 
 const log = std.log.scoped(.web_search);
 
@@ -122,16 +123,7 @@ pub fn urlEncode(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
 }
 
 pub fn urlEncodePath(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(allocator);
-    for (input) |c| {
-        if (std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.' or c == '~') {
-            try buf.append(allocator, c);
-        } else {
-            try buf.appendSlice(allocator, &.{ '%', hexDigit(c >> 4), hexDigit(c & 0x0f) });
-        }
-    }
-    return buf.toOwnedSlice(allocator);
+    return url_percent.encode(allocator, input);
 }
 
 fn hexDigit(v: u8) u8 {

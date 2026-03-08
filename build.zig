@@ -84,8 +84,6 @@ const ChannelSelection = struct {
     enable_channel_qq: bool = false,
     enable_channel_maixcam: bool = false,
     enable_channel_signal: bool = false,
-    enable_channel_mqtt: bool = false,
-    enable_channel_redis_stream: bool = false,
     enable_channel_nostr: bool = false,
     enable_channel_web: bool = false,
 
@@ -107,8 +105,6 @@ const ChannelSelection = struct {
         self.enable_channel_qq = true;
         self.enable_channel_maixcam = true;
         self.enable_channel_signal = true;
-        self.enable_channel_mqtt = true;
-        self.enable_channel_redis_stream = true;
         self.enable_channel_nostr = true;
         self.enable_channel_web = true;
     }
@@ -178,10 +174,6 @@ fn parseChannelsOption(raw: []const u8) !ChannelSelection {
             selection.enable_channel_maixcam = true;
         } else if (std.mem.eql(u8, token, "signal")) {
             selection.enable_channel_signal = true;
-        } else if (std.mem.eql(u8, token, "mqtt")) {
-            selection.enable_channel_mqtt = true;
-        } else if (std.mem.eql(u8, token, "redis_stream") or std.mem.eql(u8, token, "redis-stream")) {
-            selection.enable_channel_redis_stream = true;
         } else if (std.mem.eql(u8, token, "nostr")) {
             selection.enable_channel_nostr = true;
         } else if (std.mem.eql(u8, token, "web")) {
@@ -324,12 +316,11 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const is_wasi = target.result.os.tag == .wasi;
     const is_static = b.option(bool, "static", "Static build") orelse false;
-    const app_version = b.option([]const u8, "version", "Version string embedded in the binary") orelse
-        getGitVersion(b) orelse "unknown";
+    const app_version = b.option([]const u8, "version", "Version string embedded in the binary") orelse "2026.3.7";
     const channels_raw = b.option(
         []const u8,
         "channels",
-        "Channels list. Tokens: all|none|cli|telegram|discord|slack|whatsapp|matrix|mattermost|irc|imessage|email|lark|dingtalk|line|onebot|qq|maixcam|signal|mqtt|redis_stream|nostr|web (default: all)",
+        "Channels list. Tokens: all|none|cli|telegram|discord|slack|whatsapp|matrix|mattermost|irc|imessage|email|lark|dingtalk|line|onebot|qq|maixcam|signal|nostr|web (default: all)",
     );
     const channels = if (channels_raw) |raw| blk: {
         const parsed = parseChannelsOption(raw) catch {
@@ -377,38 +368,21 @@ pub fn build(b: *std.Build) void {
     const enable_channel_qq = channels.enable_channel_qq;
     const enable_channel_maixcam = channels.enable_channel_maixcam;
     const enable_channel_signal = channels.enable_channel_signal;
-    const enable_channel_mqtt = channels.enable_channel_mqtt;
-    const enable_channel_redis_stream = channels.enable_channel_redis_stream;
     const enable_channel_nostr = channels.enable_channel_nostr;
-    // Resolve websocket dependency when the web channel is enabled.
-    // The package is vendored in vendor/websocket/ so it is always available.
-    const ws_dep: ?*std.Build.Dependency = if (channels.enable_channel_web)
-        b.dependency("websocket", .{ .target = target, .optimize = optimize })
-    else
-        null;
     const enable_channel_web = channels.enable_channel_web;
 
-    // Force-disable C-linked backends when targeting WASI (no C library linking in wasm32-wasi).
-    const effective_enable_sqlite = enable_sqlite and !is_wasi;
-    const effective_enable_postgres = enable_postgres and !is_wasi;
-    if (is_wasi and enable_sqlite) {
-        std.log.warn("SQLite backend disabled: C linking is not supported on wasm32-wasi", .{});
-    }
-    if (is_wasi and enable_postgres) {
-        std.log.warn("PostgreSQL backend disabled: C linking is not supported on wasm32-wasi", .{});
-    }
-    const effective_enable_memory_sqlite = effective_enable_sqlite and enable_memory_sqlite;
-    const effective_enable_memory_lucid = effective_enable_sqlite and enable_memory_lucid;
-    const effective_enable_memory_lancedb = effective_enable_sqlite and enable_memory_lancedb;
+    const effective_enable_memory_sqlite = enable_sqlite and enable_memory_sqlite;
+    const effective_enable_memory_lucid = enable_sqlite and enable_memory_lucid;
+    const effective_enable_memory_lancedb = enable_sqlite and enable_memory_lancedb;
 
-    if (effective_enable_sqlite) {
+    if (enable_sqlite) {
         verifyVendoredSqliteHashes(b) catch {
             std.log.err("vendored sqlite integrity check failed", .{});
             std.process.exit(1);
         };
     }
 
-    const sqlite3 = if (effective_enable_sqlite) blk: {
+    const sqlite3 = if (enable_sqlite) blk: {
         const sqlite3_dep = b.dependency("sqlite3", .{
             .target = target,
             .optimize = optimize,
@@ -424,8 +398,8 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "enable_memory_markdown", enable_memory_markdown);
     build_options.addOption(bool, "enable_memory_memory", enable_memory_memory);
     build_options.addOption(bool, "enable_memory_api", enable_memory_api);
-    build_options.addOption(bool, "enable_sqlite", effective_enable_sqlite);
-    build_options.addOption(bool, "enable_postgres", effective_enable_postgres);
+    build_options.addOption(bool, "enable_sqlite", enable_sqlite);
+    build_options.addOption(bool, "enable_postgres", enable_postgres);
     build_options.addOption(bool, "enable_memory_sqlite", effective_enable_memory_sqlite);
     build_options.addOption(bool, "enable_memory_lucid", effective_enable_memory_lucid);
     build_options.addOption(bool, "enable_memory_redis", enable_memory_redis);
@@ -447,8 +421,6 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "enable_channel_qq", enable_channel_qq);
     build_options.addOption(bool, "enable_channel_maixcam", enable_channel_maixcam);
     build_options.addOption(bool, "enable_channel_signal", enable_channel_signal);
-    build_options.addOption(bool, "enable_channel_mqtt", enable_channel_mqtt);
-    build_options.addOption(bool, "enable_channel_redis_stream", enable_channel_redis_stream);
     build_options.addOption(bool, "enable_channel_nostr", enable_channel_nostr);
     build_options.addOption(bool, "enable_channel_web", enable_channel_web);
     const build_options_module = build_options.createModule();
@@ -464,11 +436,15 @@ pub fn build(b: *std.Build) void {
         if (sqlite3) |lib| {
             module.linkLibrary(lib);
         }
-        if (effective_enable_postgres) {
+        if (enable_postgres) {
             module.linkSystemLibrary("pq", .{});
         }
         if (enable_channel_web) {
-            module.addImport("websocket", ws_dep.?.module("websocket"));
+            const ws_dep = b.dependency("websocket", .{
+                .target = target,
+                .optimize = optimize,
+            });
+            module.addImport("websocket", ws_dep.module("websocket"));
         }
         break :blk module;
     };
@@ -498,19 +474,12 @@ pub fn build(b: *std.Build) void {
         });
     exe.root_module.addImport("build_options", build_options_module);
 
-    // Link libc so that std.DynLib uses dlopen/dlsym for SO plugin loading.
-    // Without this Zig falls back to ElfDynLib which does not perform full
-    // relocation, causing data-section pointers in plugin SOs to be invalid.
-    if (!is_wasi) {
-        exe.linkLibC();
-    }
-
     // Link SQLite on the compile step (not the module)
     if (!is_wasi) {
         if (sqlite3) |lib| {
             exe.linkLibrary(lib);
         }
-        if (effective_enable_postgres) {
+        if (enable_postgres) {
             exe.root_module.linkSystemLibrary("pq", .{});
         }
     }
@@ -550,7 +519,7 @@ pub fn build(b: *std.Build) void {
         if (sqlite3) |lib| {
             lib_tests.linkLibrary(lib);
         }
-        if (effective_enable_postgres) {
+        if (enable_postgres) {
             lib_tests.root_module.linkSystemLibrary("pq", .{});
         }
 
@@ -558,24 +527,4 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&b.addRunArtifact(lib_tests).step);
         test_step.dependOn(&b.addRunArtifact(exe_tests).step);
     }
-}
-
-/// Attempt to derive the version string from the current git tag.
-/// Returns the exact tag (e.g. "v2026.3.7.2"), preserving any "v" prefix,
-/// or null when git is unavailable or HEAD is not at an exact tag.
-fn getGitVersion(b: *std.Build) ?[]const u8 {
-    const result = std.process.Child.run(.{
-        .allocator = b.allocator,
-        .argv = &.{ "git", "describe", "--tags", "--exact-match" },
-        .max_output_bytes = 256,
-    }) catch return null;
-    defer b.allocator.free(result.stdout);
-    defer b.allocator.free(result.stderr);
-    switch (result.term) {
-        .Exited => |code| if (code != 0) return null,
-        else => return null,
-    }
-    const trimmed = std.mem.trim(u8, result.stdout, &std.ascii.whitespace);
-    if (trimmed.len == 0) return null;
-    return b.allocator.dupe(u8, trimmed) catch null;
 }
