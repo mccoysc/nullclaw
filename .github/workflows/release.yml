@@ -51,6 +51,7 @@ jobs:
       run:
         shell: bash
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
@@ -73,11 +74,11 @@ jobs:
             target: macos-x86_64
             zig_target: x86_64-macos
             ext: ""
-          - os: windows-latest
+          - os: ubuntu-latest
             target: windows-x86_64
             zig_target: x86_64-windows
             ext: ".exe"
-          - os: windows-latest
+          - os: ubuntu-latest
             target: windows-aarch64
             zig_target: aarch64-windows
             ext: ".exe"
@@ -144,7 +145,6 @@ jobs:
             nullclaw-${{ needs.version.outputs.version }}-macos-x86_64.bin
             nullclaw-${{ needs.version.outputs.version }}-windows-x86_64.exe
             nullclaw-${{ needs.version.outputs.version }}-windows-aarch64.exe
-            nullclaw-${{ needs.version.outputs.version }}-wasm32-wasi.wasm
           generate_release_notes: true
 
   docker:
