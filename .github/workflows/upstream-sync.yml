@@ -76,7 +76,7 @@ jobs:
 
           # Fetch the tag
           git fetch upstream "refs/tags/$LATEST_TAG"
-          TAG_SHA=$(git rev-parse FETCH_HEAD)
+          TAG_SHA=$(git rev-parse FETCH_HEAD^{commit})
           echo "tag_sha=$TAG_SHA" >> "$GITHUB_OUTPUT"
 
           # Check if this tag is already merged into local main
