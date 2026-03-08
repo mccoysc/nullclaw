@@ -132,16 +132,7 @@ jobs:
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Sync release to branch
-        if: steps.check_release.outputs.has_new == 'true' && steps.check_update.outputs.needed == 'true'
-        run: |
-          TAG_SHA="${{ steps.check_release.outputs.tag_sha }}"
-          git checkout -B upstream-sync "$TAG_SHA"
-          git push origin upstream-sync --force
-          echo "Pushed upstream-sync. Waiting for GitHub to update refs..."
-          sleep 10
-
-      - name: Create or update PR
+      - name: Sync release to branch and create PR
         if: steps.check_release.outputs.has_new == 'true' && steps.check_update.outputs.needed == 'true'
         env:
           GH_TOKEN: ${{ secrets.ACTION_TOKEN }}
@@ -151,6 +142,27 @@ jobs:
           LOG: ${{ steps.notes.outputs.log }}
           WORKFLOW_URL: ${{ github.server_url }}/${{ github.repository }}/actions/workflows/upstream-sync.yml
         run: |
+          # Reset upstream-sync branch to the release commit
+          git checkout -B upstream-sync "$TAG_SHA"
+          git push origin upstream-sync --force
+
+          # Wait for GitHub to register the branch
+          echo "Waiting for GitHub to register branch..."
+          for i in $(seq 1 12); do
+            REMOTE_SHA=$(git ls-remote origin refs/heads/upstream-sync | awk '{print $1}')
+            if [ "$REMOTE_SHA" = "$TAG_SHA" ]; then
+              echo "Branch confirmed at $TAG_SHA"
+              break
+            fi
+            echo "Attempt $i: branch not ready yet, waiting 5s..."
+            sleep 5
+          done
+
+          if [ "$REMOTE_SHA" != "$TAG_SHA" ]; then
+            echo "Error: Branch did not update to expected SHA after 60s."
+            exit 1
+          fi
+
           PR_TITLE="chore: sync upstream release $LATEST_TAG"
 
           # Write body to a temp file
@@ -187,7 +199,7 @@ jobs:
               --base main \
               --title "$PR_TITLE" \
               --body-file "$PR_BODY_FILE" \
-              --label "upstream-sync" || \
+              --label "upstream-sync" 2>/dev/null || \
             gh pr create \
               --head "upstream-sync" \
               --base main \
@@ -199,12 +211,18 @@ jobs:
           # Check for conflicts
           if [ -n "$PR_NUMBER" ]; then
             echo "Checking for merge conflicts in PR #$PR_NUMBER..."
-            sleep 10
-            MERGE_STATUS=$(gh pr view "$PR_NUMBER" --json mergeable --jq .mergeable)
+            for i in $(seq 1 6); do
+              MERGE_STATUS=$(gh pr view "$PR_NUMBER" --json mergeable --jq .mergeable)
+              if [ "$MERGE_STATUS" != "UNKNOWN" ]; then
+                break
+              fi
+              echo "Mergeability unknown, waiting 10s..."
+              sleep 10
+            done
             if [ "$MERGE_STATUS" = "CONFLICTING" ]; then
               echo "Merge conflicts detected."
-              gh pr edit "$PR_NUMBER" --add-label "conflicts"
-              gh pr comment "$PR_NUMBER" --body "Merge conflicts detected. Please use GitHub Copilot to resolve."
+              gh pr edit "$PR_NUMBER" --add-label "conflicts" 2>/dev/null || true
+              gh pr comment "$PR_NUMBER" --body "@github-copilot Merge conflicts detected. Please help resolve the conflicts in this PR."
             fi
           fi
 
