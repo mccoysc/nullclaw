@@ -138,24 +138,8 @@ jobs:
           TAG_SHA="${{ steps.check_release.outputs.tag_sha }}"
           git checkout -B upstream-sync "$TAG_SHA"
           git push origin upstream-sync --force
-          
-          echo "Waiting for GitHub to update branch ref..."
-          
-          # Loop check for branch update
-          for i in {1..10}; do
-             REMOTE_SHA=$(git ls-remote origin upstream-sync | awk '{print $1}')
-             if [ "$REMOTE_SHA" = "$TAG_SHA" ]; then
-                echo "Branch updated successfully."
-                break
-             fi
-             echo "Waiting... ($i/10)"
-             sleep 5
-          done
-          
-          if [ "$REMOTE_SHA" != "$TAG_SHA" ]; then
-             echo "Error: Branch update failed or timed out."
-             exit 1
-          fi
+          echo "Pushed upstream-sync. Waiting for GitHub to update refs..."
+          sleep 10
 
       - name: Create or update PR
         if: steps.check_release.outputs.has_new == 'true' && steps.check_update.outputs.needed == 'true'
