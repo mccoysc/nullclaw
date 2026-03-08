@@ -82,11 +82,7 @@ jobs:
             target: windows-aarch64
             zig_target: aarch64-windows
             ext: ".exe"
-          - os: ubuntu-latest
-            target: wasm32-wasi
-            zig_target: wasm32-wasi
-            ext: ".wasm"
-            disabled: true  # wasm release disabled by default; set to false to re-enable
+          # wasm32-wasi: disabled; add back here to re-enable wasm release
 
     steps:
       - uses: actions/checkout@v4
@@ -97,11 +93,9 @@ jobs:
           version: 0.15.2
 
       - name: Build ReleaseSmall
-        if: ${{ matrix.disabled != true }}
         run: zig build -Doptimize=ReleaseSmall -Dversion=${{ needs.version.outputs.tag }} ${{ matrix.zig_target && format('-Dtarget={0}', matrix.zig_target) || '' }}
 
       - name: Upload artifact
-        if: ${{ matrix.disabled != true }}
         uses: actions/upload-artifact@v4
         with:
           name: nullclaw-${{ matrix.target }}
@@ -129,7 +123,6 @@ jobs:
           mv nullclaw-macos-x86_64/nullclaw   nullclaw-${VERSION}-macos-x86_64.bin
           mv nullclaw-windows-x86_64/nullclaw.exe  nullclaw-${VERSION}-windows-x86_64.exe
           mv nullclaw-windows-aarch64/nullclaw.exe nullclaw-${VERSION}-windows-aarch64.exe
-          [ -d "nullclaw-wasm32-wasi" ] && mv nullclaw-wasm32-wasi/nullclaw.wasm nullclaw-${VERSION}-wasm32-wasi.wasm || true
 
       - name: Create release
         uses: softprops/action-gh-release@v2

@@ -9,7 +9,7 @@ RUN apk add --no-cache zig musl-dev
 WORKDIR /app
 COPY build.zig build.zig.zon ./
 COPY src/ src/
-COPY vendor/sqlite3/ vendor/sqlite3/
+COPY vendor/ vendor/
 
 ARG TARGETARCH
 RUN --mount=type=cache,target=/root/.cache/zig \
