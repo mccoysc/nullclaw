@@ -79,12 +79,19 @@ jobs:
           TAG_SHA=$(git rev-parse FETCH_HEAD^{commit})
           echo "tag_sha=$TAG_SHA" >> "$GITHUB_OUTPUT"
 
-          # Check if this tag is already merged into local main
-          if git merge-base --is-ancestor "$TAG_SHA" "origin/main"; then
+          # Check if this tag is already reachable from local main.
+          # NOTE: upstream and this fork may have unrelated histories
+          # (fork relationship was severed), so merge-base may return nothing.
+          # We treat "no common ancestor" as "new content to sync".
+          MAIN_SHA=$(git rev-parse "origin/main")
+          if [ "$TAG_SHA" = "$MAIN_SHA" ]; then
+             echo "Tag $LATEST_TAG is already at main HEAD — nothing to sync."
+             echo "has_new=false" >> "$GITHUB_OUTPUT"
+          elif git merge-base --is-ancestor "$TAG_SHA" "origin/main" 2>/dev/null; then
              echo "Tag $LATEST_TAG is already merged."
              echo "has_new=false" >> "$GITHUB_OUTPUT"
           else
-             echo "Tag $LATEST_TAG is new."
+             echo "Tag $LATEST_TAG is new (or histories are unrelated)."
              echo "has_new=true" >> "$GITHUB_OUTPUT"
           fi
 
@@ -96,19 +103,22 @@ jobs:
         run: |
           TAG_SHA="${{ steps.check_release.outputs.tag_sha }}"
           
-          # Check if upstream-sync branch exists
+          # Check if upstream-sync branch exists and already contains this tag
+          ALREADY_SYNCED=false
           if git ls-remote --exit-code origin upstream-sync >/dev/null 2>&1; then
              git fetch origin upstream-sync
-             SYNC_SHA=$(git rev-parse origin/upstream-sync)
-          else
-             SYNC_SHA=""
+             # The branch may be a merge commit (not TAG_SHA itself), so check
+             # whether TAG_SHA is reachable from the current upstream-sync tip.
+             if git merge-base --is-ancestor "$TAG_SHA" "origin/upstream-sync" 2>/dev/null; then
+               ALREADY_SYNCED=true
+             fi
           fi
           
           # Check for existing PR
           EXISTING_PR=$(gh pr list --head "upstream-sync" --base main --state open --json number --jq '.[0].number')
           
-          if [ "$TAG_SHA" = "$SYNC_SHA" ] && [ -n "$EXISTING_PR" ]; then
-             echo "Already synced to $TAG_SHA with PR #$EXISTING_PR."
+          if [ "$ALREADY_SYNCED" = "true" ] && [ -n "$EXISTING_PR" ]; then
+             echo "Already synced tag $TAG_SHA with PR #$EXISTING_PR."
              echo "needed=false" >> "$GITHUB_OUTPUT"
           else
              echo "Update needed."
@@ -142,23 +152,56 @@ jobs:
           LOG: ${{ steps.notes.outputs.log }}
           WORKFLOW_URL: ${{ github.server_url }}/${{ github.repository }}/actions/workflows/upstream-sync.yml
         run: |
-          # Reset upstream-sync branch to the release commit
-          git checkout -B upstream-sync "$TAG_SHA"
+          # Guard: ensure TAG_SHA is not already the same as main HEAD
+          MAIN_SHA=$(git rev-parse "origin/main")
+          if [ "$TAG_SHA" = "$MAIN_SHA" ]; then
+            echo "upstream-sync would equal main — no PR needed."
+            exit 0
+          fi
+
+          # Build the upstream-sync branch on top of main so that GitHub can
+          # compute a diff even when the two repos have unrelated histories
+          # (fork relationship was severed).
+          #
+          # Strategy:
+          #   1. Start upstream-sync from the current main HEAD.
+          #   2. Merge the upstream tag with --allow-unrelated-histories.
+          #      This produces a merge commit that has main as one parent and
+          #      the upstream tag commit as the other, giving GitHub a valid
+          #      base SHA and head SHA for the PR.
+          git checkout -B upstream-sync "origin/main"
+          git merge --allow-unrelated-histories --no-edit \
+            -m "chore: merge upstream release $LATEST_TAG into upstream-sync" \
+            "$TAG_SHA" || {
+            # If merge fails (conflicts), commit the conflicted state so the
+            # PR can still be opened and reviewers can resolve conflicts.
+            git add -A
+            git commit --no-edit -m "chore: merge upstream release $LATEST_TAG (conflicts present)"
+          }
+
+          # Verify the merge actually introduced changes vs main
+          if git diff --quiet "origin/main" HEAD; then
+            echo "Merge produced no diff vs main — nothing to sync."
+            exit 0
+          fi
+
+          # Capture the merge commit SHA (not TAG_SHA — we pushed a merge commit)
+          SYNC_HEAD=$(git rev-parse HEAD)
           git push origin upstream-sync --force
 
-          # Wait for GitHub to register the branch
+          # Wait for GitHub to register the branch at the new HEAD
           echo "Waiting for GitHub to register branch..."
           for i in $(seq 1 12); do
             REMOTE_SHA=$(git ls-remote origin refs/heads/upstream-sync | awk '{print $1}')
-            if [ "$REMOTE_SHA" = "$TAG_SHA" ]; then
-              echo "Branch confirmed at $TAG_SHA"
+            if [ "$REMOTE_SHA" = "$SYNC_HEAD" ]; then
+              echo "Branch confirmed at $SYNC_HEAD"
               break
             fi
             echo "Attempt $i: branch not ready yet, waiting 5s..."
             sleep 5
           done
 
-          if [ "$REMOTE_SHA" != "$TAG_SHA" ]; then
+          if [ "$REMOTE_SHA" != "$SYNC_HEAD" ]; then
             echo "Error: Branch did not update to expected SHA after 60s."
             exit 1
           fi
