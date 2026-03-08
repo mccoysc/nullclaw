@@ -50,7 +50,10 @@ fn shouldSuppressGroupReply(is_group: bool, reply: []const u8) bool {
     return is_group and std.mem.indexOf(u8, reply, "[NO_REPLY]") != null;
 }
 
-fn isStopLikeCommand(content: []const u8) bool {
+/// Check if content is a stop/abort command addressed to the current bot.
+/// If bot_name is provided, commands like /stop@other_bot will return false.
+/// If bot_name is null, any /stop or /abort will match (legacy behavior).
+fn isStopLikeCommand(content: []const u8, bot_name: ?[]const u8) bool {
     const trimmed = std.mem.trim(u8, content, " \t\r\n");
     if (trimmed.len < 5 or trimmed[0] != '/') return false;
 
@@ -63,11 +66,21 @@ fn isStopLikeCommand(content: []const u8) bool {
     if (split_idx == 0) return false;
 
     const raw_name = body[0..split_idx];
-    const name = if (std.mem.indexOfScalar(u8, raw_name, '@')) |mention_sep|
-        raw_name[0..mention_sep]
-    else
-        raw_name;
-    return std.ascii.eqlIgnoreCase(name, "stop") or std.ascii.eqlIgnoreCase(name, "abort");
+    const mention_idx = std.mem.indexOfScalar(u8, raw_name, '@');
+    const name = if (mention_idx) |i| raw_name[0..i] else raw_name;
+
+    // Check if this is stop or abort command
+    const is_stop_like = std.ascii.eqlIgnoreCase(name, "stop") or std.ascii.eqlIgnoreCase(name, "abort");
+    if (!is_stop_like) return false;
+
+    // If there's a @mention, verify it matches the bot name
+    if (mention_idx != null and bot_name != null) {
+        const mentioned_bot = raw_name[mention_idx.? + 1 ..];
+        return std.ascii.eqlIgnoreCase(mentioned_bot, bot_name.?);
+    }
+
+    // If no @mention or no bot_name provided, allow match (legacy behavior)
+    return true;
 }
 
 fn processTelegramMessage(
@@ -636,7 +649,7 @@ pub fn runTelegramLoop(
             if (enable_parallel) {
                 var handled_in_worker = false;
                 parallel_attempt: {
-                    if (isStopLikeCommand(msg.content) and active_worker_threads.get(session_key) != null) {
+                    if (isStopLikeCommand(msg.content, tg_ptr.bot_username) and active_worker_threads.get(session_key) != null) {
                         var interrupt = runtime.session_mgr.requestTurnInterrupt(session_key);
                         defer interrupt.deinit(allocator);
                         var dynamic_notice: ?[]u8 = null;
@@ -1179,21 +1192,37 @@ test "shouldSuppressGroupReply suppresses only group replies with marker" {
 }
 
 test "isStopLikeCommand matches stop and abort variants" {
-    try std.testing.expect(isStopLikeCommand("/stop"));
-    try std.testing.expect(isStopLikeCommand("  /stop  "));
-    try std.testing.expect(isStopLikeCommand("/abort"));
-    try std.testing.expect(isStopLikeCommand("/STOP"));
-    try std.testing.expect(isStopLikeCommand("/abort@nullclaw_bot"));
-    try std.testing.expect(isStopLikeCommand("/stop: now"));
-    try std.testing.expect(isStopLikeCommand("/abort please"));
+    // Without bot_name, any stop/abort matches (legacy behavior)
+    try std.testing.expect(isStopLikeCommand("/stop", null));
+    try std.testing.expect(isStopLikeCommand("  /stop  ", null));
+    try std.testing.expect(isStopLikeCommand("/abort", null));
+    try std.testing.expect(isStopLikeCommand("/STOP", null));
+    try std.testing.expect(isStopLikeCommand("/stop: now", null));
+    try std.testing.expect(isStopLikeCommand("/abort please", null));
+
+    // With bot_name: @mention matches
+    try std.testing.expect(isStopLikeCommand("/stop@mybot", "mybot"));
+    try std.testing.expect(isStopLikeCommand("/abort@mybot", "mybot"));
+    try std.testing.expect(isStopLikeCommand("/STOP@MyBot", "mybot"));
+
+    // Without @mention matches any bot
+    try std.testing.expect(isStopLikeCommand("/stop", "mybot"));
+    try std.testing.expect(isStopLikeCommand("/stop", null));
+}
+
+test "isStopLikeCommand rejects commands for different bots" {
+    // When bot_name is provided, /stop@other_bot should not match
+    try std.testing.expect(!isStopLikeCommand("/stop@other_bot", "mybot"));
+    try std.testing.expect(!isStopLikeCommand("/abort@other_bot", "mybot"));
+    try std.testing.expect(!isStopLikeCommand("/STOP@OtherBot", "mybot"));
 }
 
 test "isStopLikeCommand rejects non-control commands" {
-    try std.testing.expect(!isStopLikeCommand("stop"));
-    try std.testing.expect(!isStopLikeCommand("/stopping"));
-    try std.testing.expect(!isStopLikeCommand("/aborted"));
-    try std.testing.expect(!isStopLikeCommand("/help"));
-    try std.testing.expect(!isStopLikeCommand(""));
+    try std.testing.expect(!isStopLikeCommand("stop", null));
+    try std.testing.expect(!isStopLikeCommand("/stopping", null));
+    try std.testing.expect(!isStopLikeCommand("/aborted", null));
+    try std.testing.expect(!isStopLikeCommand("/help", null));
+    try std.testing.expect(!isStopLikeCommand("", null));
 }
 
 test "ProviderHolder tagged union fields" {
