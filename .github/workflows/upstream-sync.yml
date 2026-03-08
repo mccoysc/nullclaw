@@ -35,7 +35,7 @@ jobs:
         with:
           ref: main
           fetch-depth: 0        # full history needed for merge-base checks
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.ACTION_TOKEN }} # Requires a PAT with 'workflow' scope to sync workflow files
 
       - name: Configure git identity
         run: |
@@ -106,7 +106,7 @@ jobs:
       - name: Create or update PR
         if: steps.diff_check.outputs.has_new == 'true'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.ACTION_TOKEN }}
           UPSTREAM_SHA: ${{ steps.diff_check.outputs.upstream_sha }}
           LOG: ${{ steps.notes.outputs.log }}
           WORKFLOW_URL: ${{ github.server_url }}/${{ github.repository }}/actions/workflows/upstream-sync.yml
