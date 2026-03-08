@@ -163,6 +163,34 @@ else
             pub fn setBus(_: *@This(), _: anytype) void {}
         };
     };
+pub const mqtt = if (@import("build_options").enable_channel_mqtt)
+    @import("mqtt.zig")
+else
+    struct {
+        pub const MqttChannel = struct {
+            pub fn initFromConfig(_: @import("std").mem.Allocator, _: anytype) @This() {
+                return .{};
+            }
+            pub fn channel(_: *@This()) Channel {
+                unreachable;
+            }
+            pub fn setBus(_: *@This(), _: anytype) void {}
+        };
+    };
+pub const redis_stream = if (@import("build_options").enable_channel_redis_stream)
+    @import("redis_stream.zig")
+else
+    struct {
+        pub const RedisStreamChannel = struct {
+            pub fn initFromConfig(_: @import("std").mem.Allocator, _: anytype) @This() {
+                return .{};
+            }
+            pub fn channel(_: *@This()) Channel {
+                unreachable;
+            }
+            pub fn setBus(_: *@This(), _: anytype) void {}
+        };
+    };
 pub const dispatch = @import("dispatch.zig");
 
 // ════════════════════════════════════════════════════════════════════════════

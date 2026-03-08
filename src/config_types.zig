@@ -591,6 +591,137 @@ pub const WebConfig = struct {
     }
 };
 
+/// Per-channel model configuration overrides.
+pub const ChannelModelOverride = struct {
+    /// Override the LLM provider (e.g. "openrouter", "anthropic").
+    provider: ?[]const u8 = null,
+    /// Override the model name (e.g. "openrouter/minimax/minimax-m2.5").
+    model: ?[]const u8 = null,
+    /// Override the maximum context tokens for this channel.
+    /// When reached, auto-compaction is triggered.
+    max_context_tokens: u64 = 0,
+    /// Override the temperature for this channel.
+    temperature: ?f64 = null,
+    /// Override the sub-agent LLM provider for this channel.
+    /// Fallback: channel general provider → global sub_agent_provider → global default_provider.
+    sub_agent_provider: ?[]const u8 = null,
+    /// Override the sub-agent LLM model for this channel.
+    /// Fallback: channel general model → global sub_agent_model → global default_model.
+    sub_agent_model: ?[]const u8 = null,
+    /// Override the sub-agent temperature for this channel.
+    sub_agent_temperature: ?f64 = null,
+    /// Override the sub-agent max context tokens for this channel.
+    sub_agent_max_context_tokens: u64 = 0,
+    /// Override the sub-agent provider base URL for this channel.
+    sub_agent_base_url: ?[]const u8 = null,
+    /// Override the tools reviewer LLM provider for this channel.
+    /// Fallback: channel general provider → global tools_reviewer_provider → global default_provider.
+    tools_reviewer_provider: ?[]const u8 = null,
+    /// Override the tools reviewer LLM model for this channel.
+    /// Fallback: channel general model → global tools_reviewer_model → global default_model.
+    tools_reviewer_model: ?[]const u8 = null,
+    /// Override the tools reviewer temperature for this channel.
+    tools_reviewer_temperature: ?f64 = null,
+    /// Override the tools reviewer max context tokens for this channel.
+    tools_reviewer_max_context_tokens: u64 = 0,
+    /// Override the tools reviewer provider base URL for this channel.
+    tools_reviewer_base_url: ?[]const u8 = null,
+    /// Override the sub-agent max iterations for this channel.
+    /// 0 = use global agent.sub_agent_max_iterations or compiled default.
+    sub_agent_max_iterations: u32 = 0,
+    /// Override the sub-agent review_after for this channel.
+    /// 0 = use global agent.sub_agent_review_after or compiled default.
+    sub_agent_review_after: u32 = 0,
+};
+
+/// A single MQTT endpoint configuration.
+pub const MqttEndpointConfig = struct {
+    /// Unique identifier for this endpoint.  Used to correlate running sessions
+    /// with config entries across hot-reloads.  Auto-generated during onboarding
+    /// if not provided.
+    endpoint_id: []const u8 = "",
+    /// Broker host (e.g. "broker.example.com").
+    host: []const u8,
+    /// Broker port (default 1883 for TCP, 8883 for TLS).
+    port: u16 = 1883,
+    /// Optional username for broker authentication.
+    username: ?[]const u8 = null,
+    /// Optional password for broker authentication.
+    password: ?[]const u8 = null,
+    /// Use TLS for the connection.
+    tls: bool = false,
+    /// Optional client ID (auto-generated if not set).
+    client_id: ?[]const u8 = null,
+    /// Peer's P256 public key (hex-encoded, uncompressed) — used to verify inbound messages.
+    peer_pubkey: []const u8,
+    /// Local P256 private key (hex-encoded) — used to sign outbound messages.
+    /// Generated randomly during onboarding if not provided.
+    local_privkey: []const u8,
+    /// Local P256 public key (hex-encoded, uncompressed) — derived from local_privkey.
+    /// Published so the peer can verify our signatures.
+    local_pubkey: []const u8,
+    /// Topic to subscribe to (listen for inbound messages).
+    listen_topic: []const u8,
+    /// Topic to publish replies on. If empty or equal to listen_topic,
+    /// the channel uses the same topic for both directions and filters
+    /// out messages signed by our own key.
+    reply_topic: ?[]const u8 = null,
+    /// Per-channel model configuration overrides.
+    /// When set, these override the global model/provider/temperature/max_context_tokens.
+    model_override: ChannelModelOverride = .{},
+};
+
+/// MQTT broker configuration.
+pub const MqttConfig = struct {
+    account_id: []const u8 = "default",
+    endpoints: []const MqttEndpointConfig = &.{},
+};
+
+/// A single Redis Stream endpoint configuration.
+pub const RedisStreamEndpointConfig = struct {
+    /// Unique identifier for this endpoint.  Used to correlate running sessions
+    /// with config entries across hot-reloads.  Auto-generated during onboarding
+    /// if not provided.
+    endpoint_id: []const u8 = "",
+    /// Redis host (e.g. "localhost").
+    host: []const u8 = "localhost",
+    /// Redis port.
+    port: u16 = 6379,
+    /// Optional Redis password (AUTH).
+    password: ?[]const u8 = null,
+    /// Redis database index.
+    db: u16 = 0,
+    /// Use TLS for the connection.
+    tls: bool = false,
+    /// Optional username (Redis 6+ ACL).
+    username: ?[]const u8 = null,
+    /// Peer's P256 public key (hex-encoded, uncompressed) — used to verify inbound messages.
+    peer_pubkey: []const u8,
+    /// Local P256 private key (hex-encoded) — used to sign outbound messages.
+    local_privkey: []const u8,
+    /// Local P256 public key (hex-encoded, uncompressed) — derived from local_privkey.
+    local_pubkey: []const u8,
+    /// Stream key to read from (listen for inbound messages).
+    listen_topic: []const u8,
+    /// Stream key to write replies to. If empty or equal to listen_topic,
+    /// the channel uses the same stream for both directions and filters
+    /// out messages signed by our own key.
+    reply_topic: ?[]const u8 = null,
+    /// Consumer group name for XREADGROUP.
+    consumer_group: []const u8 = "nullclaw",
+    /// Consumer name within the group.
+    consumer_name: []const u8 = "default",
+    /// Per-channel model configuration overrides.
+    /// When set, these override the global model/provider/temperature/max_context_tokens.
+    model_override: ChannelModelOverride = .{},
+};
+
+/// Redis Stream configuration.
+pub const RedisStreamConfig = struct {
+    account_id: []const u8 = "default",
+    endpoints: []const RedisStreamEndpointConfig = &.{},
+};
+
 pub const NostrConfig = struct {
     /// Private key: must be enc2:-encrypted via SecretStore (use onboarding wizard or SecretStore.encryptSecret).
     /// Not required when bunker_uri is set (external bunker handles signing).
@@ -658,6 +789,8 @@ pub const ChannelsConfig = struct {
     maixcam: []const MaixCamConfig = &.{},
     web: []const WebConfig = &.{},
     nostr: ?*NostrConfig = null,
+    mqtt: []const MqttConfig = &.{},
+    redis_stream: []const RedisStreamConfig = &.{},
 
     fn primaryAccount(comptime T: type, items: []const T) ?T {
         if (items.len == 0) return null;

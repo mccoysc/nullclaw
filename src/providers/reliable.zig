@@ -155,8 +155,13 @@ pub fn parseRetryAfterMs(err_msg: []const u8) ?u64 {
         }
         
         // 移动到下一个块，但保留一些重叠以防前缀跨块
-        const overlap = 20; // 足够容纳最长的前缀
-        chunk_start = chunk_end - @min(chunk_size, overlap);
+        const overlap: usize = 20; // 足够容纳最长的前缀
+        if (chunk_size <= overlap) {
+            // 块太小或正好等于重叠大小，直接跳过到下一块
+            chunk_start = chunk_end;
+        } else {
+            chunk_start = chunk_end - overlap;
+        }
     }
 
     return null;
