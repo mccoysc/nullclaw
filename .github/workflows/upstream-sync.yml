@@ -27,7 +27,6 @@ jobs:
     env:
       UPSTREAM_REPO: https://github.com/nullclaw/nullclaw.git
       UPSTREAM_BRANCH: main
-      SYNC_BRANCH: upstream-sync
 
     steps:
       - name: Checkout fork (main)
@@ -35,7 +34,7 @@ jobs:
         with:
           ref: main
           fetch-depth: 0        # full history needed for merge-base checks
-          token: ${{ secrets.ACTION_TOKEN }} # Requires a PAT with 'workflow' scope to sync workflow files
+          token: ${{ secrets.ACTION_TOKEN }}
 
       - name: Configure git identity
         run: |
@@ -48,53 +47,52 @@ jobs:
       - name: Fetch upstream
         run: git fetch upstream "$UPSTREAM_BRANCH"
 
-      - name: Check for new upstream commits
-        id: diff_check
+      - name: Check for new upstream release
+        id: check_release
+        env:
+          GH_TOKEN: ${{ secrets.ACTION_TOKEN }}
         run: |
-          # Resolve HEAD of upstream branch
-          UPSTREAM_SHA=$(git rev-parse "upstream/$UPSTREAM_BRANCH")
-          echo "upstream_sha=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
+          # Extract upstream owner/repo
+          UPSTREAM_REPO_PATH=$(echo "$UPSTREAM_REPO" | sed -E 's|.*github.com/([^/]+/[^/]+)(\.git)?|\1|')
+          UPSTREAM_OWNER=$(echo "$UPSTREAM_REPO_PATH" | cut -d/ -f1)
+          echo "upstream_owner=$UPSTREAM_OWNER" >> "$GITHUB_OUTPUT"
+          echo "upstream_repo_path=$UPSTREAM_REPO_PATH" >> "$GITHUB_OUTPUT"
 
-          # Does our upstream-sync branch already exist on origin?
-          if git ls-remote --exit-code origin "refs/heads/$SYNC_BRANCH" > /dev/null 2>&1; then
-            git fetch origin "$SYNC_BRANCH"
-            SYNC_SHA=$(git rev-parse "origin/$SYNC_BRANCH")
-          else
-            # Brand-new sync branch; treat everything as new
-            SYNC_SHA=""
-          fi
-          echo "sync_sha=$SYNC_SHA" >> "$GITHUB_OUTPUT"
+          # Get latest release tag from upstream
+          LATEST_TAG=$(gh release list --repo "$UPSTREAM_REPO_PATH" --limit 1 --exclude-drafts --exclude-pre-releases --json tagName --jq '.[0].tagName')
 
-          if [ "$UPSTREAM_SHA" = "$SYNC_SHA" ]; then
+          if [ -z "$LATEST_TAG" ]; then
+            echo "No releases found."
             echo "has_new=false" >> "$GITHUB_OUTPUT"
-            echo "No new upstream commits - nothing to do."
-          else
-            echo "has_new=true" >> "$GITHUB_OUTPUT"
-            COUNT=$(git rev-list --count "${SYNC_SHA:+$SYNC_SHA..}upstream/$UPSTREAM_BRANCH" 2>/dev/null || echo "?")
-            echo "New upstream commits detected (~$COUNT). Will update $SYNC_BRANCH."
+            exit 0
           fi
 
-      - name: Update upstream-sync branch
-        if: steps.diff_check.outputs.has_new == 'true'
-        run: |
-          # Hard-reset (or create) the local sync branch to upstream HEAD.
-          # This branch is a pure mirror - no fork-specific commits here.
-          git checkout -B "$SYNC_BRANCH" "upstream/$UPSTREAM_BRANCH"
-          git push origin "$SYNC_BRANCH" --force-with-lease
+          echo "Latest release: $LATEST_TAG"
+          echo "latest_tag=$LATEST_TAG" >> "$GITHUB_OUTPUT"
 
-      - name: Collect upstream release notes
-        if: steps.diff_check.outputs.has_new == 'true'
+          # Fetch the tag
+          git fetch upstream "refs/tags/$LATEST_TAG"
+          TAG_SHA=$(git rev-parse FETCH_HEAD)
+          echo "tag_sha=$TAG_SHA" >> "$GITHUB_OUTPUT"
+
+          # Check if this tag is already merged into local main
+          if git merge-base --is-ancestor "$TAG_SHA" "origin/main"; then
+             echo "Tag $LATEST_TAG is already merged."
+             echo "has_new=false" >> "$GITHUB_OUTPUT"
+          else
+             echo "Tag $LATEST_TAG is new."
+             echo "has_new=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Collect release notes
+        if: steps.check_release.outputs.has_new == 'true'
         id: notes
         run: |
-          UPSTREAM_SHA="${{ steps.diff_check.outputs.upstream_sha }}"
-          SYNC_SHA="${{ steps.diff_check.outputs.sync_sha }}"
+          TAG_SHA="${{ steps.check_release.outputs.tag_sha }}"
+          BASE_SHA=$(git rev-parse "origin/main")
 
-          # Short log of new upstream commits (max 50 lines)
-          if [ -n "$SYNC_SHA" ]; then
-            LOG=$(git log --oneline --no-merges "$SYNC_SHA..$UPSTREAM_SHA" | head -50)
-          else
-            LOG=$(git log --oneline --no-merges "$UPSTREAM_SHA" | head -50)
-          fi
+          # Short log of new commits (max 50 lines)
+          LOG=$(git log --oneline --no-merges "$BASE_SHA..$TAG_SHA" | head -50)
 
           # Escape for multiline GitHub output
           {
@@ -104,69 +102,80 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Create or update PR
-        if: steps.diff_check.outputs.has_new == 'true'
+        if: steps.check_release.outputs.has_new == 'true'
         env:
           GH_TOKEN: ${{ secrets.ACTION_TOKEN }}
-          UPSTREAM_SHA: ${{ steps.diff_check.outputs.upstream_sha }}
+          LATEST_TAG: ${{ steps.check_release.outputs.latest_tag }}
+          TAG_SHA: ${{ steps.check_release.outputs.tag_sha }}
+          UPSTREAM_OWNER: ${{ steps.check_release.outputs.upstream_owner }}
           LOG: ${{ steps.notes.outputs.log }}
           WORKFLOW_URL: ${{ github.server_url }}/${{ github.repository }}/actions/workflows/upstream-sync.yml
         run: |
-          # Check if there are commits to merge
-          git fetch origin main
-          if [ "$(git rev-list --count origin/main..HEAD)" -eq 0 ]; then
-            echo "Main is already up to date with upstream-sync. Skipping PR creation."
-            exit 0
-          fi
+          PR_TITLE="chore: sync upstream release $LATEST_TAG"
 
-          SHORT_SHA="${UPSTREAM_SHA:0:7}"
-          PR_TITLE="chore: sync upstream nullclaw/nullclaw@${SHORT_SHA}"
-
-          # Write body to a temp file using printf so that:
-          # 1. Arbitrary characters in $LOG cannot break shell string parsing.
-          # 2. All lines stay indented, avoiding YAML block-scalar parse errors
-          #    that occur when heredoc content appears at column 0 inside run: |.
+          # Write body to a temp file
           PR_BODY_FILE=$(mktemp)
           {
-            printf '## Upstream sync\n\n'
-            printf 'New commits from [nullclaw/nullclaw](https://github.com/nullclaw/nullclaw) are available.\n'
-            printf 'This PR merges branch `upstream-sync` (a direct mirror of upstream `main`) into `main`.\n\n'
+            printf '## Upstream Sync: Release %s\n\n' "$LATEST_TAG"
+            printf 'New release from [%s/nullclaw](https://github.com/%s/nullclaw) is available.\n' "$UPSTREAM_OWNER" "$UPSTREAM_OWNER"
+            printf 'This PR merges upstream tag `%s` into `main`.\n\n' "$LATEST_TAG"
             printf '**Review workflow:**\n'
-            printf '1. Check the diff below for breaking changes, API renames, or conflicts with fork-specific patches.\n'
-            printf '2. Resolve any conflicts directly on the `upstream-sync` branch.\n'
+            printf '1. Check the diff below for breaking changes.\n'
+            printf '2. Resolve any conflicts directly on the `main` branch.\n'
             printf '3. Merge when ready.\n\n'
-            printf '**Upstream HEAD:** `%s`\n\n' "$UPSTREAM_SHA"
+            printf '**Release Tag:** `%s`\n' "$LATEST_TAG"
+            printf '**Commit SHA:** `%s`\n\n' "$TAG_SHA"
             printf '<details>\n<summary>New commits (newest first)</summary>\n\n```\n'
             printf '%s\n' "$LOG"
             printf '```\n\n</details>\n\n---\n'
             printf '*Auto-generated by the [Upstream Sync](%s) workflow.*\n' "$WORKFLOW_URL"
           } > "$PR_BODY_FILE"
 
-          # Check whether an open PR for this branch already exists
-          EXISTING_PR=$(gh pr list \
-            --head "$SYNC_BRANCH" \
-            --base main \
-            --state open \
-            --json number \
-            --jq '.[0].number' 2>/dev/null || echo "")
+          # Check for existing PRs with label 'upstream-sync'
+          EXISTING_PRS=$(gh pr list --base main --state open --label "upstream-sync" --json number,title)
+          
+          # Find PR for current tag
+          TARGET_PR=$(echo "$EXISTING_PRS" | jq -r ".[] | select(.title | contains(\"$LATEST_TAG\")) | .number" | head -1)
+          
+          # Close PRs for older releases
+          OTHER_PRS=$(echo "$EXISTING_PRS" | jq -r ".[] | select(.number != $TARGET_PR) | .number")
+          for pr in $OTHER_PRS; do
+             echo "Closing outdated PR #$pr"
+             gh pr close "$pr" --comment "Closing in favor of newer release $LATEST_TAG"
+          done
 
-          if [ -n "$EXISTING_PR" ]; then
-            echo "Updating existing PR #${EXISTING_PR} with new title/body."
-            gh pr edit "$EXISTING_PR" \
+          if [ -n "$TARGET_PR" ]; then
+            echo "Updating existing PR #${TARGET_PR}."
+            gh pr edit "$TARGET_PR" \
               --title "$PR_TITLE" \
               --body-file "$PR_BODY_FILE"
+            PR_NUMBER="$TARGET_PR"
           else
             echo "Opening new PR: $PR_TITLE"
-            gh pr create \
-              --head "$SYNC_BRANCH" \
+            PR_URL=$(gh pr create \
+              --head "$UPSTREAM_OWNER:$LATEST_TAG" \
               --base main \
               --title "$PR_TITLE" \
               --body-file "$PR_BODY_FILE" \
               --label "upstream-sync" || \
             gh pr create \
-              --head "$SYNC_BRANCH" \
+              --head "$UPSTREAM_OWNER:$LATEST_TAG" \
               --base main \
               --title "$PR_TITLE" \
-              --body-file "$PR_BODY_FILE"
+              --body-file "$PR_BODY_FILE")
+            PR_NUMBER=$(echo "$PR_URL" | grep -oE '[0-9]+$')
+          fi
+
+          # Check for conflicts
+          if [ -n "$PR_NUMBER" ]; then
+            echo "Checking for merge conflicts in PR #$PR_NUMBER..."
+            sleep 10
+            MERGE_STATUS=$(gh pr view "$PR_NUMBER" --json mergeable --jq .mergeable)
+            if [ "$MERGE_STATUS" = "CONFLICTING" ]; then
+              echo "Merge conflicts detected."
+              gh pr edit "$PR_NUMBER" --add-label "conflicts"
+              gh pr comment "$PR_NUMBER" --body "Merge conflicts detected. Please use GitHub Copilot to resolve."
+            fi
           fi
 
           rm -f "$PR_BODY_FILE"
@@ -174,11 +183,11 @@ jobs:
       - name: Summary
         if: always()
         run: |
-          if [ "${{ steps.diff_check.outputs.has_new }}" = "true" ]; then
+          if [ "${{ steps.check_release.outputs.has_new }}" = "true" ]; then
             echo "### Upstream sync complete" >> "$GITHUB_STEP_SUMMARY"
-            echo "- Upstream HEAD: \`${{ steps.diff_check.outputs.upstream_sha }}\`" >> "$GITHUB_STEP_SUMMARY"
-            echo "- Branch \`upstream-sync\` updated and PR opened/updated against \`main\`." >> "$GITHUB_STEP_SUMMARY"
+            echo "- Release: \`${{ steps.check_release.outputs.latest_tag }}\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- PR opened/updated against \`main\`." >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "### No new upstream commits" >> "$GITHUB_STEP_SUMMARY"
-            echo "Branch \`upstream-sync\` is already up to date." >> "$GITHUB_STEP_SUMMARY"
+            echo "### No new upstream release" >> "$GITHUB_STEP_SUMMARY"
+            echo "Branch \`main\` is already up to date with latest release." >> "$GITHUB_STEP_SUMMARY"
           fi
