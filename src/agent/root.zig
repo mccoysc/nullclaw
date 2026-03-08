@@ -2506,7 +2506,7 @@ pub const Agent = struct {
                 // (shouldn't happen since we checked hasValidBehaviorTag, but be safe)
                 if (parsed.action == .agent) {
                     log.warn(
-                        "sub-agent: behavior tag detected but parse returned unexpected action, degrading to passthrough | output={s} instructions={s} hook_content={s}",
+                        "sub-agent: behavior tag detected but parse returned unexpected action, falling back to passthrough | output={s} instructions={s} hook_content={s}",
                         .{
                             response_text,
                             skill_instructions,
@@ -2518,11 +2518,11 @@ pub const Agent = struct {
                 return parsed;
             }
 
-            // No valid behavior tag in response — gracefully degrade to passthrough.
+            // No valid behavior tag in response — gracefully fall back to passthrough.
             // The sub-agent likely intended to pass content through unchanged but did
             // not emit the required [behavior:passthrough] tag.
             log.warn(
-                "sub-agent: no behavior tag in response, degrading to passthrough | output={s} instructions={s} hook_content={s} iteration={d}",
+                "sub-agent: no behavior tag in response, falling back to passthrough | output={s} instructions={s} hook_content={s} iteration={d}",
                 .{
                     response_text,
                     skill_instructions,

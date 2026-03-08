@@ -917,7 +917,7 @@ pub fn parseSubAgentResponse(allocator: std.mem.Allocator, response: []const u8)
         }
     }
 
-    // No recognized behavior tag found — degrade to passthrough.
+    // No recognized behavior tag found — fall back to passthrough.
     // The sub-agent likely intended to pass content through but omitted the tag.
     return .{ .action = .passthrough };
 }
