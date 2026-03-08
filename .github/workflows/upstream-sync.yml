@@ -111,6 +111,13 @@ jobs:
           LOG: ${{ steps.notes.outputs.log }}
           WORKFLOW_URL: ${{ github.server_url }}/${{ github.repository }}/actions/workflows/upstream-sync.yml
         run: |
+          # Check if there are commits to merge
+          git fetch origin main
+          if [ "$(git rev-list --count origin/main..HEAD)" -eq 0 ]; then
+            echo "Main is already up to date with upstream-sync. Skipping PR creation."
+            exit 0
+          fi
+
           SHORT_SHA="${UPSTREAM_SHA:0:7}"
           PR_TITLE="chore: sync upstream nullclaw/nullclaw@${SHORT_SHA}"
 
