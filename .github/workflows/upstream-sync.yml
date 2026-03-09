@@ -1,0 +1,338 @@
+name: Upstream Sync
+
+# Tracks https://github.com/nullclaw/nullclaw (upstream source)
+# and opens a PR against main whenever new commits appear upstream.
+#
+# The `upstream-sync` branch is the single source-of-truth mirror of
+# upstream/main. It is never committed to directly; only this workflow
+# updates it. A PR from upstream-sync -> main lets maintainers review
+# and cherry-pick upstream changes on their own schedule.
+
+on:
+  push:
+    branches: [main]      # run on every merge to main so check suites pass
+  schedule:
+    - cron: "0 4 * * *"   # daily at 04:00 UTC
+  workflow_dispatch:       # allow manual trigger
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    name: Sync upstream -> upstream-sync branch
+    runs-on: ubuntu-latest
+
+    env:
+      UPSTREAM_REPO: https://github.com/nullclaw/nullclaw.git
+      UPSTREAM_BRANCH: main
+
+    steps:
+      - name: Checkout fork (main)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0        # full history needed for merge-base checks
+          token: ${{ secrets.ACTION_TOKEN }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: git remote add upstream "$UPSTREAM_REPO"
+
+      - name: Fetch upstream
+        run: git fetch upstream "$UPSTREAM_BRANCH"
+
+      - name: Check for new upstream release
+        id: check_release
+        env:
+          GH_TOKEN: ${{ secrets.ACTION_TOKEN }}
+        run: |
+          # Extract upstream owner/repo
+          # Remove protocol and domain
+          REPO_PATH=$(echo "$UPSTREAM_REPO" | sed -E 's|.*github.com/||')
+          # Remove .git suffix if present
+          UPSTREAM_REPO_PATH=${REPO_PATH%.git}
+          
+          UPSTREAM_OWNER=$(echo "$UPSTREAM_REPO_PATH" | cut -d/ -f1)
+          echo "upstream_owner=$UPSTREAM_OWNER" >> "$GITHUB_OUTPUT"
+          echo "upstream_repo_path=$UPSTREAM_REPO_PATH" >> "$GITHUB_OUTPUT"
+
+          # Get latest release tag from upstream
+          LATEST_TAG=$(gh release list --repo "$UPSTREAM_REPO_PATH" --limit 1 --exclude-drafts --exclude-pre-releases --json tagName --jq '.[0].tagName')
+
+          if [ -z "$LATEST_TAG" ]; then
+            echo "No releases found."
+            echo "has_new=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Latest release: $LATEST_TAG"
+          echo "latest_tag=$LATEST_TAG" >> "$GITHUB_OUTPUT"
+
+          # Fetch the tag
+          git fetch upstream "refs/tags/$LATEST_TAG"
+          TAG_SHA=$(git rev-parse FETCH_HEAD^{commit})
+          echo "tag_sha=$TAG_SHA" >> "$GITHUB_OUTPUT"
+
+          # Check if this tag is already reachable from local main.
+          # NOTE: upstream and this fork may have unrelated histories
+          # (fork relationship was severed), so merge-base may return nothing.
+          # We treat "no common ancestor" as "new content to sync".
+          MAIN_SHA=$(git rev-parse "origin/main")
+          if [ "$TAG_SHA" = "$MAIN_SHA" ]; then
+             echo "Tag $LATEST_TAG is already at main HEAD — nothing to sync."
+             echo "has_new=false" >> "$GITHUB_OUTPUT"
+          elif git merge-base --is-ancestor "$TAG_SHA" "origin/main" 2>/dev/null; then
+             echo "Tag $LATEST_TAG is already merged."
+             echo "has_new=false" >> "$GITHUB_OUTPUT"
+          else
+             echo "Tag $LATEST_TAG is new (or histories are unrelated)."
+             echo "has_new=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check if update needed
+        if: steps.check_release.outputs.has_new == 'true'
+        id: check_update
+        env:
+          GH_TOKEN: ${{ secrets.ACTION_TOKEN }}
+        run: |
+          TAG_SHA="${{ steps.check_release.outputs.tag_sha }}"
+          FORK_OWNER=$(echo "${{ github.repository }}" | cut -d/ -f1)
+          FORK_REPO="${{ github.repository }}"
+          
+          # Check if upstream-sync branch already carries the upstream tag's tree.
+          # We use read-tree+commit to build the sync commit (not a merge commit),
+          # so TAG_SHA is not an ancestor of upstream-sync. Compare trees instead.
+          ALREADY_SYNCED=false
+          if git ls-remote --exit-code origin upstream-sync >/dev/null 2>&1; then
+             git fetch origin upstream-sync
+             SYNC_TREE=$(git rev-parse "origin/upstream-sync^{tree}" 2>/dev/null || echo "")
+             TAG_TREE=$(git rev-parse "${TAG_SHA}^{tree}" 2>/dev/null || echo "")
+             if [ -n "$SYNC_TREE" ] && [ "$SYNC_TREE" = "$TAG_TREE" ]; then
+               ALREADY_SYNCED=true
+             fi
+          fi
+          
+          # Check for existing PR via REST API (avoids GraphQL index lag)
+          EXISTING_PR=$(gh api \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${FORK_REPO}/pulls?head=${FORK_OWNER}:upstream-sync&base=main&state=open" \
+            --jq '.[0].number // empty' 2>/dev/null || echo "")
+          
+          if [ "$ALREADY_SYNCED" = "true" ] && [ -n "$EXISTING_PR" ]; then
+             echo "Already synced tag $TAG_SHA with PR #$EXISTING_PR."
+             echo "needed=false" >> "$GITHUB_OUTPUT"
+          else
+             echo "Update needed."
+             echo "needed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Collect release notes
+        if: steps.check_release.outputs.has_new == 'true' && steps.check_update.outputs.needed == 'true'
+        id: notes
+        run: |
+          TAG_SHA="${{ steps.check_release.outputs.tag_sha }}"
+          BASE_SHA=$(git rev-parse "origin/main")
+
+          # Short log of new commits (max 50 lines)
+          LOG=$(git log --oneline --no-merges "$BASE_SHA..$TAG_SHA" | head -50)
+
+          # Escape for multiline GitHub output
+          {
+            echo "log<<EOF"
+            echo "$LOG"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Sync release to branch and create PR
+        if: steps.check_release.outputs.has_new == 'true' && steps.check_update.outputs.needed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.ACTION_TOKEN }}
+          LATEST_TAG: ${{ steps.check_release.outputs.latest_tag }}
+          TAG_SHA: ${{ steps.check_release.outputs.tag_sha }}
+          UPSTREAM_OWNER: ${{ steps.check_release.outputs.upstream_owner }}
+          LOG: ${{ steps.notes.outputs.log }}
+          WORKFLOW_URL: ${{ github.server_url }}/${{ github.repository }}/actions/workflows/upstream-sync.yml
+          FORK_REPO: ${{ github.repository }}
+        run: |
+          FORK_OWNER=$(echo "$FORK_REPO" | cut -d/ -f1)
+
+          # Guard: ensure TAG_SHA is not already the same as main HEAD
+          MAIN_SHA=$(git rev-parse "origin/main")
+          echo "DEBUG: MAIN_SHA=$MAIN_SHA"
+          echo "DEBUG: TAG_SHA=$TAG_SHA"
+          if [ "$TAG_SHA" = "$MAIN_SHA" ]; then
+            echo "upstream-sync would equal main — no PR needed."
+            exit 0
+          fi
+
+          # Build the upstream-sync branch on top of main so that GitHub can
+          # compute a diff even when the two repos have unrelated histories
+          # (fork relationship was severed).
+          #
+          # Strategy:
+          #   1. Checkout upstream-sync from main (shares history with main).
+          #   2. Use git read-tree to replace the working tree with the upstream
+          #      tag's tree, then commit. This produces a normal commit (not a
+          #      merge commit) whose parent is main HEAD and whose content is
+          #      the upstream release — giving GitHub a valid PR diff.
+          UPSTREAM_TREE=$(git rev-parse "${TAG_SHA}^{tree}")
+          MAIN_TREE=$(git rev-parse "origin/main^{tree}")
+          echo "DEBUG: UPSTREAM_TREE=$UPSTREAM_TREE"
+          echo "DEBUG: MAIN_TREE=$MAIN_TREE"
+
+          if [ "$UPSTREAM_TREE" = "$MAIN_TREE" ]; then
+            echo "Upstream tree is identical to main tree — nothing to sync."
+            exit 0
+          fi
+
+          # Start upstream-sync from main
+          git checkout -B upstream-sync "origin/main"
+
+          # Replace the entire working tree with the upstream tag's tree
+          git read-tree --reset -u "$UPSTREAM_TREE"
+
+          # Commit the result
+          git commit -m "chore: sync upstream release $LATEST_TAG" \
+            --allow-empty
+
+          # Capture the new commit SHA
+          SYNC_HEAD=$(git rev-parse HEAD)
+          git push origin upstream-sync --force
+
+          # Wait for GitHub to register the branch at the new HEAD
+          echo "Waiting for GitHub to register branch..."
+          for i in $(seq 1 12); do
+            REMOTE_SHA=$(git ls-remote origin refs/heads/upstream-sync | awk '{print $1}')
+            if [ "$REMOTE_SHA" = "$SYNC_HEAD" ]; then
+              echo "Branch confirmed at $SYNC_HEAD"
+              break
+            fi
+            echo "Attempt $i: branch not ready yet, waiting 5s..."
+            sleep 5
+          done
+
+          if [ "$REMOTE_SHA" != "$SYNC_HEAD" ]; then
+            echo "Error: Branch did not update to expected SHA after 60s."
+            exit 1
+          fi
+
+          PR_TITLE="chore: sync upstream release $LATEST_TAG"
+
+          # Write body to a temp file
+          PR_BODY_FILE=$(mktemp)
+          {
+            printf '## Upstream Sync: Release %s\n\n' "$LATEST_TAG"
+            printf 'New release from [%s/nullclaw](https://github.com/%s/nullclaw) is available.\n' "$UPSTREAM_OWNER" "$UPSTREAM_OWNER"
+            printf 'This PR merges upstream tag `%s` into `main`.\n\n' "$LATEST_TAG"
+            printf '**Review workflow:**\n'
+            printf '1. Check the diff below for breaking changes.\n'
+            printf '2. Resolve any conflicts directly on the `main` branch.\n'
+            printf '3. Merge when ready.\n\n'
+            printf '**Release Tag:** `%s`\n' "$LATEST_TAG"
+            printf '**Commit SHA:** `%s`\n\n' "$TAG_SHA"
+            printf '<details>\n<summary>New commits (newest first)</summary>\n\n```\n'
+            printf '%s\n' "$LOG"
+            printf '```\n\n</details>\n\n---\n'
+            printf '*Auto-generated by the [Upstream Sync](%s) workflow.*\n' "$WORKFLOW_URL"
+          } > "$PR_BODY_FILE"
+
+          # Check for existing PR from upstream-sync branch via REST API
+          EXISTING_PR=$(gh api \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${FORK_REPO}/pulls?head=${FORK_OWNER}:upstream-sync&base=main&state=open" \
+            --jq '.[0].number // empty' 2>/dev/null || echo "")
+
+          if [ -n "$EXISTING_PR" ]; then
+            echo "Updating existing PR #${EXISTING_PR}."
+            # Use jq to safely encode the body as JSON
+            jq -n \
+              --arg title "$PR_TITLE" \
+              --rawfile body "$PR_BODY_FILE" \
+              '{"title": $title, "body": $body}' | \
+            gh api \
+              --method PATCH \
+              -H "Accept: application/vnd.github+json" \
+              "/repos/${FORK_REPO}/pulls/${EXISTING_PR}" \
+              --input - >/dev/null
+            PR_NUMBER="$EXISTING_PR"
+          else
+            echo "Opening new PR via REST API: $PR_TITLE"
+            # Use REST API directly — gh pr create uses GraphQL which rejects
+            # PRs between branches with unrelated histories even when a valid
+            # commit chain exists.
+            # Use jq to safely encode title/body as JSON to avoid shell quoting issues.
+            PR_RESPONSE=$(jq -n \
+              --arg title "$PR_TITLE" \
+              --rawfile body "$PR_BODY_FILE" \
+              --arg head "${FORK_OWNER}:upstream-sync" \
+              --arg base "main" \
+              '{"title": $title, "body": $body, "head": $head, "base": $base}' | \
+            gh api \
+              --method POST \
+              -H "Accept: application/vnd.github+json" \
+              "/repos/${FORK_REPO}/pulls" \
+              --input - \
+              --jq '.number' 2>&1) || true
+            echo "REST API response: $PR_RESPONSE"
+            if echo "$PR_RESPONSE" | grep -qE '^[0-9]+$'; then
+              PR_NUMBER="$PR_RESPONSE"
+              # Add label separately
+              gh api \
+                --method POST \
+                -H "Accept: application/vnd.github+json" \
+                "/repos/${FORK_REPO}/issues/${PR_NUMBER}/labels" \
+                -f "labels[]=upstream-sync" 2>/dev/null || true
+            else
+              echo "REST API PR creation failed: $PR_RESPONSE"
+              exit 1
+            fi
+          fi
+
+          # Check for conflicts via REST API (GraphQL index may lag after REST PR creation)
+          if [ -n "$PR_NUMBER" ]; then
+            echo "Checking for merge conflicts in PR #$PR_NUMBER..."
+            for i in $(seq 1 6); do
+              MERGE_STATUS=$(gh api \
+                -H "Accept: application/vnd.github+json" \
+                "/repos/${FORK_REPO}/pulls/${PR_NUMBER}" \
+                --jq '.mergeable_state' 2>/dev/null || echo "unknown")
+              if [ "$MERGE_STATUS" != "unknown" ] && [ "$MERGE_STATUS" != "null" ]; then
+                break
+              fi
+              echo "Mergeability unknown, waiting 10s..."
+              sleep 10
+            done
+            if [ "$MERGE_STATUS" = "dirty" ]; then
+              echo "Merge conflicts detected."
+              gh api \
+                --method POST \
+                -H "Accept: application/vnd.github+json" \
+                "/repos/${FORK_REPO}/issues/${PR_NUMBER}/labels" \
+                -f "labels[]=conflicts" 2>/dev/null || true
+              gh api \
+                --method POST \
+                -H "Accept: application/vnd.github+json" \
+                "/repos/${FORK_REPO}/issues/${PR_NUMBER}/comments" \
+                -f "body=@github-copilot Merge conflicts detected. Please help resolve the conflicts in this PR." 2>/dev/null || true
+            fi
+          fi
+
+          rm -f "$PR_BODY_FILE"
+
+      - name: Summary
+        if: always()
+        run: |
+          if [ "${{ steps.check_release.outputs.has_new }}" = "true" ]; then
+            echo "### Upstream sync complete" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Release: \`${{ steps.check_release.outputs.latest_tag }}\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- PR opened/updated against \`main\`." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### No new upstream release" >> "$GITHUB_STEP_SUMMARY"
+            echo "Branch \`main\` is already up to date with latest release." >> "$GITHUB_STEP_SUMMARY"
+          fi
