@@ -532,10 +532,15 @@ fn appendSkillsSection(
 
     if (skill_list.len == 0) return;
 
-    // Render always=true skills with full instructions first
+    // Render always=true skills with full instructions first (only prompt-trigger skills)
     var has_always = false;
     for (skill_list) |skill| {
+        if (skill.trigger != .prompt) continue; // Only prompt-trigger skills in system prompt
         if (!skill.always or !skill.available) continue;
+        // Skip [action:agent] skills — their instructions are meant for hook
+        // sub-agent processing and contain behavior-tag directives that would
+        // confuse the main LLM if injected into the system prompt.
+        if (skills_mod.parseHookAction(skill.instructions) != null) continue;
         if (!has_always) {
             try w.writeAll("## Skills\n\n");
             has_always = true;
@@ -550,10 +555,13 @@ fn appendSkillsSection(
         }
     }
 
-    // Render summary skills and unavailable skills as XML
+    // Render summary skills and unavailable skills as XML (only prompt-trigger skills)
     var has_summary = false;
     for (skill_list) |skill| {
+        if (skill.trigger != .prompt) continue; // Only prompt-trigger skills in system prompt
         if (skill.always and skill.available) continue; // already rendered above
+        // Skip [action:agent] skills from summary too (see comment above).
+        if (skills_mod.parseHookAction(skill.instructions) != null) continue;
         if (!has_summary) {
             try w.writeAll("## Available Skills\n\n");
             try w.writeAll("Use the read_file tool to load full skill instructions when needed.\n\n");

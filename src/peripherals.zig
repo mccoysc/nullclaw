@@ -433,7 +433,8 @@ pub const ArduinoPeripheral = struct {
         compile_child.spawn() catch return Peripheral.PeripheralError.FlashFailed;
         // Drain stderr to avoid pipe deadlock
         if (compile_child.stderr) |*err_pipe| {
-            _ = err_pipe.readToEndAlloc(allocator, 64 * 1024) catch {};
+            const data = err_pipe.readToEndAlloc(allocator, 64 * 1024) catch null;
+            if (data) |d| allocator.free(d);
         }
         const compile_term = compile_child.wait() catch return Peripheral.PeripheralError.FlashFailed;
         const compile_ok = switch (compile_term) {
@@ -451,7 +452,8 @@ pub const ArduinoPeripheral = struct {
         upload_child.stderr_behavior = .Pipe;
         upload_child.spawn() catch return Peripheral.PeripheralError.FlashFailed;
         if (upload_child.stderr) |*err_pipe| {
-            _ = err_pipe.readToEndAlloc(allocator, 64 * 1024) catch {};
+            const data = err_pipe.readToEndAlloc(allocator, 64 * 1024) catch null;
+            if (data) |d| allocator.free(d);
         }
         const upload_term = upload_child.wait() catch return Peripheral.PeripheralError.FlashFailed;
         const upload_ok = switch (upload_term) {
@@ -803,7 +805,8 @@ pub const NucleoFlash = struct {
         child.spawn() catch return Peripheral.PeripheralError.IoError;
         // Drain stderr to avoid pipe deadlock
         if (child.stderr) |*err_pipe| {
-            _ = err_pipe.readToEndAlloc(self.allocator, 64 * 1024) catch {};
+            const err_output = err_pipe.readToEndAlloc(self.allocator, 64 * 1024) catch null;
+            if (err_output) |d| self.allocator.free(d);
         }
         const term = child.wait() catch return Peripheral.PeripheralError.IoError;
         const exited_ok = switch (term) {
@@ -828,10 +831,12 @@ pub const NucleoFlash = struct {
         child.spawn() catch return Peripheral.PeripheralError.FlashFailed;
         // Drain pipes to avoid deadlock
         if (child.stdout) |*out| {
-            _ = out.readToEndAlloc(allocator, 64 * 1024) catch {};
+            const data = out.readToEndAlloc(allocator, 64 * 1024) catch null;
+            if (data) |d| allocator.free(d);
         }
         if (child.stderr) |*err_pipe| {
-            _ = err_pipe.readToEndAlloc(allocator, 64 * 1024) catch {};
+            const data = err_pipe.readToEndAlloc(allocator, 64 * 1024) catch null;
+            if (data) |d| allocator.free(d);
         }
         const term = child.wait() catch return Peripheral.PeripheralError.FlashFailed;
         const ok = switch (term) {
@@ -1334,11 +1339,16 @@ test "gpioRead returns result with state" {
     rpi.connected = true;
     const p = rpi.peripheral();
     if (comptime builtin.os.tag == .linux) {
-        // Only run on real RPi hardware — requires NULLCLAW_GPIO_TEST=1
-        if (platform.getEnvOrNull(std.testing.allocator, "NULLCLAW_GPIO_TEST")) |v| std.testing.allocator.free(v) else return error.SkipZigTest;
-        const result = try gpioRead(p, 17);
-        try std.testing.expectEqual(@as(u32, 17), result.pin);
-        try std.testing.expectEqualStrings("LOW", result.stateString());
+        // On real RPi hardware (NULLCLAW_GPIO_TEST=1), verify the full read path.
+        // Otherwise the sysfs GPIO files don't exist → IoError.
+        if (platform.getEnvOrNull(std.testing.allocator, "NULLCLAW_GPIO_TEST")) |v| {
+            std.testing.allocator.free(v);
+            const result = try gpioRead(p, 17);
+            try std.testing.expectEqual(@as(u32, 17), result.pin);
+            try std.testing.expectEqualStrings("LOW", result.stateString());
+        } else {
+            try std.testing.expectError(Peripheral.PeripheralError.IoError, gpioRead(p, 17));
+        }
     } else {
         try std.testing.expectError(Peripheral.PeripheralError.UnsupportedOperation, gpioRead(p, 17));
     }
@@ -1349,12 +1359,17 @@ test "gpioWrite returns success" {
     rpi.connected = true;
     const p = rpi.peripheral();
     if (comptime builtin.os.tag == .linux) {
-        // Only run on real RPi hardware — requires NULLCLAW_GPIO_TEST=1
-        if (platform.getEnvOrNull(std.testing.allocator, "NULLCLAW_GPIO_TEST")) |v| std.testing.allocator.free(v) else return error.SkipZigTest;
-        const result = try gpioWrite(p, 17, true);
-        try std.testing.expectEqual(@as(u32, 17), result.pin);
-        try std.testing.expectEqual(@as(u8, 1), result.value);
-        try std.testing.expect(result.success);
+        // On real RPi hardware (NULLCLAW_GPIO_TEST=1), verify the full write path.
+        // Otherwise the sysfs GPIO files don't exist → IoError.
+        if (platform.getEnvOrNull(std.testing.allocator, "NULLCLAW_GPIO_TEST")) |v| {
+            std.testing.allocator.free(v);
+            const result = try gpioWrite(p, 17, true);
+            try std.testing.expectEqual(@as(u32, 17), result.pin);
+            try std.testing.expectEqual(@as(u8, 1), result.value);
+            try std.testing.expect(result.success);
+        } else {
+            try std.testing.expectError(Peripheral.PeripheralError.IoError, gpioWrite(p, 17, true));
+        }
     } else {
         try std.testing.expectError(Peripheral.PeripheralError.UnsupportedOperation, gpioWrite(p, 17, true));
     }

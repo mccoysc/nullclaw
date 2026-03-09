@@ -16,6 +16,7 @@ const ChatResponse = providers.ChatResponse;
 const ToolSpec = providers.ToolSpec;
 const tools_mod = @import("../tools/root.zig");
 const Tool = tools_mod.Tool;
+const ToolRegistry = tools_mod.ToolRegistry;
 const memory_mod = @import("../memory/root.zig");
 const Memory = memory_mod.Memory;
 const bootstrap_mod = @import("../bootstrap/root.zig");
@@ -26,8 +27,10 @@ const observability = @import("../observability.zig");
 const Observer = observability.Observer;
 const ObserverEvent = observability.ObserverEvent;
 const SecurityPolicy = @import("../security/policy.zig").SecurityPolicy;
-const verbose_mod = @import("../verbose.zig");
 
+const skills_mod = @import("../skills.zig");
+const provider_factory = @import("../providers/factory.zig");
+const api_key_mod = @import("../providers/api_key.zig");
 const cache = memory_mod.cache;
 pub const dispatcher = @import("dispatcher.zig");
 pub const compaction = @import("compaction.zig");
@@ -48,10 +51,6 @@ const DEFAULT_MAX_TOOL_ITERATIONS: u32 = 25;
 
 /// Maximum non-system messages before trimming.
 const DEFAULT_MAX_HISTORY: u32 = 50;
-
-fn estimate_text_tokens(text: []const u8) u32 {
-    return @intCast((text.len + 3) / 4);
-}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Agent
@@ -229,7 +228,20 @@ pub const Agent = struct {
     allocator: std.mem.Allocator,
     provider: Provider,
     tools: []const Tool,
+    /// When true, `tools` was heap-allocated specifically for this agent
+    /// (e.g. a fresh registry snapshot taken at session-creation time).
+    /// `deinit()` will free it.  When false, `tools` is a borrowed slice
+    /// owned by the caller (ChannelRuntime) — do NOT free.
+    tools_owned: bool = false,
     tool_specs: []const ToolSpec,
+    /// Optional dynamic registry. When set, executeTool() dispatches via the
+    /// registry (with SO ref-counting). Must remain alive for the agent's lifetime.
+    registry: ?*ToolRegistry = null,
+    /// Cached registry generation — compared against registry.generation at
+    /// the start of each turn to detect staleness and trigger a refresh of
+    /// tool_specs + tools snapshot.  Replaces the old boolean tool_specs_dirty
+    /// flag which was never set to true.
+    cached_registry_generation: u32 = 0,
     mem: ?Memory,
     bootstrap: ?bootstrap_mod.BootstrapProvider = null,
     session_store: ?memory_mod.SessionStore = null,
@@ -250,16 +262,6 @@ pub const Agent = struct {
     temperature: f64,
     workspace_dir: []const u8,
     allowed_paths: []const []const u8 = &.{},
-    multimodal_unrestricted: bool = false,
-    /// List of models that do not support image/vision input.
-    /// When image markers are detected and the model is in this list,
-    /// the agent will skip processing images instead of returning an error.
-    vision_disabled_models: []const []const u8 = &.{},
-    /// When true, automatically adds the current model to vision_disabled_models
-    /// upon receiving a "model does not support vision" error.
-    auto_disable_vision_on_error: bool = true,
-    /// Models auto-detected as not supporting vision (built at runtime).
-    detected_vision_disabled: std.ArrayListUnmanaged([]const u8) = .empty,
     max_tool_iterations: u32,
     max_history_messages: u32,
     auto_save: bool,
@@ -305,9 +307,36 @@ pub const Agent = struct {
     compaction_max_summary_chars: u32 = compaction.DEFAULT_COMPACTION_MAX_SUMMARY_CHARS,
     compaction_max_source_chars: u32 = compaction.DEFAULT_COMPACTION_MAX_SOURCE_CHARS,
 
+    /// Maximum iterations for the skill sub-agent turn loop (tool calls only).
+    /// 0 = use compiled default (skills_mod.SUB_AGENT_MAX_ITERATIONS).
+    sub_agent_max_iterations: u32 = 0,
+
+    /// After this many consecutive tool-call iterations, trigger an LLM review.
+    /// 0 = use compiled default (skills_mod.SUB_AGENT_DEFAULT_REVIEW_AFTER).
+    sub_agent_review_after: u32 = 0,
+
+    /// Provider/model/temperature/max_context_tokens/base_url for sub-agent LLM calls.
+    /// null = use the agent's own defaults.  Defaults: temperature=0.3.
+    sub_agent_provider: ?[]const u8 = null,
+    sub_agent_model: ?[]const u8 = null,
+    sub_agent_temperature: ?f64 = null,
+    sub_agent_max_context_tokens: u64 = 0,
+    sub_agent_base_url: ?[]const u8 = null,
+    /// Provider/model/temperature/max_context_tokens/base_url for tools-reviewer LLM calls.
+    /// null = use the agent's own defaults.  Defaults: temperature=0.1.
+    tools_reviewer_provider: ?[]const u8 = null,
+    tools_reviewer_model: ?[]const u8 = null,
+    tools_reviewer_temperature: ?f64 = null,
+    tools_reviewer_max_context_tokens: u64 = 0,
+    tools_reviewer_base_url: ?[]const u8 = null,
+
     /// Per-turn MCP tool filter groups (slice into config-owned memory; not freed by Agent).
     /// Empty = no filtering; all tool specs are sent as-is.
     tool_filter_groups: []const config_types.ToolFilterGroup = &.{},
+
+    /// Background queue for fire-and-forget [action:asyncAgent] skill tasks.
+    /// Lazily initialised on first enqueue; shut down in deinit.
+    async_skill_queue: skills_mod.AsyncSkillQueue = skills_mod.AsyncSkillQueue.init(undefined),
 
     /// Optional security policy for autonomy checks and rate limiting.
     policy: ?*const SecurityPolicy = null,
@@ -320,12 +349,6 @@ pub const Agent = struct {
     usage_record_callback: ?UsageRecordCallback = null,
     /// Context pointer passed to usage_record_callback.
     usage_record_ctx: ?*anyopaque = null,
-    /// Cross-thread interrupt flag used to stop in-flight tool loops.
-    interrupt_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    /// Tracks currently running tool and effective interruptions for user-facing reporting.
-    tool_state_mu: std.Thread.Mutex = .{},
-    active_tool_name: ?[]u8 = null,
-    interrupted_tools: std.ArrayListUnmanaged([]u8) = .empty,
     /// Conversation context for the current turn (Signal-specific for now).
     conversation_context: ?prompt.ConversationContext = null,
 
@@ -363,6 +386,21 @@ pub const Agent = struct {
     };
 
     /// Initialize agent from a loaded Config.
+    /// Create an Agent from config, optionally using a channel-level model
+    /// override when no global default_model is set.
+    pub fn fromConfigWithChannelModel(
+        allocator: std.mem.Allocator,
+        cfg: *const Config,
+        provider_i: Provider,
+        tools: []const Tool,
+        mem: ?Memory,
+        observer_i: Observer,
+        channel_model: ?[]const u8,
+    ) !Agent {
+        const default_model = channel_model orelse cfg.default_model orelse return error.NoDefaultModel;
+        return fromConfigInner(allocator, cfg, provider_i, tools, mem, observer_i, default_model);
+    }
+
     pub fn fromConfig(
         allocator: std.mem.Allocator,
         cfg: *const Config,
@@ -372,8 +410,24 @@ pub const Agent = struct {
         observer_i: Observer,
     ) !Agent {
         const default_model = cfg.default_model orelse return error.NoDefaultModel;
+        return fromConfigInner(allocator, cfg, provider_i, tools, mem, observer_i, default_model);
+    }
+
+    fn fromConfigInner(
+        allocator: std.mem.Allocator,
+        cfg: *const Config,
+        provider_i: Provider,
+        tools: []const Tool,
+        mem: ?Memory,
+        observer_i: Observer,
+        default_model: []const u8,
+    ) !Agent {
         const token_limit_override = if (cfg.agent.token_limit_explicit) cfg.agent.token_limit else null;
-        const resolved_token_limit = context_tokens.resolveContextTokens(token_limit_override, default_model);
+        var resolved_token_limit = context_tokens.resolveContextTokens(token_limit_override, default_model);
+        // Apply global max_context_tokens cap if configured (0 = no cap)
+        if (cfg.agent.max_context_tokens > 0 and (resolved_token_limit == 0 or cfg.agent.max_context_tokens < resolved_token_limit)) {
+            resolved_token_limit = cfg.agent.max_context_tokens;
+        }
         const resolved_max_tokens_raw = max_tokens_resolver.resolveMaxTokens(cfg.max_tokens, default_model);
         const token_limit_cap: u32 = @intCast(@min(resolved_token_limit, @as(u64, std.math.maxInt(u32))));
         const resolved_max_tokens = @min(resolved_max_tokens_raw, token_limit_cap);
@@ -412,9 +466,6 @@ pub const Agent = struct {
             .temperature = cfg.default_temperature,
             .workspace_dir = cfg.workspace_dir,
             .allowed_paths = cfg.autonomy.allowed_paths,
-            .multimodal_unrestricted = cfg.autonomy.level == .yolo,
-            .vision_disabled_models = cfg.agent.vision_disabled_models,
-            .auto_disable_vision_on_error = cfg.agent.auto_disable_vision_on_error,
             .max_tool_iterations = cfg.agent.max_tool_iterations,
             .max_history_messages = cfg.agent.max_history_messages,
             .auto_save = cfg.memory.auto_save,
@@ -431,15 +482,28 @@ pub const Agent = struct {
             .compaction_max_summary_chars = cfg.agent.compaction_max_summary_chars,
             .compaction_max_source_chars = cfg.agent.compaction_max_source_chars,
             .tool_filter_groups = cfg.agent.tool_filter_groups,
+            .sub_agent_max_iterations = cfg.agent.sub_agent_max_iterations,
+            .sub_agent_review_after = cfg.agent.sub_agent_review_after,
+            .sub_agent_provider = cfg.sub_agent_provider,
+            .sub_agent_model = cfg.sub_agent_model,
+            .sub_agent_temperature = cfg.sub_agent_temperature,
+            .sub_agent_max_context_tokens = cfg.sub_agent_max_context_tokens,
+            .sub_agent_base_url = cfg.sub_agent_base_url,
+            .tools_reviewer_provider = cfg.tools_reviewer_provider,
+            .tools_reviewer_model = cfg.tools_reviewer_model,
+            .tools_reviewer_temperature = cfg.tools_reviewer_temperature,
+            .tools_reviewer_max_context_tokens = cfg.tools_reviewer_max_context_tokens,
+            .tools_reviewer_base_url = cfg.tools_reviewer_base_url,
             .exec_security = switch (cfg.autonomy.level) {
-                .full, .yolo => .full,
+                .full => .full,
                 .read_only => .deny,
                 .supervised => .allowlist,
             },
             .exec_ask = switch (cfg.autonomy.level) {
-                .full, .read_only, .yolo => .off,
+                .full, .read_only => .off,
                 .supervised => .on_miss,
             },
+            .async_skill_queue = skills_mod.AsyncSkillQueue.init(allocator),
             .history = .empty,
             .total_tokens = 0,
             .has_system_prompt = false,
@@ -448,7 +512,10 @@ pub const Agent = struct {
     }
 
     pub fn deinit(self: *Agent) void {
+        // Shut down the async skill queue first (blocks until worker exits).
+        self.async_skill_queue.deinit();
         if (self.bootstrap) |bp| bp.deinit();
+        if (self.tools_owned) self.allocator.free(self.tools);
         if (self.model_name_owned) self.allocator.free(self.model_name);
         if (self.default_provider_owned) self.allocator.free(self.default_provider);
         if (self.exec_node_id_owned and self.exec_node_id != null) self.allocator.free(self.exec_node_id.?);
@@ -456,101 +523,53 @@ pub const Agent = struct {
         if (self.pending_exec_command_owned and self.pending_exec_command != null) self.allocator.free(self.pending_exec_command.?);
         if (self.focus_target_owned and self.focus_target != null) self.allocator.free(self.focus_target.?);
         if (self.dock_target_owned and self.dock_target != null) self.allocator.free(self.dock_target.?);
-        self.tool_state_mu.lock();
-        if (self.active_tool_name) |name| self.allocator.free(name);
-        self.active_tool_name = null;
-        for (self.interrupted_tools.items) |name| self.allocator.free(name);
-        self.interrupted_tools.deinit(self.allocator);
-        self.tool_state_mu.unlock();
         for (self.history.items) |*msg| {
             msg.deinit(self.allocator);
         }
         self.history.deinit(self.allocator);
-        for (self.detected_vision_disabled.items) |model| {
-            self.allocator.free(model);
-        }
-        self.detected_vision_disabled.deinit(self.allocator);
         self.allocator.free(self.tool_specs);
     }
 
-    pub fn requestInterrupt(self: *Agent) void {
-        self.interrupt_requested.store(true, .release);
-    }
+    /// Rebuild tool_specs from the registry.
+    /// Call after adding/removing tools from the registry to keep the LLM
+    /// function-calling schema in sync.
+    ///
+    /// The ToolSpec fields (.name, .description, .parameters_json) are
+    /// borrowed pointers into the Tool vtable / wrapper structs.  We must
+    /// read them while the registry mutex is held so a concurrent hot-reload
+    /// cannot free the underlying wrappers mid-copy (UAF).  We use the
+    /// registry's internal mutex via a manual lock/unlock bracket.
+    pub fn refreshToolSpecs(self: *Agent) !void {
+        const reg = self.registry orelse return;
 
-    pub fn clearInterruptRequest(self: *Agent) void {
-        self.interrupt_requested.store(false, .release);
-    }
+        // Hold the registry mutex for the entire copy so that tool wrapper
+        // pointers remain valid while we dereference .name()/.description()
+        // etc.  This prevents the UAF where a hot-reload frees wrappers
+        // between copySlice() and the ToolSpec field reads.
+        reg.mutex.lock();
+        defer reg.mutex.unlock();
 
-    fn isInterruptRequested(self: *const Agent) bool {
-        return self.interrupt_requested.load(.acquire);
-    }
+        const entry_count = reg.entries.items.len;
+        const new_specs = try self.allocator.alloc(ToolSpec, entry_count);
+        errdefer self.allocator.free(new_specs);
 
-    fn setActiveToolName(self: *Agent, name: []const u8) !void {
-        self.tool_state_mu.lock();
-        defer self.tool_state_mu.unlock();
-        if (self.active_tool_name) |old| self.allocator.free(old);
-        self.active_tool_name = try self.allocator.dupe(u8, name);
-    }
-
-    fn clearActiveToolName(self: *Agent) void {
-        self.tool_state_mu.lock();
-        defer self.tool_state_mu.unlock();
-        if (self.active_tool_name) |old| self.allocator.free(old);
-        self.active_tool_name = null;
-    }
-
-    fn noteInterruptedTool(self: *Agent, name: []const u8) !void {
-        self.tool_state_mu.lock();
-        defer self.tool_state_mu.unlock();
-        for (self.interrupted_tools.items) |existing| {
-            if (std.ascii.eqlIgnoreCase(existing, name)) return;
-        }
-        try self.interrupted_tools.append(self.allocator, try self.allocator.dupe(u8, name));
-    }
-
-    fn takeInterruptedToolsSummary(self: *Agent) !?[]u8 {
-        self.tool_state_mu.lock();
-        defer self.tool_state_mu.unlock();
-        if (self.interrupted_tools.items.len == 0) return null;
-
-        var out: std.ArrayListUnmanaged(u8) = .empty;
-        errdefer out.deinit(self.allocator);
-        for (self.interrupted_tools.items, 0..) |name, i| {
-            if (i > 0) try out.appendSlice(self.allocator, ", ");
-            try out.appendSlice(self.allocator, name);
+        for (reg.entries.items, 0..) |e, i| {
+            new_specs[i] = .{
+                .name = e.tool.name(),
+                .description = e.tool.description(),
+                .parameters_json = e.tool.parametersJson(),
+            };
         }
 
-        for (self.interrupted_tools.items) |name| self.allocator.free(name);
-        self.interrupted_tools.clearRetainingCapacity();
-
-        return try out.toOwnedSlice(self.allocator);
+        self.allocator.free(self.tool_specs);
+        self.tool_specs = new_specs;
     }
 
-    pub fn snapshotActiveToolName(self: *Agent, allocator: std.mem.Allocator) !?[]u8 {
-        self.tool_state_mu.lock();
-        defer self.tool_state_mu.unlock();
-        if (self.active_tool_name) |name| {
-            return try allocator.dupe(u8, name);
-        }
-        return null;
-    }
-
-    fn interruptedReply(self: *Agent) ![]const u8 {
-        self.clearInterruptRequest();
-        const summary = try self.takeInterruptedToolsSummary();
-        defer if (summary) |s| self.allocator.free(s);
-        const msg = if (summary) |tools|
-            try std.fmt.allocPrint(self.allocator, "Interrupted by /stop. Interrupted tools: {s}.", .{tools})
-        else
-            try self.allocator.dupe(u8, "Interrupted by /stop. Halting tool execution for this turn.");
-        errdefer self.allocator.free(msg);
-        try self.history.append(self.allocator, .{
-            .role = .assistant,
-            .content = try self.allocator.dupe(u8, msg),
-        });
-        const complete_event = ObserverEvent{ .turn_complete = {} };
-        self.observer.recordEvent(&complete_event);
-        return msg;
+    /// Returns true when the registry is draining (pending SO unload).
+    /// The channel layer should call this before accepting new messages.
+    pub fn isRegistryDraining(self: *const Agent) bool {
+        const reg = self.registry orelse return false;
+        return reg.isPendingDrain();
     }
 
     /// Estimate total tokens in conversation history.
@@ -653,6 +672,80 @@ pub const Agent = struct {
         return compaction.forceCompressHistory(self.allocator, &self.history);
     }
 
+    /// Load workspace skills for hook evaluation.
+    /// Returns a slice that must be freed with skills_mod.freeSkills().
+    /// Also consumes any `.reload` sentinel files in the skills directories.
+    fn loadSkillsForHooks(self: *Agent) ?[]skills_mod.Skill {
+        const home_dir = platform.getHomeDir(self.allocator) catch null;
+        defer if (home_dir) |h| self.allocator.free(h);
+        const community_base = if (home_dir) |h|
+            std.fs.path.join(self.allocator, &.{ h, ".nullclaw", "skills" }) catch null
+        else
+            null;
+        defer if (community_base) |cb| self.allocator.free(cb);
+
+        // Consume reload sentinels (best-effort; result unused here because
+        // skills are always loaded fresh from disk on every turn).
+        if (community_base) |cb| _ = skills_mod.consumeReloadSentinel(self.allocator, cb);
+        _ = skills_mod.consumeReloadSentinel(self.allocator, self.workspace_dir);
+
+        if (community_base) |cb| {
+            return skills_mod.listSkillsMerged(self.allocator, cb, self.workspace_dir) catch
+                skills_mod.listSkills(self.allocator, self.workspace_dir) catch null;
+        }
+        return skills_mod.listSkills(self.allocator, self.workspace_dir) catch null;
+    }
+
+    /// Resolve a provider for sub-agent or tools-reviewer LLM calls.
+    /// If `override_provider` names a provider different from `default_provider`,
+    /// create a temporary ProviderHolder on the arena, resolve its API key from
+    /// configured_providers, and return its vtable.  Otherwise return the agent's
+    /// own provider (no allocation).
+    fn resolveOverrideProvider(
+        self: *const Agent,
+        arena: std.mem.Allocator,
+        override_provider: ?[]const u8,
+        override_base_url: ?[]const u8,
+    ) ?Provider {
+        const target = override_provider orelse return null;
+        if (target.len == 0) return null;
+        if (std.mem.eql(u8, target, self.default_provider) and override_base_url == null) return null;
+
+        // Resolve API key for the target provider
+        const resolved_key = api_key_mod.resolveApiKeyFromConfig(
+            arena,
+            target,
+            self.configured_providers,
+        ) catch null;
+
+        // Use explicit base_url if provided; otherwise look up from configured_providers
+        const base_url = override_base_url orelse blk: {
+            for (self.configured_providers) |entry| {
+                if (std.mem.eql(u8, entry.name, target)) break :blk entry.base_url;
+            }
+            break :blk null;
+        };
+
+        // Look up native_tools setting from configured_providers
+        const native_tools = blk_nt: {
+            for (self.configured_providers) |entry| {
+                if (std.mem.eql(u8, entry.name, target)) break :blk_nt entry.native_tools;
+            }
+            break :blk_nt true;
+        };
+
+        const holder = arena.create(provider_factory.ProviderHolder) catch return null;
+        holder.* = provider_factory.ProviderHolder.fromConfig(
+            arena,
+            target,
+            resolved_key,
+            base_url,
+            native_tools,
+            null, // user_agent
+        );
+        return holder.provider();
+    }
+
     fn appendUniqueString(
         list: *std.ArrayListUnmanaged([]const u8),
         allocator: std.mem.Allocator,
@@ -699,20 +792,6 @@ pub const Agent = struct {
 
     fn composeFinalReply(self: *const Agent, base_text: []const u8, reasoning_content: ?[]const u8, usage: providers.TokenUsage) ![]const u8 {
         return commands.composeFinalReply(self, base_text, reasoning_content, usage);
-    }
-
-    fn selectDisplayText(response_text: []const u8, parsed_text: []const u8, parsed_calls_len: usize) []const u8 {
-        if (parsed_calls_len > 0) return parsed_text;
-        if (parsed_text.len > 0) {
-            // Some malformed/unclosed tool-call payloads can survive into parsed_text
-            // via parser recovery fallbacks. Suppress them from user-visible output.
-            if (dispatcher.containsToolCallMarkup(parsed_text)) return "";
-            return parsed_text;
-        }
-        // If tool-call markup exists but parsing produced no valid calls/text,
-        // never show the raw payload to the user.
-        if (dispatcher.containsToolCallMarkup(response_text)) return "";
-        return response_text;
     }
 
     fn shouldForceActionFollowThrough(text: []const u8) bool {
@@ -969,6 +1048,55 @@ pub const Agent = struct {
         self.context_was_compacted = false;
         commands.refreshSubagentToolContext(self);
 
+        // Rebuild tool_specs and tools snapshot if the registry was mutated
+        // since the last turn.  Both must be refreshed together so the
+        // capabilities section, system prompt, and XML tool instructions all
+        // reflect the current registry state.
+        //
+        // Detection: compare our cached generation against the registry's
+        // atomic generation counter (bumped by applyPlugins / hot-reload).
+        // This replaces the old boolean `tool_specs_dirty` flag which was
+        // never set to true (BUG-0002).
+        if (self.registry) |reg| {
+            const current_gen = reg.generation.load(.acquire);
+            if (current_gen != self.cached_registry_generation) {
+                self.refreshToolSpecs() catch |err| {
+                    log.warn("refreshToolSpecs failed: {}; using stale specs", .{err});
+                };
+                // Also refresh the tools snapshot so system-prompt generation
+                // and capability advertising use the live registry contents.
+                // Use dupe-from-copySlice pattern (same as session.zig) to
+                // avoid realloc ownership issues.
+                const n = reg.count();
+                var stack_buf: [256]Tool = undefined;
+                const heap_buf: ?[]Tool = self.allocator.alloc(Tool, n) catch null;
+                if (heap_buf != null or n <= stack_buf.len) {
+                    const temp: []Tool = if (heap_buf) |b| b else stack_buf[0..n];
+                    defer if (heap_buf) |b| self.allocator.free(b);
+                    const filled = reg.copySlice(temp);
+                    const new_snapshot = self.allocator.dupe(Tool, temp[0..filled]) catch null;
+                    if (new_snapshot) |snapshot| {
+                        if (self.tools_owned) self.allocator.free(self.tools);
+                        self.tools = snapshot;
+                        self.tools_owned = true;
+                        // Invalidate the system prompt so it is rebuilt with the new
+                        // tool list on this turn (fixes stale capabilities section).
+                        self.has_system_prompt = false;
+
+                        self.cached_registry_generation = current_gen;
+                    } else {
+                        // Snapshot dupe OOM — do NOT update generation so
+                        // the next turn retries the refresh.
+                        log.warn("tools snapshot dupe failed (OOM); will retry next turn", .{});
+                    }
+                } else {
+                    // OOM with > 256 tools: skip refresh; do NOT update
+                    // cached_registry_generation so the next turn retries.
+                    log.warn("tools snapshot refresh skipped: OOM for {} tools", .{n});
+                }
+            }
+        }
+
         const effective_user_message = blk: {
             if (commands.bareSessionResetPrompt(user_message)) |fresh_prompt| {
                 // Preserve slash side-effects (/new|/reset session clear), but route bare command
@@ -1080,23 +1208,38 @@ pub const Agent = struct {
             .content = enriched,
         });
 
+        // Load skills once for hook evaluation across the entire turn.
+        // Must be loaded before cache check so on_llm_request hooks can
+        // fire even when a cached response would otherwise be returned.
+        const hook_skills = self.loadSkillsForHooks();
+        defer if (hook_skills) |hs| skills_mod.freeSkills(self.allocator, hs);
+
         // ── Response cache check ──
-        if (self.response_cache) |rc| {
-            var key_buf: [16]u8 = undefined;
-            const system_prompt = if (self.history.items.len > 0 and self.history.items[0].role == .system)
-                self.history.items[0].content
-            else
-                null;
-            const key_hex = cache.ResponseCache.cacheKeyHex(&key_buf, self.model_name, system_prompt, effective_user_message);
-            if (rc.get(self.allocator, key_hex) catch null) |cached_response| {
-                errdefer self.allocator.free(cached_response);
-                const history_copy = try self.allocator.dupe(u8, cached_response);
-                errdefer self.allocator.free(history_copy);
-                try self.history.append(self.allocator, .{
-                    .role = .assistant,
-                    .content = history_copy,
-                });
-                return cached_response;
+        // Skip cache when on_llm_request hooks are present, since those hooks
+        // may intercept, modify, or compress content before the LLM call.
+        const has_llm_request_hooks = if (hook_skills) |hs|
+            skills_mod.hasSkillsForTrigger(hs, .on_llm_request)
+        else
+            false;
+
+        if (!has_llm_request_hooks) {
+            if (self.response_cache) |rc| {
+                var key_buf: [16]u8 = undefined;
+                const system_prompt = if (self.history.items.len > 0 and self.history.items[0].role == .system)
+                    self.history.items[0].content
+                else
+                    null;
+                const key_hex = cache.ResponseCache.cacheKeyHex(&key_buf, self.model_name, system_prompt, effective_user_message);
+                if (rc.get(self.allocator, key_hex) catch null) |cached_response| {
+                    errdefer self.allocator.free(cached_response);
+                    const history_copy = try self.allocator.dupe(u8, cached_response);
+                    errdefer self.allocator.free(history_copy);
+                    try self.history.append(self.allocator, .{
+                        .role = .assistant,
+                        .content = history_copy,
+                    });
+                    return cached_response;
+                }
             }
         }
 
@@ -1115,15 +1258,144 @@ pub const Agent = struct {
         var iteration: u32 = 0;
         var forced_follow_through_count: u32 = 0;
         while (iteration < self.max_tool_iterations) : (iteration += 1) {
-            if (self.isInterruptRequested()) {
-                return self.interruptedReply();
-            }
-
             _ = iter_arena.reset(.retain_capacity);
             const arena = iter_arena.allocator();
 
+            // ── on_llm_request hook: evaluate before building messages ──
+            if (hook_skills) |hs| {
+                if (skills_mod.hasSkillsForTrigger(hs, .on_llm_request)) {
+                    // 1. Run all [action:agent] skills in chain
+                    const agent_skills = skills_mod.collectAgentSkills(self.allocator, hs, .on_llm_request) catch &.{};
+                    defer if (agent_skills.len > 0) self.allocator.free(agent_skills);
+                    var hook_result = self.runSkillSubAgentChain(self.allocator, agent_skills, "");
+                    defer skills_mod.freeHookResult(self.allocator, &hook_result);
+
+                    // 2. If chain didn't intercept, run plain skills
+                    if (hook_result.action != .intercept and hook_result.action != .agent_error) {
+                        const effective = if (hook_result.action == .continue_with and hook_result.content.len > 0) hook_result.content else "";
+                        var plain_result = skills_mod.evaluateSkillHook(self.allocator, hs, .on_llm_request, effective) catch skills_mod.SkillHookResult{};
+                        if (plain_result.action == .continue_with or plain_result.action == .intercept or plain_result.action == .agent_error) {
+                            skills_mod.freeHookResult(self.allocator, &hook_result);
+                            hook_result = plain_result;
+                        } else {
+                            skills_mod.freeHookResult(self.allocator, &plain_result);
+                        }
+                    }
+
+                    switch (hook_result.action) {
+                        .agent_error => {
+                            const err_response = if (hook_result.content.len > 0)
+                                try self.allocator.dupe(u8, hook_result.content)
+                            else
+                                try self.allocator.dupe(u8, "[skill hook agent error]");
+                            errdefer self.allocator.free(err_response);
+                            try self.history.append(self.allocator, .{
+                                .role = .assistant,
+                                .content = try self.allocator.dupe(u8, err_response),
+                            });
+                            const complete_event = ObserverEvent{ .turn_complete = {} };
+                            self.observer.recordEvent(&complete_event);
+                            return err_response;
+                        },
+                        .intercept => {
+                            const intercept_response = if (hook_result.content.len > 0)
+                                try self.allocator.dupe(u8, hook_result.content)
+                            else
+                                try self.allocator.dupe(u8, "[intercepted by skill hook]");
+                            errdefer self.allocator.free(intercept_response);
+                            try self.history.append(self.allocator, .{
+                                .role = .assistant,
+                                .content = try self.allocator.dupe(u8, intercept_response),
+                            });
+                            const complete_event = ObserverEvent{ .turn_complete = {} };
+                            self.observer.recordEvent(&complete_event);
+                            return intercept_response;
+                        },
+                        .continue_with => {
+                            if (hook_result.content.len > 0 and self.history.items.len > 0) {
+                                const last_idx = self.history.items.len - 1;
+                                if (self.history.items[last_idx].role == .user) {
+                                    self.history.items[last_idx].deinit(self.allocator);
+                                    self.history.items[last_idx] = .{
+                                        .role = .user,
+                                        .content = try self.allocator.dupe(u8, hook_result.content),
+                                    };
+                                }
+                            }
+                        },
+                        .passthrough, .agent, .async_agent => {},
+                    }
+                }
+            }
+
             // Build messages slice for provider (arena-owned; freed at end of iteration)
-            const messages = try self.buildProviderMessages(arena);
+            var messages = try self.buildProviderMessages(arena);
+
+            // ── on_llm_before hook: modify messages content before LLM call ──
+            if (hook_skills) |hs| {
+                if (skills_mod.hasSkillsForTrigger(hs, .on_llm_before)) {
+                    for (0..messages.len) |i| {
+                        const idx = messages.len - 1 - i;
+                        if (messages[idx].role == .user) {
+                            // 1. Run all [action:agent] skills in chain
+                            const agent_skills = skills_mod.collectAgentSkills(arena, hs, .on_llm_before) catch break;
+                            defer if (agent_skills.len > 0) arena.free(agent_skills);
+                            var hook_result = self.runSkillSubAgentChain(arena, agent_skills, messages[idx].content);
+                            defer skills_mod.freeHookResult(arena, &hook_result);
+
+                            // 2. If chain didn't intercept, run plain skills
+                            if (hook_result.action != .intercept and hook_result.action != .agent_error) {
+                                const effective = if (hook_result.action == .continue_with and hook_result.content.len > 0) hook_result.content else messages[idx].content;
+                                var plain_result = skills_mod.evaluateSkillHook(arena, hs, .on_llm_before, effective) catch skills_mod.SkillHookResult{};
+                                if (plain_result.action == .continue_with or plain_result.action == .intercept or plain_result.action == .agent_error) {
+                                    skills_mod.freeHookResult(arena, &hook_result);
+                                    hook_result = plain_result;
+                                } else {
+                                    skills_mod.freeHookResult(arena, &plain_result);
+                                }
+                            }
+
+                            switch (hook_result.action) {
+                                .agent_error => {
+                                    const err_response = if (hook_result.content.len > 0)
+                                        try self.allocator.dupe(u8, hook_result.content)
+                                    else
+                                        try self.allocator.dupe(u8, "[skill hook agent error]");
+                                    errdefer self.allocator.free(err_response);
+                                    try self.history.append(self.allocator, .{
+                                        .role = .assistant,
+                                        .content = try self.allocator.dupe(u8, err_response),
+                                    });
+                                    const complete_event = ObserverEvent{ .turn_complete = {} };
+                                    self.observer.recordEvent(&complete_event);
+                                    return err_response;
+                                },
+                                .intercept => {
+                                    const intercept_response = if (hook_result.content.len > 0)
+                                        try self.allocator.dupe(u8, hook_result.content)
+                                    else
+                                        try self.allocator.dupe(u8, "[intercepted by on_llm_before hook]");
+                                    errdefer self.allocator.free(intercept_response);
+                                    try self.history.append(self.allocator, .{
+                                        .role = .assistant,
+                                        .content = try self.allocator.dupe(u8, intercept_response),
+                                    });
+                                    const complete_event = ObserverEvent{ .turn_complete = {} };
+                                    self.observer.recordEvent(&complete_event);
+                                    return intercept_response;
+                                },
+                                .continue_with => {
+                                    if (hook_result.content.len > 0) {
+                                        messages[idx].content = try arena.dupe(u8, hook_result.content);
+                                    }
+                                },
+                                .passthrough, .agent, .async_agent => {},
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
 
             const timer_start = std.time.milliTimestamp();
             const is_streaming = self.stream_callback != null and self.stream_ctx != null and self.provider.supportsStreaming();
@@ -1156,7 +1428,7 @@ pub const Agent = struct {
                     self.temperature,
                     self.stream_callback.?,
                     self.stream_ctx.?,
-                ) catch |err| retry_stream: {
+                ) catch |err| {
                     const fail_duration: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - timer_start)));
                     const fail_event = ObserverEvent{ .llm_response = .{
                         .provider = self.provider.getName(),
@@ -1166,41 +1438,6 @@ pub const Agent = struct {
                         .error_message = @errorName(err),
                     } };
                     self.observer.recordEvent(&fail_event);
-
-                    // Auto-disable vision on first "model does not support vision" error
-                    if (self.auto_disable_vision_on_error and err == error.ProviderDoesNotSupportVision) {
-                        if (self.verbose_level == .on or self.verbose_level == .full) {
-                            log.info("Auto-disabling vision for model {s}", .{self.model_name});
-                        }
-                        try self.markVisionDisabled();
-                        const retry_msgs = try self.buildProviderMessages(arena);
-                        const retry_max_tokens = self.effectiveMaxTokensForMessagesWithToolSpecs(
-                            retry_msgs,
-                            if (native_tools_enabled) turn_tool_specs else null,
-                        );
-                        response_attempt = 2;
-                        self.logLlmRequest(iteration + 1, 2, retry_msgs, native_tools_enabled, true);
-                        break :retry_stream self.provider.streamChat(
-                            self.allocator,
-                            .{
-                                .messages = retry_msgs,
-                                .model = self.model_name,
-                                .temperature = self.temperature,
-                                .max_tokens = retry_max_tokens,
-                                .tools = null,
-                                .timeout_secs = self.message_timeout_secs,
-                                .reasoning_effort = self.reasoning_effort,
-                            },
-                            self.model_name,
-                            self.temperature,
-                            self.stream_callback.?,
-                            self.stream_ctx.?,
-                        ) catch |retry_err| {
-                            self.emitUsageFailure();
-                            return retry_err;
-                        };
-                    }
-
                     self.emitUsageFailure();
                     return err;
                 };
@@ -1236,37 +1473,6 @@ pub const Agent = struct {
                         .error_message = @errorName(err),
                     } };
                     self.observer.recordEvent(&fail_event);
-
-                    // Auto-disable vision on first "model does not support vision" error
-                    if (self.auto_disable_vision_on_error and err == error.ProviderDoesNotSupportVision) {
-                        if (self.verbose_level == .on or self.verbose_level == .full) {
-                            log.info("Auto-disabling vision for model {s}", .{self.model_name});
-                        }
-                        try self.markVisionDisabled();
-                        const retry_msgs = try self.buildProviderMessages(arena);
-                        const retry_max_tokens = self.effectiveMaxTokensForMessagesWithToolSpecs(
-                            retry_msgs,
-                            if (native_tools_enabled) turn_tool_specs else null,
-                        );
-                        self.logLlmRequest(iteration + 1, 2, retry_msgs, native_tools_enabled, false);
-                        break :retry_blk self.provider.chat(
-                            self.allocator,
-                            .{
-                                .messages = retry_msgs,
-                                .model = self.model_name,
-                                .temperature = self.temperature,
-                                .max_tokens = retry_max_tokens,
-                                .tools = if (native_tools_enabled) turn_tool_specs else null,
-                                .timeout_secs = self.message_timeout_secs,
-                                .reasoning_effort = self.reasoning_effort,
-                            },
-                            self.model_name,
-                            self.temperature,
-                        ) catch |retry_err| {
-                            self.emitUsageFailure();
-                            return retry_err;
-                        };
-                    }
 
                     // Context exhaustion: compact immediately before first retry
                     const err_name = @errorName(err);
@@ -1365,25 +1571,77 @@ pub const Agent = struct {
             } };
             self.observer.recordEvent(&resp_event);
 
-            const response_text = response.contentOrEmpty();
-
-            // Track tokens with provider-agnostic fallback when total is omitted.
-            var normalized_usage = response.usage;
-            if (normalized_usage.total_tokens == 0 and
-                (normalized_usage.prompt_tokens > 0 or normalized_usage.completion_tokens > 0))
-            {
-                normalized_usage.total_tokens = normalized_usage.prompt_tokens +| normalized_usage.completion_tokens;
-            }
-            // Some providers/channels omit usage entirely; keep status counters useful.
-            if (normalized_usage.total_tokens == 0 and normalized_usage.prompt_tokens == 0 and normalized_usage.completion_tokens == 0 and response_text.len > 0) {
-                normalized_usage.completion_tokens = estimate_text_tokens(response_text);
-                normalized_usage.total_tokens = normalized_usage.completion_tokens;
-            }
-            response.usage = normalized_usage;
-
-            self.total_tokens += normalized_usage.total_tokens;
-            self.last_turn_usage = normalized_usage;
+            // Track tokens
+            self.total_tokens += response.usage.total_tokens;
+            self.last_turn_usage = response.usage;
             self.emitUsageRecord(&response, true);
+
+            // ── on_llm_after hook: process LLM response before further handling ──
+            var llm_after_replacement: ?[]const u8 = null;
+            defer if (llm_after_replacement) |r| arena.free(r);
+            if (hook_skills) |hs| {
+                if (skills_mod.hasSkillsForTrigger(hs, .on_llm_after)) {
+                    const raw_resp = response.contentOrEmpty();
+                    // 1. Run all [action:agent] skills in chain
+                    const agent_skills = skills_mod.collectAgentSkills(arena, hs, .on_llm_after) catch &.{};
+                    defer if (agent_skills.len > 0) arena.free(agent_skills);
+                    var hook_result = self.runSkillSubAgentChain(arena, agent_skills, raw_resp);
+                    defer skills_mod.freeHookResult(arena, &hook_result);
+
+                    // 2. If chain didn't intercept, run plain skills
+                    if (hook_result.action != .intercept and hook_result.action != .agent_error) {
+                        const effective = if (hook_result.action == .continue_with and hook_result.content.len > 0) hook_result.content else raw_resp;
+                        var plain_result = skills_mod.evaluateSkillHook(arena, hs, .on_llm_after, effective) catch skills_mod.SkillHookResult{};
+                        if (plain_result.action == .continue_with or plain_result.action == .intercept or plain_result.action == .agent_error) {
+                            skills_mod.freeHookResult(arena, &hook_result);
+                            hook_result = plain_result;
+                        } else {
+                            skills_mod.freeHookResult(arena, &plain_result);
+                        }
+                    }
+
+                    switch (hook_result.action) {
+                        .agent_error => {
+                            const err_response = if (hook_result.content.len > 0)
+                                try self.allocator.dupe(u8, hook_result.content)
+                            else
+                                try self.allocator.dupe(u8, "[skill hook agent error]");
+                            errdefer self.allocator.free(err_response);
+                            try self.history.append(self.allocator, .{
+                                .role = .assistant,
+                                .content = try self.allocator.dupe(u8, err_response),
+                            });
+                            self.freeResponseFields(&response);
+                            const complete_event = ObserverEvent{ .turn_complete = {} };
+                            self.observer.recordEvent(&complete_event);
+                            return err_response;
+                        },
+                        .intercept => {
+                            const intercept_response = if (hook_result.content.len > 0)
+                                try self.allocator.dupe(u8, hook_result.content)
+                            else
+                                try self.allocator.dupe(u8, "[intercepted by on_llm_after hook]");
+                            errdefer self.allocator.free(intercept_response);
+                            try self.history.append(self.allocator, .{
+                                .role = .assistant,
+                                .content = try self.allocator.dupe(u8, intercept_response),
+                            });
+                            self.freeResponseFields(&response);
+                            const complete_event = ObserverEvent{ .turn_complete = {} };
+                            self.observer.recordEvent(&complete_event);
+                            return intercept_response;
+                        },
+                        .continue_with => {
+                            if (hook_result.content.len > 0) {
+                                llm_after_replacement = try arena.dupe(u8, hook_result.content);
+                            }
+                        },
+                        .passthrough, .agent, .async_agent => {},
+                    }
+                }
+            }
+
+            const response_text = if (llm_after_replacement) |replacement| replacement else response.contentOrEmpty();
             const use_native = response.hasToolCalls();
 
             // Determine tool calls: structured (native) first, then XML fallback.
@@ -1449,7 +1707,12 @@ pub const Agent = struct {
             // When tool calls are present, only show parsed plain text (if any).
             // Never fall back to raw response_text here, otherwise markup like
             // <tool_call>...</tool_call> can leak to users.
-            const display_text = selectDisplayText(response_text, parsed_text, parsed_calls.len);
+            const display_text = if (parsed_calls.len > 0)
+                parsed_text
+            else if (parsed_text.len > 0)
+                parsed_text
+            else
+                response_text;
 
             if (parsed_calls.len == 0) {
                 // Guardrail: if the model promises "I'll try/check now" but emits no
@@ -1585,11 +1848,6 @@ pub const Agent = struct {
             }
 
             for (parsed_calls, 0..) |call, idx| {
-                if (self.isInterruptRequested()) {
-                    self.freeResponseFields(&response);
-                    return self.interruptedReply();
-                }
-
                 if (self.log_tool_calls) {
                     log.info(
                         "tool-call start session=0x{x} index={d} name={s} id={s}",
@@ -1600,8 +1858,58 @@ pub const Agent = struct {
                 const tool_start_event = ObserverEvent{ .tool_call_start = .{ .tool = call.name } };
                 self.observer.recordEvent(&tool_start_event);
 
+                // ── on_tool_call_before hook ──
+                var tool_intercepted = false;
+                var tool_before_result_override: ?ToolExecutionResult = null;
+                if (hook_skills) |hs| {
+                    if (skills_mod.hasSkillsForTrigger(hs, .on_tool_call_before)) {
+                        const tool_ctx = std.fmt.allocPrint(arena, "tool:{s} args:{s}", .{ call.name, call.arguments_json }) catch "";
+                        // 1. Run all [action:agent] skills in chain
+                        const agent_skills = skills_mod.collectAgentSkills(arena, hs, .on_tool_call_before) catch &.{};
+                        defer if (agent_skills.len > 0) arena.free(agent_skills);
+                        var hook_result = self.runSkillSubAgentChain(arena, agent_skills, tool_ctx);
+                        defer skills_mod.freeHookResult(arena, &hook_result);
+
+                        // 2. If chain didn't intercept, run plain skills
+                        if (hook_result.action != .intercept and hook_result.action != .agent_error) {
+                            const effective = if (hook_result.action == .continue_with and hook_result.content.len > 0) hook_result.content else tool_ctx;
+                            var plain_result = skills_mod.evaluateSkillHook(arena, hs, .on_tool_call_before, effective) catch skills_mod.SkillHookResult{};
+                            if (plain_result.action == .continue_with or plain_result.action == .intercept or plain_result.action == .agent_error) {
+                                skills_mod.freeHookResult(arena, &hook_result);
+                                hook_result = plain_result;
+                            } else {
+                                skills_mod.freeHookResult(arena, &plain_result);
+                            }
+                        }
+
+                        switch (hook_result.action) {
+                            .agent_error => {
+                                tool_intercepted = true;
+                                tool_before_result_override = ToolExecutionResult{
+                                    .name = call.name,
+                                    .output = if (hook_result.content.len > 0) (arena.dupe(u8, hook_result.content) catch hook_result.content) else "[skill hook agent error]",
+                                    .success = false,
+                                    .tool_call_id = call.tool_call_id,
+                                };
+                            },
+                            .intercept => {
+                                tool_intercepted = true;
+                                tool_before_result_override = ToolExecutionResult{
+                                    .name = call.name,
+                                    .output = if (hook_result.content.len > 0) (arena.dupe(u8, hook_result.content) catch hook_result.content) else "[intercepted by on_tool_call_before hook]",
+                                    .success = true,
+                                    .tool_call_id = call.tool_call_id,
+                                };
+                            },
+                            .continue_with, .passthrough, .agent, .async_agent => {},
+                        }
+                    }
+                }
+
                 const tool_timer = std.time.milliTimestamp();
-                const result = if (should_skip_tools_memory_store_duplicate(arena, batch_updates_tools_md, call))
+                const result = if (tool_before_result_override) |override|
+                    override
+                else if (should_skip_tools_memory_store_duplicate(arena, batch_updates_tools_md, call))
                     ToolExecutionResult{
                         .name = call.name,
                         .output = "Skipped duplicate memory_store: TOOLS.md was updated in the same tool batch",
@@ -1612,22 +1920,62 @@ pub const Agent = struct {
                     self.executeTool(arena, call);
                 const tool_duration: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - tool_timer)));
 
+                // ── on_tool_call_after hook ──
+                var final_result = result;
+                if (!tool_intercepted) {
+                    if (hook_skills) |hs| {
+                        if (skills_mod.hasSkillsForTrigger(hs, .on_tool_call_after)) {
+                            // 1. Run all [action:agent] skills in chain
+                            const agent_skills = skills_mod.collectAgentSkills(arena, hs, .on_tool_call_after) catch &.{};
+                            defer if (agent_skills.len > 0) arena.free(agent_skills);
+                            var hook_result = self.runSkillSubAgentChain(arena, agent_skills, result.output);
+                            defer skills_mod.freeHookResult(arena, &hook_result);
+
+                            // 2. If chain didn't intercept, run plain skills
+                            if (hook_result.action != .intercept and hook_result.action != .agent_error) {
+                                const effective = if (hook_result.action == .continue_with and hook_result.content.len > 0) hook_result.content else result.output;
+                                var plain_result = skills_mod.evaluateSkillHook(arena, hs, .on_tool_call_after, effective) catch skills_mod.SkillHookResult{};
+                                if (plain_result.action == .continue_with or plain_result.action == .intercept or plain_result.action == .agent_error) {
+                                    skills_mod.freeHookResult(arena, &hook_result);
+                                    hook_result = plain_result;
+                                } else {
+                                    skills_mod.freeHookResult(arena, &plain_result);
+                                }
+                            }
+
+                            switch (hook_result.action) {
+                                .continue_with => {
+                                    if (hook_result.content.len > 0) {
+                                        final_result = ToolExecutionResult{
+                                            .name = result.name,
+                                            .output = arena.dupe(u8, hook_result.content) catch hook_result.content,
+                                            .success = result.success,
+                                            .tool_call_id = result.tool_call_id,
+                                        };
+                                    }
+                                },
+                                .agent_error, .intercept, .passthrough, .agent, .async_agent => {},
+                            }
+                        }
+                    }
+                }
+
                 if (self.log_tool_calls) {
                     log.info(
                         "tool-call done session=0x{x} index={d} name={s} success={} duration_ms={d}",
-                        .{ session_hash, idx + 1, call.name, result.success, tool_duration },
+                        .{ session_hash, idx + 1, call.name, final_result.success, tool_duration },
                     );
                 }
 
                 const tool_event = ObserverEvent{ .tool_call = .{
                     .tool = call.name,
                     .duration_ms = tool_duration,
-                    .success = result.success,
-                    .detail = if (result.success) null else result.output,
+                    .success = final_result.success,
+                    .detail = if (final_result.success) null else final_result.output,
                 } };
                 self.observer.recordEvent(&tool_event);
 
-                try results_buf.append(self.allocator, result);
+                try results_buf.append(self.allocator, final_result);
             }
 
             // Format tool results, scrub credentials, add reflection prompt, and add to history
@@ -1802,16 +2150,470 @@ pub const Agent = struct {
             std.ascii.eqlIgnoreCase(key, "__bootstrap.prompt.TOOLS.md");
     }
 
-    fn executeTool(self: *Agent, tool_allocator: std.mem.Allocator, call: ParsedToolCall) ToolExecutionResult {
-        if (self.isInterruptRequested()) {
+    /// Static wrapper for `runSkillSubAgent` that matches the `AsyncSkillQueue.RunFn`
+    /// signature so the background worker can call back into the Agent.
+    fn asyncSkillRunFn(ctx: *anyopaque, alloc: std.mem.Allocator, instructions: []const u8, content: []const u8) skills_mod.SkillHookResult {
+        const agent: *Agent = @ptrCast(@alignCast(ctx));
+        return agent.runSkillSubAgent(alloc, instructions, content);
+    }
+
+    /// Run a chain of [action:agent] / [action:asyncAgent] skill hooks in sequence.
+    ///
+    /// Synchronous (`agent`) skills are executed inline via `runSkillSubAgent`.
+    /// The chain obeys short-circuit semantics:
+    ///   - `intercept` / `agent_error` → stop immediately, return that result.
+    ///   - `continue_with` → adopt the modified content for the next skill.
+    ///   - `passthrough` → leave content unchanged, proceed to next skill.
+    ///
+    /// Asynchronous (`async_agent`) skills are enqueued on the Agent's
+    /// `async_skill_queue` and do NOT block the chain or influence the
+    /// pipeline result.
+    ///
+    /// After all skills have been evaluated:
+    ///   - If any skill returned `continue_with`, the final result is
+    ///     `continue_with` with the (cumulatively) modified content.
+    ///   - Otherwise the result is a plain `passthrough` (empty, not owned).
+    pub fn runSkillSubAgentChain(
+        self: *Agent,
+        result_allocator: std.mem.Allocator,
+        agent_skills: []const skills_mod.AgentSkillEntry,
+        initial_content: []const u8,
+    ) skills_mod.SkillHookResult {
+        if (agent_skills.len == 0) {
+            return .{}; // passthrough, empty, not owned
+        }
+
+        var current_content: []const u8 = initial_content;
+        var owns_current: bool = false;
+
+        for (agent_skills) |entry| {
+            // ── asyncAgent: fire-and-forget ──────────────────────────────
+            if (entry.is_async) {
+                log.info(
+                    "sub-agent chain: enqueueing async skill '{s}' | content_len={d}",
+                    .{ entry.name, current_content.len },
+                );
+                // Lazily bind the queue to this Agent on first use.
+                if (!self.async_skill_queue.started) {
+                    self.async_skill_queue.bind(@ptrCast(self), asyncSkillRunFn);
+                }
+                self.async_skill_queue.enqueue(entry.instructions, current_content);
+                continue; // does not affect chain result
+            }
+
+            // ── synchronous agent ───────────────────────────────────────
+            log.info(
+                "sub-agent chain: running skill '{s}' | content_len={d}",
+                .{ entry.name, current_content.len },
+            );
+
+            var result = self.runSkillSubAgent(result_allocator, entry.instructions, current_content);
+
+            switch (result.action) {
+                .intercept, .agent_error => {
+                    // Terminal — free intermediate content and return.
+                    if (owns_current) {
+                        result_allocator.free(@constCast(current_content));
+                    }
+                    return result;
+                },
+                .continue_with => {
+                    // Adopt new content; free the old intermediate if owned.
+                    if (owns_current) {
+                        result_allocator.free(@constCast(current_content));
+                    }
+                    current_content = result.content;
+                    owns_current = result.content_owned;
+                },
+                .passthrough => {
+                    // No change — free the result's content (if any).
+                    skills_mod.freeHookResult(result_allocator, &result);
+                },
+                .agent, .async_agent => {
+                    // Should not happen from runSkillSubAgent; treat as passthrough.
+                    skills_mod.freeHookResult(result_allocator, &result);
+                },
+            }
+        }
+
+        // All skills completed without intercept.
+        if (owns_current) {
             return .{
-                .name = call.name,
-                .output = "Interrupted by /stop",
-                .success = false,
-                .tool_call_id = call.tool_call_id,
+                .action = .continue_with,
+                .content = current_content,
+                .content_owned = true,
             };
         }
 
+        // No modifications — plain passthrough.
+        return .{};
+    }
+
+    /// Run a sub-agent LLM call for an [action:agent] skill hook.
+    ///
+    /// Implements a mini turn loop that:
+    /// 1. Sends skill instructions (system prompt) + hook content (user message) to the LLM.
+    /// 2. Supports multi-turn tool calls within a single invocation.
+    /// 3. Requires that the final text response contains a valid behavior tag ([behavior:xxx]).
+    /// 4. On any error (LLM failure, invalid output, iterations exhausted), returns agent_error
+    ///    immediately with no retries, and logs detailed error info.
+    ///
+    /// The sub-agent is stateless between invocations — no history is preserved.
+    /// The sub-agent's execution does NOT trigger any skill hooks (isolated).
+    pub fn runSkillSubAgent(
+        self: *Agent,
+        result_allocator: std.mem.Allocator,
+        skill_instructions: []const u8,
+        hook_content: []const u8,
+    ) skills_mod.SkillHookResult {
+        // Use an arena for all intermediate allocations within this sub-agent invocation.
+        var sub_arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer sub_arena.deinit();
+        const arena = sub_arena.allocator();
+
+        // Build system prompt: sub_agent_system_prompt + skill instructions
+        const system_prompt = std.fmt.allocPrint(
+            arena,
+            "{s}{s}",
+            .{ skills_mod.sub_agent_system_prompt, skill_instructions },
+        ) catch {
+            log.warn(
+                "sub-agent error: could not build system prompt | instructions={s} hook_content={s}",
+                .{ skill_instructions, hook_content },
+            );
+            return .{
+                .action = .agent_error,
+                .content = result_allocator.dupe(u8, "sub-agent failed: could not build system prompt") catch "",
+                .content_owned = true,
+            };
+        };
+
+        // Build initial messages list (system + user)
+        var messages = std.ArrayListUnmanaged(ChatMessage).empty;
+        messages.append(arena, ChatMessage.system(system_prompt)) catch {
+            log.warn(
+                "sub-agent error: out of memory building messages | instructions={s}",
+                .{skill_instructions},
+            );
+            return .{
+                .action = .agent_error,
+                .content = result_allocator.dupe(u8, "sub-agent failed: out of memory") catch "",
+                .content_owned = true,
+            };
+        };
+        // Wrap hook_content in <hook_data> tags so the LLM treats it as
+        // untrusted data to inspect — not as instructions to follow.
+        // This mitigates prompt injection from raw user messages.
+        const wrapped_content = if (hook_content.len > 0)
+            std.fmt.allocPrint(arena, "<hook_data>\n{s}\n</hook_data>", .{hook_content}) catch {
+                log.warn(
+                    "sub-agent error: out of memory wrapping hook content | instructions={s}",
+                    .{skill_instructions},
+                );
+                return .{
+                    .action = .agent_error,
+                    .content = result_allocator.dupe(u8, "sub-agent failed: out of memory wrapping content") catch "",
+                    .content_owned = true,
+                };
+            }
+        else
+            "(empty content)";
+
+        messages.append(arena, ChatMessage.user(wrapped_content)) catch {
+            log.warn(
+                "sub-agent error: out of memory building messages | instructions={s}",
+                .{skill_instructions},
+            );
+            return .{
+                .action = .agent_error,
+                .content = result_allocator.dupe(u8, "sub-agent failed: out of memory") catch "",
+                .content_owned = true,
+            };
+        };
+
+        // Resolve sub-agent model: sub_agent_model → model_name (fallback already
+        // applied by session layer via applyModelOverride).
+        const sa_model = self.sub_agent_model orelse self.model_name;
+
+        // Resolve sub-agent provider: if sub_agent_provider differs from the
+        // agent's default provider, create a temporary provider for this call.
+        const sa_provider = self.resolveOverrideProvider(arena, self.sub_agent_provider, self.sub_agent_base_url) orelse self.provider;
+
+        const native_tools_enabled = sa_provider.supportsNativeTools();
+        var total_iterations: u32 = 0;
+        const max_sub_iterations = if (self.sub_agent_max_iterations > 0) self.sub_agent_max_iterations else skills_mod.SUB_AGENT_MAX_ITERATIONS;
+
+        // ── Smart review setup ──────────────────────────────────────────
+        // Resolve the effective review_after threshold:
+        //   configured > 0  → use it, but clamp to max_iterations-1
+        //   configured == 0 → use compiled default, clamped similarly
+        //   max_iterations <= 1 → disable review (review_after = max_iterations)
+        const review_after: u32 = blk: {
+            if (max_sub_iterations <= 1) break :blk max_sub_iterations + 1; // no room for review
+            const configured = if (self.sub_agent_review_after > 0) self.sub_agent_review_after else skills_mod.SUB_AGENT_DEFAULT_REVIEW_AFTER;
+            break :blk @min(configured, max_sub_iterations - 1);
+        };
+        var next_review_at: u32 = review_after; // fires every review_after iterations
+        var tool_call_summaries = std.ArrayListUnmanaged([]const u8).empty;
+
+        while (total_iterations < max_sub_iterations) : (total_iterations += 1) {
+            // Call provider with tools (use resolved sub-agent model/provider)
+            const response = sa_provider.chat(
+                arena,
+                .{
+                    .messages = messages.items,
+                    .model = sa_model,
+                    .temperature = self.sub_agent_temperature orelse 0.3,
+                    .max_tokens = self.max_tokens,
+                    .tools = if (native_tools_enabled) self.tool_specs else null,
+                    .timeout_secs = self.message_timeout_secs,
+                },
+                sa_model,
+                self.sub_agent_temperature orelse 0.3,
+            ) catch |err| {
+                log.warn(
+                    "sub-agent error: LLM call failed | error={s} model={s} instructions={s} hook_content={s} iteration={d}",
+                    .{
+                        @errorName(err),
+                        sa_model,
+                        skill_instructions,
+                        hook_content,
+                        total_iterations + 1,
+                    },
+                );
+                const err_msg = std.fmt.allocPrint(
+                    result_allocator,
+                    "sub-agent LLM call failed: {s}",
+                    .{@errorName(err)},
+                ) catch return .{
+                    .action = .agent_error,
+                    .content = result_allocator.dupe(u8, "sub-agent LLM call failed") catch "",
+                    .content_owned = true,
+                };
+                return .{ .action = .agent_error, .content = err_msg, .content_owned = true };
+            };
+
+            const response_text = response.contentOrEmpty();
+
+            // Check for tool calls (native first, then XML fallback)
+            var has_tool_calls = false;
+            var parsed_calls: []ParsedToolCall = &.{};
+
+            if (native_tools_enabled and response.tool_calls.len > 0) {
+                parsed_calls = dispatcher.parseStructuredToolCalls(arena, response.tool_calls) catch &.{};
+                has_tool_calls = parsed_calls.len > 0;
+            }
+
+            if (!has_tool_calls and response_text.len > 0) {
+                const xml_parsed = dispatcher.parseToolCalls(arena, response_text) catch null;
+                if (xml_parsed) |xp| {
+                    parsed_calls = xp.calls;
+                    has_tool_calls = xp.calls.len > 0;
+                }
+            }
+
+            if (has_tool_calls) {
+                // Add assistant message to conversation
+                messages.append(arena, ChatMessage.assistant(
+                    arena.dupe(u8, response_text) catch response_text,
+                )) catch break;
+
+                // Execute each tool call and collect results
+                var results_buf = std.ArrayListUnmanaged([]const u8).empty;
+                for (parsed_calls) |call| {
+                    const result = self.executeTool(arena, call);
+                    const formatted = std.fmt.allocPrint(
+                        arena,
+                        "[Tool: {s}] {s}{s}",
+                        .{
+                            call.name,
+                            if (result.success) "" else "(FAILED) ",
+                            result.output,
+                        },
+                    ) catch continue;
+                    results_buf.append(arena, formatted) catch continue;
+
+                    // Accumulate a brief summary for the review call
+                    const output_preview = if (result.output.len > 120) result.output[0..120] else result.output;
+                    const summary_line = std.fmt.allocPrint(
+                        arena,
+                        "#{d} {s}: {s}{s}",
+                        .{
+                            total_iterations + 1,
+                            call.name,
+                            if (result.success) "" else "(FAILED) ",
+                            output_preview,
+                        },
+                    ) catch continue;
+                    tool_call_summaries.append(arena, summary_line) catch {};
+                }
+
+                // Format all results and add as user message
+                const joined = std.mem.join(arena, "\n\n", results_buf.items) catch "";
+                messages.append(arena, ChatMessage.user(
+                    if (joined.len > 0) joined else "Tool execution completed with no output.",
+                )) catch break;
+
+                // ── Smart review check ──────────────────────────────
+                // Every review_after consecutive tool-call iterations,
+                // ask the LLM whether the loop is making progress.
+                if (total_iterations + 1 >= next_review_at and tool_call_summaries.items.len > 0) {
+                    next_review_at += review_after; // schedule next review
+                    const review_result = self.runSubAgentReview(arena, skill_instructions, tool_call_summaries.items);
+                    if (review_result) |stop_reason| {
+                        log.info(
+                            "sub-agent review: LLM recommended stop | reason={s} iterations={d} instructions={s}",
+                            .{ stop_reason, total_iterations + 1, skill_instructions },
+                        );
+                        const user_msg = std.fmt.allocPrint(
+                            result_allocator,
+                            "sub-agent stopped after review ({d} tool calls): {s}",
+                            .{ total_iterations + 1, stop_reason },
+                        ) catch return .{
+                            .action = .agent_error,
+                            .content = result_allocator.dupe(u8, "sub-agent stopped: review determined loop is stuck") catch "",
+                            .content_owned = true,
+                        };
+                        return .{ .action = .agent_error, .content = user_msg, .content_owned = true };
+                    }
+                    // Verdict was continue (or review failed) — keep going until next review or hard limit.
+                    log.info("sub-agent review: LLM recommended continue | iterations={d} next_review_at={d}", .{ total_iterations + 1, next_review_at });
+                }
+
+                // Continue the loop for the next LLM call
+                continue;
+            }
+
+            // No tool calls — check if the response contains a valid behavior tag.
+            if (skills_mod.hasValidBehaviorTag(response_text)) {
+                // Parse and return the result
+                const parsed = skills_mod.parseSubAgentResponse(result_allocator, response_text) catch {
+                    log.warn(
+                        "sub-agent error: failed to parse valid response | output={s} instructions={s} hook_content={s}",
+                        .{
+                            response_text,
+                            skill_instructions,
+                            hook_content,
+                        },
+                    );
+                    return .{
+                        .action = .agent_error,
+                        .content = result_allocator.dupe(u8, "sub-agent error: failed to parse response") catch "",
+                        .content_owned = true,
+                    };
+                };
+                // parseSubAgentResponse now returns .passthrough when no tag is found
+                // (shouldn't happen since we checked hasValidBehaviorTag, but be safe)
+                if (parsed.action == .agent) {
+                    log.warn(
+                        "sub-agent: behavior tag detected but parse returned unexpected action, falling back to passthrough | output={s} instructions={s} hook_content={s}",
+                        .{
+                            response_text,
+                            skill_instructions,
+                            hook_content,
+                        },
+                    );
+                    return .{ .action = .passthrough };
+                }
+                return parsed;
+            }
+
+            // No valid behavior tag in response — gracefully fall back to passthrough.
+            // The sub-agent likely intended to pass content through unchanged but did
+            // not emit the required [behavior:passthrough] tag.
+            log.warn(
+                "sub-agent: no behavior tag in response, falling back to passthrough | output={s} instructions={s} hook_content={s} iteration={d}",
+                .{
+                    response_text,
+                    skill_instructions,
+                    hook_content,
+                    total_iterations + 1,
+                },
+            );
+            return .{ .action = .passthrough };
+        }
+
+        // Total iterations exhausted (only reachable via tool call loops)
+        log.warn(
+            "sub-agent error: max iterations exhausted ({d}) | instructions={s} hook_content={s}",
+            .{
+                max_sub_iterations,
+                skill_instructions,
+                hook_content,
+            },
+        );
+        const exhaust_msg = std.fmt.allocPrint(
+            result_allocator,
+            "sub-agent exceeded maximum iterations (limit={d}) without producing a result",
+            .{max_sub_iterations},
+        ) catch return .{
+            .action = .agent_error,
+            .content = result_allocator.dupe(u8, "sub-agent exceeded maximum iterations without producing a result") catch "",
+            .content_owned = true,
+        };
+        return .{
+            .action = .agent_error,
+            .content = exhaust_msg,
+            .content_owned = true,
+        };
+    }
+
+    /// Make a lightweight LLM call to review whether the sub-agent tool-call
+    /// loop is making progress.  Returns `null` when the loop should continue,
+    /// or a reason string (arena-allocated) when it should stop.
+    fn runSubAgentReview(
+        self: *Agent,
+        arena: std.mem.Allocator,
+        skill_instructions: []const u8,
+        summaries: []const []const u8,
+    ) ?[]const u8 {
+        const summary_text = std.mem.join(arena, "\n", summaries) catch return null;
+
+        const user_content = std.fmt.allocPrint(
+            arena,
+            "Sub-agent goal:\n{s}\n\nTool call history:\n{s}",
+            .{ skill_instructions, summary_text },
+        ) catch return null;
+
+        var review_msgs = std.ArrayListUnmanaged(ChatMessage).empty;
+        review_msgs.append(arena, ChatMessage.system(skills_mod.sub_agent_review_prompt)) catch return null;
+        review_msgs.append(arena, ChatMessage.user(user_content)) catch return null;
+
+        // Resolve tools-reviewer model and provider
+        const tr_model = self.tools_reviewer_model orelse self.model_name;
+        const tr_provider = self.resolveOverrideProvider(arena, self.tools_reviewer_provider, self.tools_reviewer_base_url) orelse self.provider;
+
+        const review_response = tr_provider.chat(
+            arena,
+            .{
+                .messages = review_msgs.items,
+                .model = tr_model,
+                .temperature = self.tools_reviewer_temperature orelse 0.1,
+                .max_tokens = 200, // only need a short verdict
+                .tools = null,
+                .timeout_secs = self.message_timeout_secs,
+            },
+            tr_model,
+            self.tools_reviewer_temperature orelse 0.1,
+        ) catch |err| {
+            log.warn("sub-agent review: LLM call failed, continuing loop | error={s}", .{@errorName(err)});
+            return null; // on failure, let the loop continue
+        };
+
+        const verdict_text = review_response.contentOrEmpty();
+        const parsed = skills_mod.parseReviewResponse(verdict_text);
+
+        return switch (parsed.verdict) {
+            .stop => if (parsed.reason.len > 0) parsed.reason else "review determined the loop is stuck",
+            .@"continue" => null,
+            .unknown => {
+                log.warn("sub-agent review: could not parse verdict, continuing | response={s}", .{verdict_text});
+                return null;
+            },
+        };
+    }
+
+    fn executeTool(self: *Agent, tool_allocator: std.mem.Allocator, call: ParsedToolCall) ToolExecutionResult {
         // Policy gate: check autonomy and rate limit
         if (self.policy) |pol| {
             if (!pol.canAct()) {
@@ -1835,7 +2637,31 @@ pub const Agent = struct {
 
         const trimmed_call_name = std.mem.trim(u8, call.name, " \t\r\n");
 
-        for (self.tools) |t| {
+        // Acquire SO ref count BEFORE copying tools from the registry.
+        // This prevents the hot-reload drain from completing while we hold
+        // a snapshot that may reference SO-backed tool pointers.
+        const has_registry = self.registry != null;
+        if (has_registry) self.registry.?.acquireSoCall();
+        defer if (has_registry) self.registry.?.releaseSoCall();
+
+        // Resolve effective tool list: registry takes priority over static slice.
+        // When a registry is present, NEVER fall back to self.tools — doing so
+        // would resurrect tools that were removed by overwrite/hot-reload.
+        var effective_tools_buf: ?[]Tool = null;
+        defer if (effective_tools_buf) |buf| tool_allocator.free(buf);
+        const effective_tools: []const Tool = if (self.registry) |reg| blk: {
+            const n = reg.count();
+            if (n == 0) break :blk &[_]Tool{};
+            const buf = tool_allocator.alloc(Tool, n) catch {
+                log.err("failed to allocate tool buffer for registry dispatch", .{});
+                break :blk &[_]Tool{};
+            };
+            effective_tools_buf = buf; // track for deferred free
+            const filled = reg.copySlice(buf);
+            break :blk buf[0..filled];
+        } else self.tools;
+
+        for (effective_tools) |t| {
             if (std.ascii.eqlIgnoreCase(t.name(), trimmed_call_name)) {
                 // Parse arguments JSON to ObjectMap ONCE
                 const parsed = std.json.parseFromSlice(
@@ -1876,16 +2702,10 @@ pub const Agent = struct {
                     }
                 }
 
-                self.setActiveToolName(trimmed_call_name) catch {};
-                defer self.clearActiveToolName();
-                tools_mod.process_util.setThreadInterruptFlag(&self.interrupt_requested);
-                defer tools_mod.process_util.setThreadInterruptFlag(null);
-                @import("../http_util.zig").setThreadInterruptFlag(&self.interrupt_requested);
-                defer @import("../http_util.zig").setThreadInterruptFlag(null);
+                // SO ref count is already held for the entire executeTool scope
+                // (acquired before copySlice above), so no per-tool acquire needed.
+
                 const result = t.execute(tool_allocator, args) catch |err| {
-                    if (verbose_mod.isVerbose()) {
-                        log.info("tool result: name={s} error={s}", .{ call.name, @errorName(err) });
-                    }
                     return .{
                         .name = call.name,
                         .output = @errorName(err),
@@ -1893,16 +2713,6 @@ pub const Agent = struct {
                         .tool_call_id = call.tool_call_id,
                     };
                 };
-                const was_interrupted = !result.success and
-                    ((result.error_msg != null and std.mem.indexOf(u8, result.error_msg.?, "Interrupted by /stop") != null) or
-                        std.mem.indexOf(u8, result.output, "Interrupted by /stop") != null);
-                if (was_interrupted) {
-                    self.noteInterruptedTool(trimmed_call_name) catch {};
-                }
-                if (verbose_mod.isVerbose()) {
-                    const output_preview = if (result.output.len > 256) result.output[0..256] else result.output;
-                    log.info("tool result: name={s} success={} output_len={d} output={s}...", .{ call.name, result.success, result.output.len, output_preview });
-                }
                 return .{
                     .name = call.name,
                     .output = if (result.success) result.output else (result.error_msg orelse result.output),
@@ -1959,7 +2769,7 @@ pub const Agent = struct {
                     msg.content.len,
                     parts_count,
                     std.json.fmt(preview.slice, .{}),
-                    if (preview.truncated) " [log preview truncated]" else "",
+                    if (preview.truncated) " [truncated]" else "",
                 },
             );
         }
@@ -1982,7 +2792,7 @@ pub const Agent = struct {
                 response.tool_calls.len,
                 std.json.fmt(response.usage, .{}),
                 std.json.fmt(preview.slice, .{}),
-                if (preview.truncated) " [log preview truncated]" else "",
+                if (preview.truncated) " [truncated]" else "",
             },
         );
 
@@ -1996,7 +2806,7 @@ pub const Agent = struct {
                     attempt,
                     reasoning.len,
                     std.json.fmt(r_preview.slice, .{}),
-                    if (r_preview.truncated) " [log preview truncated]" else "",
+                    if (r_preview.truncated) " [truncated]" else "",
                 },
             );
         }
@@ -2013,7 +2823,7 @@ pub const Agent = struct {
                     if (tc.id.len > 0) tc.id else "-",
                     tc.name,
                     std.json.fmt(args_preview.slice, .{}),
-                    if (args_preview.truncated) " [log preview truncated]" else "",
+                    if (args_preview.truncated) " [truncated]" else "",
                 },
             );
         }
@@ -2049,27 +2859,6 @@ pub const Agent = struct {
         self.emitUsageRecord(&failed, false);
     }
 
-    /// Check if vision is disabled for current model (either configured or auto-detected).
-    fn isVisionDisabled(self: *const Agent) bool {
-        for (self.vision_disabled_models) |model| {
-            if (std.mem.eql(u8, model, self.model_name)) return true;
-        }
-        for (self.detected_vision_disabled.items) |model| {
-            if (std.mem.eql(u8, model, self.model_name)) return true;
-        }
-        return false;
-    }
-
-    /// Add model to detected vision disabled list if not already present.
-    fn markVisionDisabled(self: *Agent) !void {
-        const already_disabled = for (self.detected_vision_disabled.items) |model| {
-            if (std.mem.eql(u8, model, self.model_name)) break true;
-        } else false;
-        if (!already_disabled) {
-            try self.detected_vision_disabled.append(self.allocator, try self.allocator.dupe(u8, self.model_name));
-        }
-    }
-
     /// Build provider-ready ChatMessage slice from owned history.
     /// Applies multimodal preprocessing and vision capability checks.
     fn buildProviderMessages(self: *Agent, arena: std.mem.Allocator) ![]ChatMessage {
@@ -2079,28 +2868,8 @@ pub const Agent = struct {
         }
 
         const image_marker_count = multimodal.countImageMarkersInLastUser(m);
-        if (image_marker_count == 0) {
-            return m;
-        }
-
-        // Check if vision is disabled (configured or auto-detected)
-        if (self.isVisionDisabled()) {
-            if (self.verbose_level == .on or self.verbose_level == .full) {
-                log.info("Vision disabled for model {s}, stripping image markers", .{self.model_name});
-            }
-            return multimodal.stripImageMarkers(arena, m);
-        }
-
-        // Check if provider supports vision for this model
-        if (!self.provider.supportsVisionForModel(self.model_name)) {
-            if (self.verbose_level == .on or self.verbose_level == .full) {
-                log.info("Model {s} does not support vision, stripping image markers", .{self.model_name});
-            }
-            // Auto-disable vision if configured
-            if (self.auto_disable_vision_on_error) {
-                try self.markVisionDisabled();
-            }
-            return multimodal.stripImageMarkers(arena, m);
+        if (image_marker_count > 0 and !self.provider.supportsVisionForModel(self.model_name)) {
+            return error.ProviderDoesNotSupportVision;
         }
 
         // Allow local multimodal reads from:
@@ -2119,8 +2888,6 @@ pub const Agent = struct {
 
         return multimodal.prepareMessagesForProvider(arena, m, .{
             .allowed_dirs = allowed,
-            .skip_dir_check = self.multimodal_unrestricted,
-            .allow_remote_fetch = self.multimodal_unrestricted,
         });
     }
 
@@ -2715,11 +3482,7 @@ test "Agent buildProviderMessages uses model-aware vision capability" {
     defer arena_impl.deinit();
     const arena = arena_impl.allocator();
 
-    const text_model_messages = try agent.buildProviderMessages(arena);
-    try std.testing.expectEqual(@as(usize, 1), text_model_messages.len);
-    try std.testing.expect(text_model_messages[0].content_parts == null);
-    try std.testing.expect(std.mem.indexOf(u8, text_model_messages[0].content, "[IMAGE:") == null);
-    try std.testing.expect(std.mem.indexOf(u8, text_model_messages[0].content, "omitted because the current model does not support vision") != null);
+    try std.testing.expectError(error.ProviderDoesNotSupportVision, agent.buildProviderMessages(arena));
 
     agent.model_name = "vision-model";
     const messages = try agent.buildProviderMessages(arena);
@@ -2908,43 +3671,10 @@ test "Agent clearHistory then add messages" {
 // ── Slash Command Tests ──────────────────────────────────────────
 
 fn makeTestAgent(allocator: std.mem.Allocator) !Agent {
-    const DummyProvider = struct {
-        fn chatWithSystem(_: *anyopaque, allocator_: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
-            return allocator_.dupe(u8, "");
-        }
-
-        fn chat(_: *anyopaque, allocator_: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
-            return .{
-                .content = try allocator_.dupe(u8, "ok"),
-                .tool_calls = &.{},
-                .usage = .{},
-                .model = try allocator_.dupe(u8, "test-model"),
-            };
-        }
-
-        fn supportsNativeTools(_: *anyopaque) bool {
-            return false;
-        }
-
-        fn getName(_: *anyopaque) []const u8 {
-            return "dummy-test-provider";
-        }
-
-        fn deinitFn(_: *anyopaque) void {}
-    };
-
-    const dummy_vtable = Provider.VTable{
-        .chatWithSystem = DummyProvider.chatWithSystem,
-        .chat = DummyProvider.chat,
-        .supportsNativeTools = DummyProvider.supportsNativeTools,
-        .getName = DummyProvider.getName,
-        .deinit = DummyProvider.deinitFn,
-    };
-
     var noop = observability.NoopObserver{};
     return Agent{
         .allocator = allocator,
-        .provider = .{ .ptr = @ptrFromInt(1), .vtable = &dummy_vtable },
+        .provider = undefined,
         .tools = &.{},
         .tool_specs = try allocator.alloc(ToolSpec, 0),
         .mem = null,
@@ -3880,11 +4610,6 @@ test "slash /think updates reasoning effort" {
     var agent = try makeTestAgent(allocator);
     defer agent.deinit();
 
-    const alias_resp = (try agent.handleSlashCommand("/think on")).?;
-    defer allocator.free(alias_resp);
-    try std.testing.expect(std.mem.indexOf(u8, alias_resp, "medium") != null);
-    try std.testing.expectEqualStrings("medium", agent.reasoning_effort.?);
-
     const set_resp = (try agent.handleSlashCommand("/think high")).?;
     defer allocator.free(set_resp);
     try std.testing.expect(std.mem.indexOf(u8, set_resp, "high") != null);
@@ -3982,181 +4707,6 @@ test "slash /stop handled explicitly" {
     defer allocator.free(response);
 
     try std.testing.expect(std.mem.indexOf(u8, response, "No active background task") != null);
-}
-
-test "slash /abort aliases /stop" {
-    const allocator = std.testing.allocator;
-    var agent = try makeTestAgent(allocator);
-    defer agent.deinit();
-
-    const response = (try agent.handleSlashCommand("/abort")).?;
-    defer allocator.free(response);
-
-    try std.testing.expect(std.mem.indexOf(u8, response, "No active background task") != null);
-}
-
-test "turn returns interruption reply when interrupt requested" {
-    const allocator = std.testing.allocator;
-    var agent = try makeTestAgent(allocator);
-    defer agent.deinit();
-
-    agent.requestInterrupt();
-    const response = try agent.turn("hello");
-    defer allocator.free(response);
-
-    try std.testing.expect(std.mem.indexOf(u8, response, "Interrupted by /stop") != null);
-}
-
-test "interruption reply lists effectively interrupted tools" {
-    const allocator = std.testing.allocator;
-    var agent = try makeTestAgent(allocator);
-    defer agent.deinit();
-
-    try agent.noteInterruptedTool("shell");
-    try agent.noteInterruptedTool("web_fetch");
-    agent.requestInterrupt();
-
-    const response = try agent.turn("hello");
-    defer allocator.free(response);
-
-    try std.testing.expect(std.mem.indexOf(u8, response, "Interrupted tools: shell, web_fetch") != null);
-}
-
-test "hard stop mock interruption lists exactly interrupted tool" {
-    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
-
-    const ProbeTool = struct {
-        const Self = @This();
-        started: *std.atomic.Value(bool),
-
-        pub const tool_name = "hard_stop_probe";
-        pub const tool_description = "Mock long-running tool for hard-stop tests";
-        pub const tool_params = "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}";
-        pub const vtable = tools_mod.ToolVTable(Self);
-
-        fn tool(self: *Self) Tool {
-            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
-        }
-
-        pub fn execute(self: *Self, allocator: std.mem.Allocator, _: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
-            self.started.store(true, .release);
-            const proc = tools_mod.process_util;
-            const result = try proc.run(allocator, &.{ "sh", "-c", "sleep 5; echo done" }, .{});
-            defer result.deinit(allocator);
-            if (result.interrupted) {
-                return .{ .success = false, .output = "", .error_msg = "Interrupted by /stop" };
-            }
-            return .{ .success = true, .output = try allocator.dupe(u8, "probe-finished") };
-        }
-    };
-
-    const OneShotToolProvider = struct {
-        const Self = @This();
-        call_count: usize = 0,
-
-        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
-            return allocator.dupe(u8, "");
-        }
-
-        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
-            const self: *Self = @ptrCast(@alignCast(ptr));
-            self.call_count += 1;
-            const tool_calls = try allocator.alloc(providers.ToolCall, 1);
-            tool_calls[0] = .{
-                .id = try allocator.dupe(u8, "call-hard-stop"),
-                .name = try allocator.dupe(u8, "hard_stop_probe"),
-                .arguments = try allocator.dupe(u8, "{}"),
-            };
-            return .{
-                .content = try allocator.dupe(u8, "running"),
-                .tool_calls = tool_calls,
-                .usage = .{},
-                .model = try allocator.dupe(u8, "test-model"),
-            };
-        }
-
-        fn supportsNativeTools(_: *anyopaque) bool {
-            return true;
-        }
-
-        fn getName(_: *anyopaque) []const u8 {
-            return "one-shot-tool-provider";
-        }
-
-        fn deinitFn(_: *anyopaque) void {}
-    };
-
-    const InterruptCtx = struct {
-        agent: *Agent,
-        started: *std.atomic.Value(bool),
-    };
-    const InterruptWorker = struct {
-        fn run(ctx: *InterruptCtx) void {
-            while (!ctx.started.load(.acquire)) {
-                std.Thread.sleep(10 * std.time.ns_per_ms);
-            }
-            std.Thread.sleep(80 * std.time.ns_per_ms);
-            ctx.agent.requestInterrupt();
-        }
-    };
-
-    const allocator = std.testing.allocator;
-    var started = std.atomic.Value(bool).init(false);
-    var tool_impl = ProbeTool{ .started = &started };
-    const tools = [_]Tool{tool_impl.tool()};
-
-    var specs = try allocator.alloc(ToolSpec, tools.len);
-    for (tools, 0..) |t, i| {
-        specs[i] = .{
-            .name = t.name(),
-            .description = t.description(),
-            .parameters_json = t.parametersJson(),
-        };
-    }
-
-    var provider_state = OneShotToolProvider{};
-    const provider_vtable = Provider.VTable{
-        .chatWithSystem = OneShotToolProvider.chatWithSystem,
-        .chat = OneShotToolProvider.chat,
-        .supportsNativeTools = OneShotToolProvider.supportsNativeTools,
-        .getName = OneShotToolProvider.getName,
-        .deinit = OneShotToolProvider.deinitFn,
-    };
-    const provider = Provider{
-        .ptr = @ptrCast(&provider_state),
-        .vtable = &provider_vtable,
-    };
-
-    var noop = observability.NoopObserver{};
-    var agent = Agent{
-        .allocator = allocator,
-        .provider = provider,
-        .tools = &tools,
-        .tool_specs = specs,
-        .mem = null,
-        .observer = noop.observer(),
-        .model_name = "test-model",
-        .temperature = 0.7,
-        .workspace_dir = "/tmp",
-        .max_tool_iterations = 4,
-        .max_history_messages = 50,
-        .auto_save = false,
-        .history = .empty,
-        .total_tokens = 0,
-        .has_system_prompt = false,
-    };
-    defer agent.deinit();
-
-    var interrupt_ctx = InterruptCtx{ .agent = &agent, .started = &started };
-    const interrupt_thread = try std.Thread.spawn(.{}, InterruptWorker.run, .{&interrupt_ctx});
-    defer interrupt_thread.join();
-
-    const response = try agent.turn("run hard stop mock");
-    defer allocator.free(response);
-
-    try std.testing.expect(std.mem.indexOf(u8, response, "Interrupted by /stop") != null);
-    try std.testing.expect(std.mem.indexOf(u8, response, "hard_stop_probe") != null);
-    try std.testing.expectEqual(@as(usize, 1), provider_state.call_count);
 }
 
 test "slash /approve executes pending bash command" {
@@ -4292,74 +4842,6 @@ test "turn includes reasoning and usage footer when enabled" {
     try std.testing.expect(std.mem.indexOf(u8, response, "Reasoning:\nthinking trace") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "[usage] total_tokens=10") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "final answer") != null);
-}
-
-test "turn estimates token usage when provider omits usage" {
-    const ProviderState = struct {
-        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
-            return allocator.dupe(u8, "");
-        }
-
-        fn chat(_: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
-            return .{
-                .content = try allocator.dupe(u8, "final answer"),
-                .tool_calls = &.{},
-                .usage = .{},
-                .model = try allocator.dupe(u8, "test-model"),
-            };
-        }
-
-        fn supportsNativeTools(_: *anyopaque) bool {
-            return false;
-        }
-
-        fn getName(_: *anyopaque) []const u8 {
-            return "test";
-        }
-
-        fn deinitFn(_: *anyopaque) void {}
-    };
-
-    var state: u8 = 0;
-    const vtable = Provider.VTable{
-        .chatWithSystem = ProviderState.chatWithSystem,
-        .chat = ProviderState.chat,
-        .supportsNativeTools = ProviderState.supportsNativeTools,
-        .getName = ProviderState.getName,
-        .deinit = ProviderState.deinitFn,
-    };
-    const provider = Provider{ .ptr = @ptrCast(&state), .vtable = &vtable };
-
-    const allocator = std.testing.allocator;
-    var noop = observability.NoopObserver{};
-    var agent = Agent{
-        .allocator = allocator,
-        .provider = provider,
-        .tools = &.{},
-        .tool_specs = try allocator.alloc(ToolSpec, 0),
-        .mem = null,
-        .observer = noop.observer(),
-        .model_name = "test-model",
-        .temperature = 0.7,
-        .workspace_dir = "/tmp",
-        .max_tool_iterations = 2,
-        .max_history_messages = 20,
-        .auto_save = false,
-        .history = .empty,
-    };
-    defer agent.deinit();
-
-    const response = try agent.turn("hello");
-    defer allocator.free(response);
-
-    const expected_tokens = estimate_text_tokens("final answer");
-    try std.testing.expectEqual(@as(u64, expected_tokens), agent.tokensUsed());
-
-    const status = (try agent.handleSlashCommand("/status")).?;
-    defer allocator.free(status);
-    var expected_line_buf: [64]u8 = undefined;
-    const expected_line = try std.fmt.bufPrint(&expected_line_buf, "Tokens used: {d}", .{expected_tokens});
-    try std.testing.expect(std.mem.indexOf(u8, status, expected_line) != null);
 }
 
 test "turn refreshes system prompt after workspace markdown change" {
@@ -5199,153 +5681,6 @@ test "Agent tool loop frees dynamic tool outputs" {
     try std.testing.expectEqual(@as(usize, 2), provider_state.call_count);
 }
 
-test "Agent shell failure with normalized output does not poison next turn" {
-    const ShellFailureProvider = struct {
-        const Self = @This();
-
-        call_count: usize = 0,
-        saw_tool_results: bool = false,
-        saw_error_tool_result: bool = false,
-        saw_valid_utf8_tool_results: bool = false,
-        saw_non_empty_error_tool_result: bool = false,
-
-        fn failingShellCommand() []const u8 {
-            return if (comptime builtin.os.tag == .windows)
-                "powershell.exe -NoProfile -Command \"[Console]::OpenStandardError().Write([byte[]](0xD6,0xD0,0xCE,0xC4),0,4)\" & exit /b 1"
-            else
-                "printf '\\200' >&2; exit 1";
-        }
-
-        fn captureToolResultMessage(self: *Self, messages: []const ChatMessage) void {
-            const start_marker = "<tool_result name=\"shell\" status=\"error\">";
-            const end_marker = "</tool_result>";
-
-            for (messages) |msg| {
-                if (msg.role != .user) continue;
-                if (std.mem.indexOf(u8, msg.content, "[Tool results]") == null) continue;
-
-                self.saw_tool_results = true;
-                self.saw_error_tool_result = std.mem.indexOf(u8, msg.content, "<tool_result name=\"shell\" status=\"error\">") != null;
-                self.saw_valid_utf8_tool_results = std.unicode.utf8ValidateSlice(msg.content);
-                if (std.mem.indexOf(u8, msg.content, start_marker)) |start_idx| {
-                    const body_start = start_idx + start_marker.len;
-                    if (std.mem.indexOf(u8, msg.content[body_start..], end_marker)) |end_rel| {
-                        const body = std.mem.trim(u8, msg.content[body_start .. body_start + end_rel], " \t\r\n");
-                        self.saw_non_empty_error_tool_result = body.len > 0;
-                    }
-                }
-                break;
-            }
-        }
-
-        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
-            return allocator.dupe(u8, "");
-        }
-
-        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, request: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
-            const self: *Self = @ptrCast(@alignCast(ptr));
-            self.call_count += 1;
-
-            if (self.call_count == 1) {
-                const tool_calls = try allocator.alloc(providers.ToolCall, 1);
-                tool_calls[0] = .{
-                    .id = try allocator.dupe(u8, "call-shell-1"),
-                    .name = try allocator.dupe(u8, "shell"),
-                    .arguments = try std.fmt.allocPrint(allocator, "{{\"command\":{f}}}", .{
-                        std.json.fmt(failingShellCommand(), .{}),
-                    }),
-                };
-
-                return .{
-                    .content = try allocator.dupe(u8, "Run shell"),
-                    .tool_calls = tool_calls,
-                    .usage = .{},
-                    .model = try allocator.dupe(u8, "test-model"),
-                };
-            }
-
-            self.captureToolResultMessage(request.messages);
-            return .{
-                .content = try allocator.dupe(u8, "recovered"),
-                .tool_calls = &.{},
-                .usage = .{},
-                .model = try allocator.dupe(u8, "test-model"),
-            };
-        }
-
-        fn supportsNativeTools(_: *anyopaque) bool {
-            return true;
-        }
-
-        fn getName(_: *anyopaque) []const u8 {
-            return "shell-failure-provider";
-        }
-
-        fn deinitFn(_: *anyopaque) void {}
-    };
-
-    const allocator = std.testing.allocator;
-
-    var provider_state = ShellFailureProvider{};
-    const provider_vtable = Provider.VTable{
-        .chatWithSystem = ShellFailureProvider.chatWithSystem,
-        .chat = ShellFailureProvider.chat,
-        .supportsNativeTools = ShellFailureProvider.supportsNativeTools,
-        .getName = ShellFailureProvider.getName,
-        .deinit = ShellFailureProvider.deinitFn,
-    };
-    const provider = Provider{
-        .ptr = @ptrCast(&provider_state),
-        .vtable = &provider_vtable,
-    };
-
-    var shell_tool_impl = tools_mod.shell.ShellTool{ .workspace_dir = "." };
-    const tool_list = [_]Tool{shell_tool_impl.tool()};
-
-    var specs = try allocator.alloc(ToolSpec, tool_list.len);
-    for (tool_list, 0..) |t, i| {
-        specs[i] = .{
-            .name = t.name(),
-            .description = t.description(),
-            .parameters_json = t.parametersJson(),
-        };
-    }
-
-    var noop = observability.NoopObserver{};
-    var agent = Agent{
-        .allocator = allocator,
-        .provider = provider,
-        .tools = &tool_list,
-        .tool_specs = specs,
-        .mem = null,
-        .observer = noop.observer(),
-        .model_name = "test-model",
-        .temperature = 0.7,
-        .workspace_dir = ".",
-        .max_tool_iterations = 4,
-        .max_history_messages = 50,
-        .auto_save = false,
-        .history = .empty,
-        .total_tokens = 0,
-        .has_system_prompt = false,
-    };
-    defer agent.deinit();
-
-    const response = try agent.turn("run failing shell");
-    defer allocator.free(response);
-
-    try std.testing.expectEqualStrings("recovered", response);
-    try std.testing.expectEqual(@as(usize, 2), provider_state.call_count);
-    try std.testing.expect(provider_state.saw_tool_results);
-    try std.testing.expect(provider_state.saw_error_tool_result);
-    try std.testing.expect(provider_state.saw_valid_utf8_tool_results);
-    try std.testing.expect(provider_state.saw_non_empty_error_tool_result);
-
-    for (agent.history.items) |msg| {
-        try std.testing.expect(std.unicode.utf8ValidateSlice(msg.content));
-    }
-}
-
 test "Agent streaming fields can be set" {
     const allocator = std.testing.allocator;
     var noop = observability.NoopObserver{};
@@ -5490,29 +5825,6 @@ test "Agent shouldForceActionFollowThrough ignores normal final answer" {
     try std.testing.expect(!Agent.shouldForceActionFollowThrough("I cannot do that in this environment."));
 }
 
-test "Agent selectDisplayText hides malformed tool markup payload" {
-    const raw = "<tool_call>web_search<arg_key>query</arg_key><arg_value>x</arg_value></tool_call>";
-    const selected = Agent.selectDisplayText(raw, "", 0);
-    try std.testing.expectEqualStrings("", selected);
-}
-
-test "Agent selectDisplayText keeps plain text when no markup exists" {
-    const raw = "All good.";
-    const selected = Agent.selectDisplayText(raw, "", 0);
-    try std.testing.expectEqualStrings("All good.", selected);
-}
-
-test "Agent selectDisplayText prefers parsed text when present" {
-    const selected = Agent.selectDisplayText("<tool_call>{}</tool_call>", "let me check", 1);
-    try std.testing.expectEqualStrings("let me check", selected);
-}
-
-test "Agent selectDisplayText hides malformed tool markup present in parsed text" {
-    const parsed_with_markup = "Some text <tool_call>{\"name\":\"shell\"";
-    const selected = Agent.selectDisplayText(parsed_with_markup, parsed_with_markup, 0);
-    try std.testing.expectEqualStrings("", selected);
-}
-
 test "Agent.fromConfig sets exec_security=full for full autonomy" {
     const allocator = std.testing.allocator;
     var cfg = Config{
@@ -5565,40 +5877,6 @@ test "Agent.fromConfig sets exec_security=allowlist for supervised autonomy" {
 
     try std.testing.expect(agent.exec_security == .allowlist);
     try std.testing.expect(agent.exec_ask == .on_miss);
-}
-
-test "Agent.fromConfig sets multimodal_unrestricted for yolo" {
-    const allocator = std.testing.allocator;
-    var cfg = Config{
-        .workspace_dir = "/tmp/yc",
-        .config_path = "/tmp/yc/config.json",
-        .default_model = "openai/gpt-4.1-mini",
-        .allocator = allocator,
-    };
-    cfg.autonomy.level = .yolo;
-
-    var noop = observability.NoopObserver{};
-    var agent = try Agent.fromConfig(allocator, &cfg, undefined, &.{}, null, noop.observer());
-    defer agent.deinit();
-
-    try std.testing.expect(agent.multimodal_unrestricted == true);
-}
-
-test "Agent.fromConfig does not set multimodal_unrestricted for full" {
-    const allocator = std.testing.allocator;
-    var cfg = Config{
-        .workspace_dir = "/tmp/yc",
-        .config_path = "/tmp/yc/config.json",
-        .default_model = "openai/gpt-4.1-mini",
-        .allocator = allocator,
-    };
-    cfg.autonomy.level = .full;
-
-    var noop = observability.NoopObserver{};
-    var agent = try Agent.fromConfig(allocator, &cfg, undefined, &.{}, null, noop.observer());
-    defer agent.deinit();
-
-    try std.testing.expect(agent.multimodal_unrestricted == false);
 }
 
 test "execBlockMessage allows all commands when exec_security=full" {

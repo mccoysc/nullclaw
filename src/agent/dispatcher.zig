@@ -106,23 +106,25 @@ pub fn parseXmlToolCalls(
     var remaining = response;
 
     while (true) {
-        // Find next tool call marker: either <tool_call> or [TOOL_CALL] or [tool_call]
+        // Find next tool call marker: <tool_call>, [TOOL_CALL], [tool_call], or namespaced <xxx:tool_call>
         const marker_info: ?struct { start: usize, end: usize, open_char: u8, close_char: u8 } = blk: {
             const xml_start = std.mem.indexOf(u8, remaining, "<tool_call>");
             const br_start_upper = std.mem.indexOf(u8, remaining, "[TOOL_CALL]");
             const br_start_lower = std.mem.indexOf(u8, remaining, "[tool_call]");
 
             var best_start: ?usize = null;
+            var best_end: usize = 0;
             var open_c: u8 = '<';
             var close_c: u8 = '>';
-            const marker_len: usize = 11;
 
             if (xml_start) |s| {
                 best_start = s;
+                best_end = s + 11; // len("<tool_call>")
             }
             if (br_start_upper) |s| {
                 if (best_start == null or s < best_start.?) {
                     best_start = s;
+                    best_end = s + 11;
                     open_c = '[';
                     close_c = ']';
                 }
@@ -130,13 +132,45 @@ pub fn parseXmlToolCalls(
             if (br_start_lower) |s| {
                 if (best_start == null or s < best_start.?) {
                     best_start = s;
+                    best_end = s + 11;
                     open_c = '[';
                     close_c = ']';
                 }
             }
 
+            // Namespaced XML tool_call tags: <prefix:tool_call> (e.g. <minimax:tool_call>)
+            // Search for ":tool_call>" and backtrack to find the opening '<'.
+            const ns_suffix = ":tool_call>";
+            if (std.mem.indexOf(u8, remaining, ns_suffix)) |suffix_pos| {
+                // Backtrack from suffix_pos to find the '<' that opens this tag.
+                var ns_tag_start: ?usize = null;
+                var j = suffix_pos;
+                while (j > 0) {
+                    j -= 1;
+                    const ch = remaining[j];
+                    if (ch == '<') {
+                        ns_tag_start = j;
+                        break;
+                    }
+                    // Stop if we hit characters invalid in an XML tag name
+                    if (ch == '>' or ch == ' ' or ch == '\n' or ch == '\r' or ch == '\t') break;
+                }
+                if (ns_tag_start) |ns_s| {
+                    // Ensure this is an opening tag, not a closing tag like </minimax:tool_call>
+                    if (ns_s + 1 < remaining.len and remaining[ns_s + 1] != '/') {
+                        const ns_e = suffix_pos + ns_suffix.len;
+                        if (best_start == null or ns_s < best_start.?) {
+                            best_start = ns_s;
+                            best_end = ns_e;
+                            open_c = '<';
+                            close_c = '>';
+                        }
+                    }
+                }
+            }
+
             if (best_start) |s| {
-                break :blk .{ .start = s, .end = s + marker_len, .open_char = open_c, .close_char = close_c };
+                break :blk .{ .start = s, .end = best_end, .open_char = open_c, .close_char = close_c };
             }
             break :blk null;
         };
@@ -2512,6 +2546,58 @@ test "parseXmlToolCalls minimax format robustness" {
     try std.testing.expectEqual(@as(usize, 1), result.calls.len);
     try std.testing.expectEqualStrings("shell", result.calls[0].name);
     try std.testing.expect(std.mem.indexOf(u8, result.calls[0].arguments_json, "ls -la") != null);
+}
+
+test "parseXmlToolCalls fully namespaced minimax format" {
+    const allocator = std.testing.allocator;
+    // Both opening and closing tags are namespaced: <minimax:tool_call>...</minimax:tool_call>
+    const response =
+        \\<minimax:tool_call>
+        \\<invoke name="shell">
+        \\<parameter name="command">curl -s "wttr.in/Chengdu?format=%c%t"</parameter>
+        \\</invoke>
+        \\</minimax:tool_call>
+    ;
+
+    const result = try parseToolCalls(allocator, response);
+    defer {
+        allocator.free(result.text);
+        for (result.calls) |call| {
+            allocator.free(call.name);
+            allocator.free(call.arguments_json);
+        }
+        allocator.free(result.calls);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), result.calls.len);
+    try std.testing.expectEqualStrings("shell", result.calls[0].name);
+    try std.testing.expect(std.mem.indexOf(u8, result.calls[0].arguments_json, "wttr.in/Chengdu") != null);
+}
+
+test "parseXmlToolCalls fully namespaced with preceding text" {
+    const allocator = std.testing.allocator;
+    const response =
+        \\Let me check the weather for you.
+        \\<minimax:tool_call>
+        \\<invoke name="shell">
+        \\<parameter name="command">curl -s wttr.in/Chengdu</parameter>
+        \\</invoke>
+        \\</minimax:tool_call>
+    ;
+
+    const result = try parseToolCalls(allocator, response);
+    defer {
+        allocator.free(result.text);
+        for (result.calls) |call| {
+            allocator.free(call.name);
+            allocator.free(call.arguments_json);
+        }
+        allocator.free(result.calls);
+    }
+
+    try std.testing.expectEqualStrings("Let me check the weather for you.", result.text);
+    try std.testing.expectEqual(@as(usize, 1), result.calls.len);
+    try std.testing.expectEqualStrings("shell", result.calls[0].name);
 }
 
 test "parseXmlToolCalls hybrid format" {
