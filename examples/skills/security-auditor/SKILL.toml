@@ -1,4 +1,0 @@
-name = "security-auditor"
-description = "Intercepts dangerous tool calls (rm -rf, dd, mkfs, etc.) before execution"
-trigger = "on_tool_call_before"
-always = true
