@@ -149,8 +149,6 @@ pub const onebot = @import("onebot.zig");
 pub const qq = @import("qq.zig");
 pub const maixcam = @import("maixcam.zig");
 pub const signal = @import("signal.zig");
-pub const mqtt = @import("mqtt.zig");
-pub const redis_stream = @import("redis_stream.zig");
 pub const web = if (@import("build_options").enable_channel_web)
     @import("web.zig")
 else

@@ -287,36 +287,31 @@ test "browser tool execute with empty json" {
     try std.testing.expect(!result.success);
 }
 
-test "browser open handles URL with shell metacharacters per platform" {
+test "browser open rejects URL with shell metacharacters on Windows" {
+    // On Windows, cmd.exe /c start interprets metacharacters — they must be blocked.
+    // On Unix, open/xdg-open uses execvp so metacharacters in argv are safe.
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+
     var bt = BrowserTool{};
     const t = bt.tool();
 
-    // & can chain commands in cmd.exe but is safe on Unix (execvp argv).
+    // & can chain commands in cmd.exe
     const p1 = try root.parseTestArgs("{\"action\": \"open\", \"url\": \"https://example.com&whoami\"}");
     defer p1.deinit();
     const r1 = try t.execute(std.testing.allocator, p1.value.object);
-    if (comptime builtin.os.tag == .windows) {
-        try std.testing.expect(!r1.success);
-        try std.testing.expect(std.mem.indexOf(u8, r1.error_msg.?, "metacharacter") != null);
-    } else {
-        defer std.testing.allocator.free(r1.output);
-        try std.testing.expect(r1.success);
-    }
+    try std.testing.expect(!r1.success);
+    try std.testing.expect(std.mem.indexOf(u8, r1.error_msg.?, "metacharacter") != null);
 
-    // | can pipe in cmd.exe but is safe on Unix.
+    // | can pipe in cmd.exe
     const p2 = try root.parseTestArgs("{\"action\": \"open\", \"url\": \"https://example.com|calc\"}");
     defer p2.deinit();
     const r2 = try t.execute(std.testing.allocator, p2.value.object);
-    if (comptime builtin.os.tag == .windows) {
-        try std.testing.expect(!r2.success);
-    } else {
-        defer std.testing.allocator.free(r2.output);
-        try std.testing.expect(r2.success);
-    }
+    try std.testing.expect(!r2.success);
 }
 
 test "browser open allows URL with query params on Unix" {
-    if (comptime builtin.os.tag == .windows) return;
+    // On Unix, & in query strings is safe (passed as argv to open/xdg-open).
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
 
     var bt = BrowserTool{};
     const t = bt.tool();

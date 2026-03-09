@@ -15,6 +15,7 @@ const MessageEntry = root.MessageEntry;
 const SessionStore = root.SessionStore;
 const config_types = @import("../../config_types.zig");
 const net_security = @import("../../net_security.zig");
+const url_percent = @import("../../url_percent.zig");
 const log = std.log.scoped(.api_memory);
 
 // ── ApiMemory ─────────────────────────────────────────────────────
@@ -326,22 +327,11 @@ pub const ApiMemory = struct {
     // ── URL encoding ──────────────────────────────────────────────
 
     fn appendUrlEncoded(buf: *std.ArrayListUnmanaged(u8), alloc: Allocator, text: []const u8) !void {
-        for (text) |ch| {
-            if (std.ascii.isAlphanumeric(ch) or ch == '-' or ch == '_' or ch == '.' or ch == '~') {
-                try buf.append(alloc, ch);
-            } else {
-                var hex_buf: [3]u8 = undefined;
-                const hex = std.fmt.bufPrint(&hex_buf, "%{X:0>2}", .{ch}) catch unreachable;
-                try buf.appendSlice(alloc, hex);
-            }
-        }
+        try url_percent.appendPercentEncodedList(buf, alloc, text);
     }
 
     fn urlEncode(alloc: Allocator, text: []const u8) ![]u8 {
-        var buf: std.ArrayListUnmanaged(u8) = .empty;
-        errdefer buf.deinit(alloc);
-        try appendUrlEncoded(&buf, alloc, text);
-        return buf.toOwnedSlice(alloc);
+        return url_percent.encode(alloc, text);
     }
 
     // ── Response parsers ─────────────────────────────────────────

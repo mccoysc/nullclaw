@@ -9,6 +9,7 @@ const build_options = @import("build_options");
 const root = @import("../root.zig");
 const registry = @import("../engines/registry.zig");
 const cache_mod = @import("cache.zig");
+const rollout_mod = @import("rollout.zig");
 const outbox_mod = @import("../vector/outbox.zig");
 const vector_store_mod = @import("../vector/store.zig");
 const retrieval_mod = @import("../retrieval/engine.zig");

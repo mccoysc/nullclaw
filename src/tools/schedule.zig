@@ -19,7 +19,7 @@ pub const ScheduleTool = struct {
         \\{"type":"object","properties":{"action":{"type":"string","enum":["create","add","once","list","get","cancel","remove","pause","resume"],"description":"Action to perform"},"expression":{"type":"string","description":"Cron expression for recurring tasks"},"delay":{"type":"string","description":"Delay for one-shot tasks (e.g. '30m', '2h')"},"command":{"type":"string","description":"Shell command to execute"},"id":{"type":"string","description":"Task ID"},"chat_id":{"type":"string","description":"Chat ID for delivery notification (e.g. Telegram chat_id)"}},"required":["action"]}
     ;
 
-    pub const vtable = root.ToolVTable(@This());
+    const vtable = root.ToolVTable(@This());
 
     /// Set the context for the current turn (called before agent.turn).
     pub fn setContext(self: *ScheduleTool, channel: ?[]const u8, chat_id: ?[]const u8) void {

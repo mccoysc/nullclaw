@@ -2613,7 +2613,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                 .autonomy = cfg.autonomy.level,
                 .workspace_dir = cfg.workspace_dir,
                 .workspace_only = cfg.autonomy.workspace_only,
-                .allowed_commands = if (cfg.autonomy.allowed_commands.len > 0) cfg.autonomy.allowed_commands else &security.default_allowed_commands,
+                .allowed_commands = security.resolveAllowedCommands(cfg.autonomy.level, cfg.autonomy.allowed_commands),
                 .max_actions_per_hour = cfg.autonomy.max_actions_per_hour,
                 .require_approval_for_medium_risk = cfg.autonomy.require_approval_for_medium_risk,
                 .block_high_risk_commands = cfg.autonomy.block_high_risk_commands,
@@ -2707,6 +2707,10 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
     try stdout.print("Gateway listening on {s}:{d}\n", .{ host, port });
     try stdout.flush();
     if (config_opt) |cfg| {
+        if (cfg.autonomy.level == .yolo) {
+            try stdout.print("\x1b[1;31m[WARNING] YOLO mode active — all security checks bypassed\x1b[0m\n", .{});
+            try stdout.flush();
+        }
         // In daemon mode the parent already prints model/provider.
         if (config_ptr == null) cfg.printModelConfig();
     }

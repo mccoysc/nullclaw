@@ -23,6 +23,7 @@ const memory_mod = @import("memory/root.zig");
 const bootstrap_mod = @import("bootstrap/root.zig");
 const onboard = @import("onboard.zig");
 const streaming = @import("streaming.zig");
+const thread_stacks = @import("thread_stacks.zig");
 
 const log = std.log.scoped(.daemon);
 
@@ -437,9 +438,6 @@ fn channelSupervisorThread(
     if (channel_rt) |rt| mgr.setRuntime(rt);
     mgr.setEventBus(event_bus);
 
-    // Enable config hot-reload watching
-    mgr.enableConfigWatch(config.config_path, allocator);
-
     mgr.collectConfiguredChannels() catch |err| {
         state.markError("channels", @errorName(err));
         health.markComponentError("channels", @errorName(err));
@@ -452,9 +450,7 @@ fn channelSupervisorThread(
         return;
     };
 
-    // Always run supervision loop when config watching is enabled
-    // (even with 0 channels, so we can detect newly added channels via hot-reload)
-    if (started > 0 or mgr.config_watch_enabled) {
+    if (started > 0) {
         state.markRunning("channels");
         health.markComponentOk("channels");
         mgr.supervisionLoop(state); // blocks until shutdown
@@ -714,7 +710,7 @@ fn inboundDispatcherThread(
             typing_recipient,
         );
 
-        const use_streaming_outbound = std.mem.eql(u8, msg.channel, "web");
+        const use_streaming_outbound = std.mem.eql(u8, msg.channel, "web") or std.mem.eql(u8, msg.channel, "telegram");
         var streaming_ctx = StreamingOutboundCtx{
             .allocator = allocator,
             .event_bus = event_bus,
@@ -722,18 +718,26 @@ fn inboundDispatcherThread(
             .account_id = outbound_account_id,
             .chat_id = msg.chat_id,
         };
+        var stream_sink: ?streaming.Sink = null;
+        var outbound_tag_filter: streaming.TagFilter = undefined;
+        if (use_streaming_outbound) {
+            const raw_sink = streaming.Sink{
+                .callback = publishStreamingChunk,
+                .ctx = @ptrCast(&streaming_ctx),
+            };
+            if (std.mem.eql(u8, msg.channel, "telegram")) {
+                outbound_tag_filter = streaming.TagFilter.init(raw_sink);
+                stream_sink = outbound_tag_filter.sink();
+            } else {
+                stream_sink = raw_sink;
+            }
+        }
 
         const reply = runtime.session_mgr.processMessageStreaming(
             session_key,
             msg.content,
             null,
-            if (use_streaming_outbound)
-                streaming.Sink{
-                    .callback = publishStreamingChunk,
-                    .ctx = @ptrCast(&streaming_ctx),
-                }
-            else
-                null,
+            stream_sink,
         ) catch |err| {
             log.warn("inbound dispatch process failed: {}", .{err});
 
@@ -839,7 +843,7 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
 
     // Spawn gateway thread
     state.markRunning("gateway");
-    const gw_thread = std.Thread.spawn(.{ .stack_size = 256 * 1024 }, gatewayThread, .{ allocator, config, host, port, &state, &event_bus }) catch |err| {
+    const gw_thread = std.Thread.spawn(.{ .stack_size = thread_stacks.DAEMON_SERVICE_STACK_SIZE }, gatewayThread, .{ allocator, config, host, port, &state, &event_bus }) catch |err| {
         state.markError("gateway", @errorName(err));
         try stdout.print("Failed to spawn gateway: {}\n", .{err});
         return err;
@@ -849,7 +853,7 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     var hb_thread: ?std.Thread = null;
     if (config.heartbeat.enabled) {
         state.markRunning("heartbeat");
-        if (std.Thread.spawn(.{ .stack_size = 128 * 1024 }, heartbeatThread, .{ allocator, config, &state })) |thread| {
+        if (std.Thread.spawn(.{ .stack_size = thread_stacks.AUXILIARY_LOOP_STACK_SIZE }, heartbeatThread, .{ allocator, config, &state })) |thread| {
             hb_thread = thread;
         } else |err| {
             state.markError("heartbeat", @errorName(err));
@@ -861,7 +865,7 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     var sched_thread: ?std.Thread = null;
     if (config.scheduler.enabled) {
         state.markRunning("scheduler");
-        if (std.Thread.spawn(.{ .stack_size = 256 * 1024 }, schedulerThread, .{ allocator, config, &state, &event_bus })) |thread| {
+        if (std.Thread.spawn(.{ .stack_size = thread_stacks.DAEMON_SERVICE_STACK_SIZE }, schedulerThread, .{ allocator, config, &state, &event_bus })) |thread| {
             sched_thread = thread;
         } else |err| {
             state.markError("scheduler", @errorName(err));
@@ -891,7 +895,7 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     // Spawn channel supervisor thread (only if channels are configured)
     var chan_thread: ?std.Thread = null;
     if (has_supervised_channels) {
-        if (std.Thread.spawn(.{ .stack_size = 256 * 1024 }, channelSupervisorThread, .{
+        if (std.Thread.spawn(.{ .stack_size = thread_stacks.DAEMON_SERVICE_STACK_SIZE }, channelSupervisorThread, .{
             allocator, config, &state, &channel_registry, channel_rt, &event_bus,
         })) |thread| {
             chan_thread = thread;
@@ -904,7 +908,7 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     var inbound_thread: ?std.Thread = null;
     if (channel_rt) |rt| {
         state.addComponent("inbound_dispatcher");
-        if (std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, inboundDispatcherThread, .{
+        if (std.Thread.spawn(.{ .stack_size = thread_stacks.SESSION_TURN_STACK_SIZE }, inboundDispatcherThread, .{
             allocator, &event_bus, &channel_registry, rt, &state,
         })) |thread| {
             inbound_thread = thread;
@@ -921,7 +925,7 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     state.addComponent("outbound_dispatcher");
 
     var dispatcher_thread: ?std.Thread = null;
-    if (std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, dispatch.runOutboundDispatcher, .{
+    if (std.Thread.spawn(.{ .stack_size = thread_stacks.HEAVY_RUNTIME_STACK_SIZE }, dispatch.runOutboundDispatcher, .{
         allocator, &event_bus, &channel_registry, &dispatch_stats,
     })) |thread| {
         dispatcher_thread = thread;
@@ -1389,6 +1393,44 @@ test "resolveInboundRouteSessionKey routes slack channel messages by chat_id" {
     try std.testing.expectEqualStrings("agent:slack-channel-agent:slack:channel:C12345", routed.?);
 }
 
+test "resolveInboundRouteSessionKey routes threaded slack channel messages by base channel_id" {
+    const allocator = std.testing.allocator;
+    const bindings = [_]agent_routing.AgentBinding{
+        .{
+            .agent_id = "slack-channel-agent",
+            .match = .{
+                .channel = "slack",
+                .account_id = "sl-main",
+                .peer = .{ .kind = .channel, .id = "C12345" },
+            },
+        },
+    };
+    const config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &bindings,
+        .channels = .{
+            .slack = &[_]@import("config_types.zig").SlackConfig{
+                .{ .account_id = "sl-main", .bot_token = "xoxb-token", .channel_id = "C12345" },
+            },
+        },
+    };
+    const msg = bus_mod.InboundMessage{
+        .channel = "slack",
+        .sender_id = "U777",
+        .chat_id = "C12345:1700.0",
+        .content = "threaded hello",
+        .session_key = "slack:sl-main:channel:C12345",
+        .metadata_json = "{\"account_id\":\"sl-main\",\"is_dm\":false,\"channel_id\":\"C12345\",\"message_id\":\"1700.1\",\"thread_id\":\"1700.0\"}",
+    };
+
+    const routed = resolveInboundRouteSessionKey(allocator, &config, &msg);
+    try std.testing.expect(routed != null);
+    defer allocator.free(routed.?);
+    try std.testing.expectEqualStrings("agent:slack-channel-agent:slack:channel:C12345:thread:1700.0", routed.?);
+}
+
 test "resolveInboundRouteSessionKey routes slack direct messages by sender" {
     const allocator = std.testing.allocator;
     const bindings = [_]agent_routing.AgentBinding{
@@ -1701,7 +1743,7 @@ test "hasSupervisedChannels true for nostr" {
         .owner_pubkey = "a" ** 64,
     };
     config.channels.nostr = &ns_cfg;
-    try std.testing.expectEqual(channel_catalog.isBuildEnabled(.nostr), hasSupervisedChannels(&config));
+    try std.testing.expect(hasSupervisedChannels(&config));
 }
 
 test "stateFilePath derives from config_path" {
@@ -1848,7 +1890,7 @@ test "channelSupervisorThread respects shutdown" {
     defer channel_registry.deinit();
     var event_bus = bus_mod.Bus.init();
 
-    const thread = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, channelSupervisorThread, .{
+    const thread = try std.Thread.spawn(.{ .stack_size = thread_stacks.DAEMON_SERVICE_STACK_SIZE }, channelSupervisorThread, .{
         std.testing.allocator, &config, &state, &channel_registry, null, &event_bus,
     });
     thread.join();
