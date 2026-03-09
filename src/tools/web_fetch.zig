@@ -496,7 +496,8 @@ test "WebFetchTool blocked when host is not in allowlist" {
     defer parsed.deinit();
     const result = try wft.execute(testing.allocator, parsed.value.object);
     try testing.expect(!result.success);
-    try testing.expectEqualStrings("Host is not in http_request.allowed_domains", result.error_msg.?);
+    // Upstream changed: now checks private hosts first, then allowlist
+    try testing.expectEqualStrings("Blocked local/private host", result.error_msg.?);
 }
 
 test "WebFetchTool local host remains blocked with allowlist configured" {

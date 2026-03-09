@@ -2243,6 +2243,7 @@ test "ChannelManager marks qq webhook receive_mode as webhook_only" {
 test "ChannelManager marks lark websocket receive_mode as gateway_loop" {
     if (!channel_catalog.isBuildEnabled(.lark)) return;
 
+    // Upstream now requires provider model config for channel initialization
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -2264,6 +2265,8 @@ test "ChannelManager marks lark websocket receive_mode as gateway_loop" {
         .channels = .{
             .lark = &lark_accounts,
         },
+        // Upstream requires default_model for channel initialization
+        .default_model = "gpt-4o-mini",
     };
 
     var reg = dispatch.ChannelRegistry.init(allocator);
@@ -2281,6 +2284,7 @@ test "ChannelManager marks lark websocket receive_mode as gateway_loop" {
 test "ChannelManager marks lark webhook receive_mode as webhook_only" {
     if (!channel_catalog.isBuildEnabled(.lark)) return;
 
+    // Upstream now requires provider model config for channel initialization
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -2301,6 +2305,8 @@ test "ChannelManager marks lark webhook receive_mode as webhook_only" {
         .channels = .{
             .lark = &lark_accounts,
         },
+        // Upstream requires default_model for channel initialization
+        .default_model = "gpt-4o-mini",
     };
 
     var reg = dispatch.ChannelRegistry.init(allocator);
