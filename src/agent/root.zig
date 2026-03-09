@@ -5199,6 +5199,147 @@ test "Agent tool loop frees dynamic tool outputs" {
     try std.testing.expectEqual(@as(usize, 2), provider_state.call_count);
 }
 
+test "Agent shell failure with normalized output does not poison next turn" {
+    const ShellFailureProvider = struct {
+        const Self = @This();
+
+        call_count: usize = 0,
+        saw_tool_results: bool = false,
+        saw_error_tool_result: bool = false,
+        saw_valid_utf8_tool_results: bool = false,
+        saw_expected_normalized_text: bool = false,
+
+        fn failingShellCommand() []const u8 {
+            return if (comptime builtin.os.tag == .windows)
+                "powershell.exe -NoProfile -Command \"[Console]::OpenStandardError().Write([byte[]](0xD6,0xD0,0xCE,0xC4),0,4); exit 1\""
+            else
+                "printf '\\200' >&2; exit 1";
+        }
+
+        fn captureToolResultMessage(self: *Self, messages: []const ChatMessage) void {
+            for (messages) |msg| {
+                if (msg.role != .user) continue;
+                if (std.mem.indexOf(u8, msg.content, "[Tool results]") == null) continue;
+
+                self.saw_tool_results = true;
+                self.saw_error_tool_result = std.mem.indexOf(u8, msg.content, "<tool_result name=\"shell\" status=\"error\">") != null;
+                self.saw_valid_utf8_tool_results = std.unicode.utf8ValidateSlice(msg.content);
+                self.saw_expected_normalized_text = if (comptime builtin.os.tag == .windows)
+                    std.mem.indexOf(u8, msg.content, "中文") != null
+                else
+                    std.mem.indexOf(u8, msg.content, "\xEF\xBF\xBD") != null;
+                break;
+            }
+        }
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, request: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            self.call_count += 1;
+
+            if (self.call_count == 1) {
+                const tool_calls = try allocator.alloc(providers.ToolCall, 1);
+                tool_calls[0] = .{
+                    .id = try allocator.dupe(u8, "call-shell-1"),
+                    .name = try allocator.dupe(u8, "shell"),
+                    .arguments = try std.fmt.allocPrint(allocator, "{{\"command\":{f}}}", .{
+                        std.json.fmt(failingShellCommand(), .{}),
+                    }),
+                };
+
+                return .{
+                    .content = try allocator.dupe(u8, "Run shell"),
+                    .tool_calls = tool_calls,
+                    .usage = .{},
+                    .model = try allocator.dupe(u8, "test-model"),
+                };
+            }
+
+            self.captureToolResultMessage(request.messages);
+            return .{
+                .content = try allocator.dupe(u8, "recovered"),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "shell-failure-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+
+    var provider_state = ShellFailureProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = ShellFailureProvider.chatWithSystem,
+        .chat = ShellFailureProvider.chat,
+        .supportsNativeTools = ShellFailureProvider.supportsNativeTools,
+        .getName = ShellFailureProvider.getName,
+        .deinit = ShellFailureProvider.deinitFn,
+    };
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    var shell_tool_impl = tools_mod.shell.ShellTool{ .workspace_dir = "." };
+    const tool_list = [_]Tool{shell_tool_impl.tool()};
+
+    var specs = try allocator.alloc(ToolSpec, tool_list.len);
+    for (tool_list, 0..) |t, i| {
+        specs[i] = .{
+            .name = t.name(),
+            .description = t.description(),
+            .parameters_json = t.parametersJson(),
+        };
+    }
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &tool_list,
+        .tool_specs = specs,
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = ".",
+        .max_tool_iterations = 4,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    const response = try agent.turn("run failing shell");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("recovered", response);
+    try std.testing.expectEqual(@as(usize, 2), provider_state.call_count);
+    try std.testing.expect(provider_state.saw_tool_results);
+    try std.testing.expect(provider_state.saw_error_tool_result);
+    try std.testing.expect(provider_state.saw_valid_utf8_tool_results);
+    try std.testing.expect(provider_state.saw_expected_normalized_text);
+
+    for (agent.history.items) |msg| {
+        try std.testing.expect(std.unicode.utf8ValidateSlice(msg.content));
+    }
+}
+
 test "Agent streaming fields can be set" {
     const allocator = std.testing.allocator;
     var noop = observability.NoopObserver{};
