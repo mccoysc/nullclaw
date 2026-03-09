@@ -11,10 +11,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Config = @import("config.zig").Config;
-const config_types = @import("config_types.zig");
-const agent_root = @import("agent/root.zig");
-const Agent = agent_root.Agent;
-const context_tokens = agent_root.context_tokens;
+const Agent = @import("agent/root.zig").Agent;
 const ConversationContext = @import("agent/prompt.zig").ConversationContext;
 const providers = @import("providers/root.zig");
 const Provider = providers.Provider;
@@ -26,35 +23,11 @@ const tools_mod = @import("tools/root.zig");
 const Tool = tools_mod.Tool;
 const SecurityPolicy = @import("security/policy.zig").SecurityPolicy;
 const streaming = @import("streaming.zig");
-const skills_mod = @import("skills.zig");
-const platform = @import("platform.zig");
+const thread_stacks = @import("thread_stacks.zig");
 const log = std.log.scoped(.session);
 const MESSAGE_LOG_MAX_BYTES: usize = 4096;
 const TOKEN_USAGE_LEDGER_FILENAME = "llm_token_usage.jsonl";
 const NS_PER_SEC: i128 = std.time.ns_per_s;
-
-/// Load workspace skills for channel hook evaluation.
-/// Also consumes any `.reload` sentinel files in the skills directories.
-fn loadSessionSkills(allocator: Allocator, workspace_dir: []const u8) ?[]skills_mod.Skill {
-    const home_dir = platform.getHomeDir(allocator) catch null;
-    defer if (home_dir) |h| allocator.free(h);
-    const community_base = if (home_dir) |h|
-        std.fs.path.join(allocator, &.{ h, ".nullclaw", "skills" }) catch null
-    else
-        null;
-    defer if (community_base) |cb| allocator.free(cb);
-
-    // Consume reload sentinels (best-effort; result unused here because
-    // skills are always loaded fresh from disk on every turn).
-    if (community_base) |cb| _ = skills_mod.consumeReloadSentinel(allocator, cb);
-    _ = skills_mod.consumeReloadSentinel(allocator, workspace_dir);
-
-    if (community_base) |cb| {
-        return skills_mod.listSkillsMerged(allocator, cb, workspace_dir) catch
-            skills_mod.listSkills(allocator, workspace_dir) catch null;
-    }
-    return skills_mod.listSkills(allocator, workspace_dir) catch null;
-}
 
 fn messageLogPreview(text: []const u8) struct { slice: []const u8, truncated: bool } {
     if (text.len <= MESSAGE_LOG_MAX_BYTES) {
@@ -74,6 +47,7 @@ pub const Session = struct {
     last_consolidated: u64 = 0,
     session_key: []const u8, // owned copy
     turn_count: u64,
+    turn_running: std.atomic.Value(bool),
     mutex: std.Thread.Mutex,
 
     pub fn deinit(self: *Session, allocator: Allocator) void {
@@ -91,12 +65,6 @@ pub const SessionManager = struct {
     config: *const Config,
     provider: Provider,
     tools: []const Tool,
-    /// Optional dynamic tool registry. When non-null, every new session's
-    /// agent has its `registry` field set to this pointer so that tool
-    /// dispatch goes through the registry (enabling plugin tools and SO
-    /// ref-counting).  The registry is NOT owned by SessionManager — it is
-    /// owned by ChannelRuntime.
-    tool_registry: ?*tools_mod.ToolRegistry = null,
     mem: ?Memory,
     session_store: ?memory_mod.SessionStore = null,
     response_cache: ?*memory_mod.cache.ResponseCache = null,
@@ -150,295 +118,6 @@ pub const SessionManager = struct {
         self.sessions.deinit(self.allocator);
     }
 
-    /// Look up per-channel model override from config based on session_key.
-    /// Session keys for MQTT/Redis follow the pattern: "mqtt:<account_id>:<topic>"
-    /// or "redis_stream:<account_id>:<topic>".
-    fn lookupChannelModelOverride(config: *const Config, session_key: []const u8) config_types.ChannelModelOverride {
-        // Try MQTT prefix — supports both "mqtt:<endpoint_id>" and legacy "mqtt:<account_id>:<topic>"
-        if (std.mem.startsWith(u8, session_key, "mqtt:")) {
-            const rest = session_key["mqtt:".len..];
-            // First try endpoint_id match (no colon in rest means it's an endpoint_id)
-            for (config.channels.mqtt) |mqtt_cfg| {
-                for (mqtt_cfg.endpoints) |ep| {
-                    if (ep.endpoint_id.len > 0 and std.mem.eql(u8, ep.endpoint_id, rest)) {
-                        return ep.model_override;
-                    }
-                }
-            }
-            // Fall back to legacy account_id:topic match
-            const sep = std.mem.indexOfScalar(u8, rest, ':');
-            if (sep) |s| {
-                const account_id = rest[0..s];
-                const topic = rest[s + 1 ..];
-                for (config.channels.mqtt) |mqtt_cfg| {
-                    if (std.mem.eql(u8, mqtt_cfg.account_id, account_id)) {
-                        for (mqtt_cfg.endpoints) |ep| {
-                            if (std.mem.eql(u8, ep.listen_topic, topic)) {
-                                return ep.model_override;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        // Try Redis Stream prefix — supports both "redis_stream:<endpoint_id>" and legacy format
-        if (std.mem.startsWith(u8, session_key, "redis_stream:")) {
-            const rest = session_key["redis_stream:".len..];
-            // First try endpoint_id match
-            for (config.channels.redis_stream) |rs_cfg| {
-                for (rs_cfg.endpoints) |ep| {
-                    if (ep.endpoint_id.len > 0 and std.mem.eql(u8, ep.endpoint_id, rest)) {
-                        return ep.model_override;
-                    }
-                }
-            }
-            // Fall back to legacy account_id:topic match
-            const sep = std.mem.indexOfScalar(u8, rest, ':');
-            if (sep) |s| {
-                const account_id = rest[0..s];
-                const topic = rest[s + 1 ..];
-                for (config.channels.redis_stream) |rs_cfg| {
-                    if (std.mem.eql(u8, rs_cfg.account_id, account_id)) {
-                        for (rs_cfg.endpoints) |ep| {
-                            if (std.mem.eql(u8, ep.listen_topic, topic)) {
-                                return ep.model_override;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        return .{};
-    }
-
-    /// Apply per-channel model overrides to an agent.
-    /// Only overrides fields that are explicitly set in the override config.
-    ///
-    /// Fallback chains for sub-agent / tools-reviewer model resolution:
-    ///   channel sub_agent_* → channel general (provider/model) → global sub_agent_* → global default
-    ///   channel tools_reviewer_* → channel general (provider/model) → global tools_reviewer_* → global default
-    /// The global sub_agent_*/tools_reviewer_* values are already set on the Agent
-    /// from Config via fromConfig().  This function layers the channel-level
-    /// overrides on top.
-    fn applyModelOverride(agent: *Agent, mo: config_types.ChannelModelOverride) void {
-        if (mo.provider) |prov| {
-            agent.default_provider = prov;
-        }
-        if (mo.model) |model| {
-            agent.model_name = model;
-            agent.default_model = model;
-            // Re-resolve token_limit with the new model
-            const new_token_limit = context_tokens.resolveContextTokens(agent.token_limit_override, model);
-            if (mo.max_context_tokens > 0 and (new_token_limit == 0 or mo.max_context_tokens < new_token_limit)) {
-                agent.token_limit = mo.max_context_tokens;
-            } else {
-                agent.token_limit = new_token_limit;
-            }
-        } else if (mo.max_context_tokens > 0) {
-            // No model override but max_context_tokens is set — cap the current token_limit
-            if (agent.token_limit == 0 or mo.max_context_tokens < agent.token_limit) {
-                agent.token_limit = mo.max_context_tokens;
-            }
-        }
-        if (mo.temperature) |temp| {
-            agent.temperature = temp;
-        }
-
-        // ── Sub-agent fallback chain ─────────────────────────────────────
-        // model/provider: fall back to channel general, then preserve existing (from global init).
-        // temperature/max_context_tokens/base_url: only override when the type-specific
-        // field is explicitly configured — the general config's values must NOT cascade
-        // into specialized types (each type has its own compiled default, e.g. 0.3 for
-        // sub-agent vs 0.7 for general).
-        agent.sub_agent_model = mo.sub_agent_model orelse mo.model orelse agent.sub_agent_model;
-        agent.sub_agent_provider = mo.sub_agent_provider orelse mo.provider orelse agent.sub_agent_provider;
-        if (mo.sub_agent_temperature) |t| agent.sub_agent_temperature = t;
-        if (mo.sub_agent_max_context_tokens > 0) agent.sub_agent_max_context_tokens = mo.sub_agent_max_context_tokens;
-        if (mo.sub_agent_base_url) |u| agent.sub_agent_base_url = u;
-        if (mo.sub_agent_max_iterations > 0) agent.sub_agent_max_iterations = mo.sub_agent_max_iterations;
-        if (mo.sub_agent_review_after > 0) agent.sub_agent_review_after = mo.sub_agent_review_after;
-
-        // ── Tools-reviewer fallback chain ────────────────────────────────
-        agent.tools_reviewer_model = mo.tools_reviewer_model orelse mo.model orelse agent.tools_reviewer_model;
-        agent.tools_reviewer_provider = mo.tools_reviewer_provider orelse mo.provider orelse agent.tools_reviewer_provider;
-        if (mo.tools_reviewer_temperature) |t| agent.tools_reviewer_temperature = t;
-        if (mo.tools_reviewer_max_context_tokens > 0) agent.tools_reviewer_max_context_tokens = mo.tools_reviewer_max_context_tokens;
-        if (mo.tools_reviewer_base_url) |u| agent.tools_reviewer_base_url = u;
-    }
-
-    /// Refresh non-model config-derived fields on an agent from the given config.
-    /// Called during config hot-reload to ensure fields displayed by /debug
-    /// (and used at runtime) reflect the latest config.  Model-related fields
-    /// are handled separately by applyModelOverride.
-    fn applyNonModelConfigRefresh(agent: *Agent, cfg: *const Config) void {
-        // Fields visible in /debug (formatStatus)
-        agent.reasoning_effort = cfg.reasoning_effort;
-        agent.status_show_emojis = cfg.agent.status_show_emojis;
-        agent.exec_security = switch (cfg.autonomy.level) {
-            .full => .full,
-            .read_only => .deny,
-            .supervised => .allowlist,
-        };
-        agent.exec_ask = switch (cfg.autonomy.level) {
-            .full, .read_only => .off,
-            .supervised => .on_miss,
-        };
-        // Agent-loop settings
-        agent.max_tool_iterations = cfg.agent.max_tool_iterations;
-        agent.max_history_messages = cfg.agent.max_history_messages;
-        agent.auto_save = cfg.memory.auto_save;
-        agent.message_timeout_secs = cfg.agent.message_timeout_secs;
-        agent.compaction_keep_recent = cfg.agent.compaction_keep_recent;
-        agent.compaction_max_summary_chars = cfg.agent.compaction_max_summary_chars;
-        agent.compaction_max_source_chars = cfg.agent.compaction_max_source_chars;
-        agent.log_tool_calls = cfg.diagnostics.log_tool_calls;
-        agent.log_llm_io = cfg.diagnostics.log_llm_io;
-        // Provider fallbacks (slices point into config arena, kept alive via prev_configs)
-        agent.configured_providers = cfg.providers;
-        agent.fallback_providers = cfg.reliability.fallback_providers;
-        agent.model_fallbacks = cfg.reliability.model_fallbacks;
-        agent.allowed_paths = cfg.autonomy.allowed_paths;
-        agent.tool_filter_groups = cfg.agent.tool_filter_groups;
-        agent.sub_agent_max_iterations = cfg.agent.sub_agent_max_iterations;
-        agent.sub_agent_review_after = cfg.agent.sub_agent_review_after;
-        agent.max_tokens_override = cfg.max_tokens;
-        // Recompute max_tokens using the same resolution as fromConfigInner
-        const resolved_raw = agent_root.max_tokens_resolver.resolveMaxTokens(cfg.max_tokens, agent.model_name);
-        const token_cap: u32 = @intCast(@min(agent.token_limit, @as(u64, std.math.maxInt(u32))));
-        agent.max_tokens = @min(resolved_raw, token_cap);
-    }
-
-    /// Hot-refresh non-model config-derived fields on sessions whose key does
-    /// NOT start with any of the given prefixes.  MQTT / Redis Stream sessions
-    /// have per-endpoint sub_agent_max_iterations / sub_agent_review_after set
-    /// by applyModelOverride; refreshing them with global values would clobber
-    /// endpoint-specific overrides.  Returns the number of sessions refreshed.
-    pub fn refreshNonModelConfig(self: *SessionManager, cfg: *const Config, exclude_prefixes: []const []const u8) usize {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        var count: usize = 0;
-        var it = self.sessions.iterator();
-        while (it.next()) |entry| {
-            const excluded = for (exclude_prefixes) |pfx| {
-                if (std.mem.startsWith(u8, entry.key_ptr.*, pfx)) break true;
-            } else false;
-            if (!excluded) {
-                const session = entry.value_ptr.*;
-                session.mutex.lock();
-                applyNonModelConfigRefresh(&session.agent, cfg);
-                session.mutex.unlock();
-                count += 1;
-            }
-        }
-        return count;
-    }
-
-    /// Evict all sessions whose key starts with the given prefix.
-    /// Used during config hot-reload to clean up sessions for removed channels.
-    /// Returns the number of sessions evicted.
-    pub fn evictByPrefix(self: *SessionManager, prefix: []const u8) usize {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        var to_remove: std.ArrayListUnmanaged([]const u8) = .empty;
-        defer to_remove.deinit(self.allocator);
-
-        var it = self.sessions.iterator();
-        while (it.next()) |entry| {
-            if (std.mem.startsWith(u8, entry.key_ptr.*, prefix)) {
-                to_remove.append(self.allocator, entry.key_ptr.*) catch continue;
-            }
-        }
-
-        for (to_remove.items) |key| {
-            if (self.sessions.fetchRemove(key)) |kv| {
-                kv.value.deinit(self.allocator);
-                self.allocator.destroy(kv.value);
-            }
-        }
-        return to_remove.items.len;
-    }
-
-    /// Hot-update model parameters on an existing session without destroying it.
-    /// The session keeps its conversation history and state; only model-related
-    /// agent fields are patched in place.  Returns true if a matching session was
-    /// found and updated.
-    pub fn updateSessionModelParams(self: *SessionManager, session_key: []const u8, mo: config_types.ChannelModelOverride) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        const sess = self.sessions.get(session_key) orelse return false;
-        applyModelOverride(&sess.agent, mo);
-        return true;
-    }
-
-    /// Hot-update model parameters on all sessions whose key starts with the
-    /// given prefix.  Returns the number of sessions updated.
-    pub fn updateModelParamsByPrefix(self: *SessionManager, prefix: []const u8, mo: config_types.ChannelModelOverride) usize {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        var count: usize = 0;
-        var it = self.sessions.iterator();
-        while (it.next()) |entry| {
-            if (std.mem.startsWith(u8, entry.key_ptr.*, prefix)) {
-                applyModelOverride(&entry.value_ptr.*.agent, mo);
-                count += 1;
-            }
-        }
-        return count;
-    }
-
-    /// Hot-update model parameters on all sessions whose key does NOT start
-    /// with any of the given prefixes.  Returns the number of sessions updated.
-    /// Used for global model changes: MQTT / Redis Stream sessions are handled
-    /// individually with per-endpoint merge logic, so we exclude them here and
-    /// update every other channel type (Telegram, Discord, Slack, etc.).
-    pub fn updateModelParamsExcludingPrefixes(self: *SessionManager, mo: config_types.ChannelModelOverride, exclude_prefixes: []const []const u8) usize {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        var count: usize = 0;
-        var it = self.sessions.iterator();
-        while (it.next()) |entry| {
-            const excluded = for (exclude_prefixes) |pfx| {
-                if (std.mem.startsWith(u8, entry.key_ptr.*, pfx)) break true;
-            } else false;
-            if (!excluded) {
-                applyModelOverride(&entry.value_ptr.*.agent, mo);
-                count += 1;
-            }
-        }
-        return count;
-    }
-
-    /// Update the config pointer for all future session creations.
-    /// Existing sessions keep their agent state; new sessions will use the new config.
-    pub fn updateConfig(self: *SessionManager, new_config: *const Config) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        self.config = new_config;
-    }
-
-    /// Replace the provider used by the session manager AND all existing
-    /// sessions.  Called during config hot-reload when API keys or provider
-    /// settings change.  Each session's agent.provider is patched in-place
-    /// under its own mutex to avoid racing with in-flight turns (processMessage
-    /// acquires the same session mutex before calling agent.turn).
-    pub fn updateProvider(self: *SessionManager, new_provider: Provider) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        // Update the manager-level provider (used for newly created sessions).
-        self.provider = new_provider;
-
-        // Patch every existing session's agent.
-        var it = self.sessions.iterator();
-        while (it.next()) |entry| {
-            const session = entry.value_ptr.*;
-            session.mutex.lock();
-            session.agent.provider = new_provider;
-            session.mutex.unlock();
-        }
-    }
-
     /// Find or create a session for the given key. Thread-safe.
     pub fn getOrCreate(self: *SessionManager, session_key: []const u8) !*Session {
         self.mutex.lock();
@@ -456,65 +135,23 @@ pub const SessionManager = struct {
         const session = try self.allocator.create(Session);
         errdefer self.allocator.destroy(session);
 
-        // Look up per-channel model overrides BEFORE creating the agent so that
-        // channels with their own model work even when no global model is set.
-        const mo = lookupChannelModelOverride(self.config, session_key);
-
-        // When a plugin registry is present, snapshot current tools from the
-        // registry rather than using self.tools, which may be stale after a
-        // hot-reload (applyOverwriteAll frees old tool entries; self.tools still
-        // holds Tool copies whose .ptr fields now dangle).
-        // The snapshot is heap-allocated and owned by the agent (tools_owned=true)
-        // so agent.deinit() will free it when the session is destroyed.
-        //
-        // Pattern mirrors refreshToolSpecs: temp stack/heap buffer → copySlice →
-        // dupe exact slice.  This avoids realloc's ownership complexity and
-        // correctly handles the (rare) TOCTOU shrink between count()+copySlice().
-        const tools_for_session: []const Tool = if (self.tool_registry) |reg| blk: {
-            const n = reg.count();
-            var stack_buf: [256]Tool = undefined;
-            const heap_buf: ?[]Tool = if (n > stack_buf.len)
-                try self.allocator.alloc(Tool, n)
-            else
-                null;
-            defer if (heap_buf) |b| self.allocator.free(b);
-            const temp: []Tool = if (heap_buf) |b| b else stack_buf[0..n];
-            const filled = reg.copySlice(temp);
-            break :blk try self.allocator.dupe(Tool, temp[0..filled]);
-        } else self.tools;
-        // Use a nullable sentinel so we can cancel the errdefer once ownership
-        // transfers to the agent (agent.deinit will free it via tools_owned).
-        var tools_errcleanup: ?[]const Tool = if (self.tool_registry != null) tools_for_session else null;
-        errdefer if (tools_errcleanup) |t| self.allocator.free(t);
-
-        var agent = try Agent.fromConfigWithChannelModel(
+        var agent = try Agent.fromConfig(
             self.allocator,
             self.config,
             self.provider,
-            tools_for_session,
+            self.tools,
             self.mem,
             self.observer,
-            mo.model,
         );
-        // Transfer ownership: agent.deinit() frees the snapshot buffer.
-        // Disable the errdefer so we don't double-free on later errors.
-        if (self.tool_registry != null) agent.tools_owned = true;
-        tools_errcleanup = null;
         agent.policy = self.policy;
         agent.session_store = self.session_store;
         agent.response_cache = self.response_cache;
         agent.mem_rt = self.mem_rt;
         agent.memory_session_id = owned_key;
-        // Wire dynamic registry so agent dispatches through plugin tools.
-        if (self.tool_registry) |reg| agent.registry = reg;
         if (self.config.diagnostics.token_usage_ledger_enabled) {
             agent.usage_record_callback = usageRecordForwarder;
             agent.usage_record_ctx = @ptrCast(self);
         }
-
-        // Apply remaining per-channel model overrides (provider, temperature,
-        // sub_agent/tools_reviewer fields, etc.)
-        applyModelOverride(&agent, mo);
 
         session.* = .{
             .agent = agent,
@@ -523,6 +160,7 @@ pub const SessionManager = struct {
             .last_consolidated = 0,
             .session_key = owned_key,
             .turn_count = 0,
+            .turn_running = std.atomic.Value(bool).init(false),
             .mutex = .{},
         };
         // From here, session owns agent — must deinit on error.
@@ -721,10 +359,6 @@ pub const SessionManager = struct {
 
     /// Process a message within a session context and optionally forward text deltas.
     /// Deltas are only emitted when provider streaming is active.
-    ///
-    /// Returns `error.RegistryDraining` immediately (without processing the message)
-    /// when the tool registry is mid-drain waiting for in-flight SO calls to finish.
-    /// Channel loops MUST handle this error and skip the message (do not reply).
     pub fn processMessageStreaming(
         self: *SessionManager,
         session_key: []const u8,
@@ -732,15 +366,6 @@ pub const SessionManager = struct {
         conversation_context: ?ConversationContext,
         stream_sink: ?streaming.Sink,
     ) ![]const u8 {
-        // Refuse new messages while SO libraries are being drained / unloaded.
-        // This is the single chokepoint for all channels.
-        if (self.tool_registry) |reg| {
-            if (reg.isPendingDrain()) {
-                log.warn("message rejected: tool registry is draining (plugin replacement in progress)", .{});
-                return error.RegistryDraining;
-            }
-        }
-
         const channel = if (conversation_context) |ctx| (ctx.channel orelse "unknown") else "unknown";
         const session_hash = std.hash.Wyhash.hash(0, session_key);
 
@@ -756,7 +381,7 @@ pub const SessionManager = struct {
                     session_hash,
                     content.len,
                     std.json.fmt(preview.slice, .{}),
-                    if (preview.truncated) " [truncated]" else "",
+                    if (preview.truncated) " [log preview truncated]" else "",
                 },
             );
         }
@@ -765,6 +390,11 @@ pub const SessionManager = struct {
 
         session.mutex.lock();
         defer session.mutex.unlock();
+        session.turn_running.store(true, .release);
+        defer {
+            session.turn_running.store(false, .release);
+            session.agent.clearInterruptRequest();
+        }
 
         // Set conversation context for this turn (Signal-specific for now)
         session.agent.conversation_context = conversation_context;
@@ -787,179 +417,9 @@ pub const SessionManager = struct {
             session.agent.stream_ctx = null;
         }
 
-        // ── Load skills for channel hooks ──
-        const hook_skills = loadSessionSkills(self.allocator, session.agent.workspace_dir);
-        defer if (hook_skills) |hs| skills_mod.freeSkills(self.allocator, hs);
-
-        // ── on_channel_receive_before hook ──
-        var effective_content = content;
-        var effective_content_owned = false;
-        defer if (effective_content_owned) self.allocator.free(effective_content);
-
-        if (hook_skills) |hs| {
-            if (skills_mod.hasSkillsForTrigger(hs, .on_channel_receive_before)) {
-                // 1. Run all [action:agent] skills in chain
-                const agent_skills = skills_mod.collectAgentSkills(self.allocator, hs, .on_channel_receive_before) catch &.{};
-                defer if (agent_skills.len > 0) self.allocator.free(agent_skills);
-                var hook_result = session.agent.runSkillSubAgentChain(self.allocator, agent_skills, content);
-                defer skills_mod.freeHookResult(self.allocator, &hook_result);
-
-                // 2. If chain didn't intercept, run plain skills
-                if (hook_result.action != .intercept and hook_result.action != .agent_error) {
-                    const effective = if (hook_result.action == .continue_with and hook_result.content.len > 0) hook_result.content else content;
-                    var plain_result = skills_mod.evaluateSkillHook(self.allocator, hs, .on_channel_receive_before, effective) catch skills_mod.SkillHookResult{};
-                    if (plain_result.action == .continue_with or plain_result.action == .intercept or plain_result.action == .agent_error) {
-                        skills_mod.freeHookResult(self.allocator, &hook_result);
-                        hook_result = plain_result;
-                    } else {
-                        skills_mod.freeHookResult(self.allocator, &plain_result);
-                    }
-                }
-
-                switch (hook_result.action) {
-                    .agent_error => {
-                        const err_response = if (hook_result.content.len > 0)
-                            try self.allocator.dupe(u8, hook_result.content)
-                        else
-                            try self.allocator.dupe(u8, "[skill hook agent error]");
-                        return err_response;
-                    },
-                    .intercept => {
-                        const intercept_response = if (hook_result.content.len > 0)
-                            try self.allocator.dupe(u8, hook_result.content)
-                        else
-                            try self.allocator.dupe(u8, "[intercepted by on_channel_receive_before hook]");
-                        return intercept_response;
-                    },
-                    .continue_with => {
-                        if (hook_result.content.len > 0) {
-                            effective_content = try self.allocator.dupe(u8, hook_result.content);
-                            effective_content_owned = true;
-                        }
-                    },
-                    .passthrough, .agent, .async_agent => {},
-                }
-            }
-        }
-
-        const response = try session.agent.turn(effective_content);
-        errdefer self.allocator.free(response);
+        const response = try session.agent.turn(content);
         session.turn_count += 1;
         session.last_active = std.time.timestamp();
-
-        // ── on_channel_receive_after hook ──
-        var post_receive_response = response;
-        var post_receive_owned = false;
-        if (hook_skills) |hs| {
-            if (skills_mod.hasSkillsForTrigger(hs, .on_channel_receive_after)) {
-                // 1. Run all [action:agent] skills in chain
-                const agent_skills = skills_mod.collectAgentSkills(self.allocator, hs, .on_channel_receive_after) catch &.{};
-                defer if (agent_skills.len > 0) self.allocator.free(agent_skills);
-                var hook_result = session.agent.runSkillSubAgentChain(self.allocator, agent_skills, response);
-                defer skills_mod.freeHookResult(self.allocator, &hook_result);
-
-                // 2. If chain didn't intercept, run plain skills
-                if (hook_result.action != .intercept and hook_result.action != .agent_error) {
-                    const effective = if (hook_result.action == .continue_with and hook_result.content.len > 0) hook_result.content else response;
-                    var plain_result = skills_mod.evaluateSkillHook(self.allocator, hs, .on_channel_receive_after, effective) catch skills_mod.SkillHookResult{};
-                    if (plain_result.action == .continue_with or plain_result.action == .intercept or plain_result.action == .agent_error) {
-                        skills_mod.freeHookResult(self.allocator, &hook_result);
-                        hook_result = plain_result;
-                    } else {
-                        skills_mod.freeHookResult(self.allocator, &plain_result);
-                    }
-                }
-
-                switch (hook_result.action) {
-                    .agent_error => {
-                        self.allocator.free(response);
-                        const err_response = if (hook_result.content.len > 0)
-                            try self.allocator.dupe(u8, hook_result.content)
-                        else
-                            try self.allocator.dupe(u8, "[skill hook agent error]");
-                        return err_response;
-                    },
-                    .continue_with => {
-                        if (hook_result.content.len > 0) {
-                            post_receive_response = try self.allocator.dupe(u8, hook_result.content);
-                            post_receive_owned = true;
-                        }
-                    },
-                    .intercept => {
-                        if (hook_result.content.len > 0) {
-                            self.allocator.free(response);
-                            return try self.allocator.dupe(u8, hook_result.content);
-                        }
-                    },
-                    .passthrough, .agent, .async_agent => {},
-                }
-            }
-        }
-
-        // ── on_channel_send_before hook ──
-        var send_response = post_receive_response;
-        var send_owned = false;
-        if (hook_skills) |hs| {
-            if (skills_mod.hasSkillsForTrigger(hs, .on_channel_send_before)) {
-                // 1. Run all [action:agent] skills in chain
-                const agent_skills = skills_mod.collectAgentSkills(self.allocator, hs, .on_channel_send_before) catch &.{};
-                defer if (agent_skills.len > 0) self.allocator.free(agent_skills);
-                var hook_result = session.agent.runSkillSubAgentChain(self.allocator, agent_skills, post_receive_response);
-                defer skills_mod.freeHookResult(self.allocator, &hook_result);
-
-                // 2. If chain didn't intercept, run plain skills
-                if (hook_result.action != .intercept and hook_result.action != .agent_error) {
-                    const effective = if (hook_result.action == .continue_with and hook_result.content.len > 0) hook_result.content else post_receive_response;
-                    var plain_result = skills_mod.evaluateSkillHook(self.allocator, hs, .on_channel_send_before, effective) catch skills_mod.SkillHookResult{};
-                    if (plain_result.action == .continue_with or plain_result.action == .intercept or plain_result.action == .agent_error) {
-                        skills_mod.freeHookResult(self.allocator, &hook_result);
-                        hook_result = plain_result;
-                    } else {
-                        skills_mod.freeHookResult(self.allocator, &plain_result);
-                    }
-                }
-
-                switch (hook_result.action) {
-                    .agent_error => {
-                        // Free both allocations: response (from agent.turn) and
-                        // post_receive_response (if owned, from on_channel_receive_after continue_with)
-                        self.allocator.free(response);
-                        if (post_receive_owned) self.allocator.free(post_receive_response);
-                        return if (hook_result.content.len > 0)
-                            try self.allocator.dupe(u8, hook_result.content)
-                        else
-                            try self.allocator.dupe(u8, "[skill hook agent error]");
-                    },
-                    .intercept => {
-                        self.allocator.free(response);
-                        if (post_receive_owned) self.allocator.free(post_receive_response);
-                        return if (hook_result.content.len > 0)
-                            try self.allocator.dupe(u8, hook_result.content)
-                        else
-                            try self.allocator.dupe(u8, "[intercepted by on_channel_send_before hook]");
-                    },
-                    .continue_with => {
-                        if (hook_result.content.len > 0) {
-                            send_response = try self.allocator.dupe(u8, hook_result.content);
-                            send_owned = true;
-                        }
-                    },
-                    .passthrough, .agent, .async_agent => {},
-                }
-            }
-        }
-
-        // Determine the final response to return
-        const final_response = if (send_owned) blk: {
-            // Always free the original response from agent.turn(), then
-            // conditionally free post_receive_response if it was a separate allocation.
-            self.allocator.free(response);
-            if (post_receive_owned) self.allocator.free(post_receive_response);
-            break :blk send_response;
-        } else if (post_receive_owned) blk: {
-            self.allocator.free(response);
-            break :blk post_receive_response;
-        } else response;
 
         // Track consolidation timestamp
         if (session.agent.last_turn_compacted) {
@@ -970,54 +430,57 @@ pub const SessionManager = struct {
         if (self.session_store) |store| {
             const trimmed = std.mem.trim(u8, content, " \t\r\n");
             if (slashClearsSession(trimmed)) {
+                // Clear persisted messages on session reset
                 store.clearMessages(session_key) catch {};
+                // Clear stale auto-saved memories
                 store.clearAutoSaved(session_key) catch {};
             } else if (!std.mem.startsWith(u8, trimmed, "/")) {
+                // Persist user + assistant messages (skip slash commands)
                 store.saveMessage(session_key, "user", content) catch {};
-                store.saveMessage(session_key, "assistant", final_response) catch {};
+                store.saveMessage(session_key, "assistant", response) catch {};
             }
         }
 
         if (self.config.diagnostics.log_message_payloads) {
-            const preview = messageLogPreview(final_response);
+            const preview = messageLogPreview(response);
             log.info(
                 "message outbound channel={s} session=0x{x} bytes={d} content={f}{s}",
                 .{
                     channel,
                     session_hash,
-                    final_response.len,
+                    response.len,
                     std.json.fmt(preview.slice, .{}),
-                    if (preview.truncated) " [truncated]" else "",
+                    if (preview.truncated) " [log preview truncated]" else "",
                 },
             );
         }
 
-        // ── on_channel_send_after hook (fire-and-forget, does not modify return) ──
-        if (hook_skills) |hs| {
-            if (skills_mod.hasSkillsForTrigger(hs, .on_channel_send_after)) {
-                // 1. Run all [action:agent] skills in chain
-                const agent_skills = skills_mod.collectAgentSkills(self.allocator, hs, .on_channel_send_after) catch &.{};
-                defer if (agent_skills.len > 0) self.allocator.free(agent_skills);
-                var hook_result = session.agent.runSkillSubAgentChain(self.allocator, agent_skills, final_response);
+        return response;
+    }
 
-                // 2. If chain didn't intercept, run plain skills
-                if (hook_result.action != .intercept and hook_result.action != .agent_error) {
-                    const effective = if (hook_result.action == .continue_with and hook_result.content.len > 0) hook_result.content else final_response;
-                    var plain_result = skills_mod.evaluateSkillHook(self.allocator, hs, .on_channel_send_after, effective) catch skills_mod.SkillHookResult{};
-                    if (plain_result.action == .continue_with or plain_result.action == .intercept or plain_result.action == .agent_error) {
-                        skills_mod.freeHookResult(self.allocator, &hook_result);
-                        hook_result = plain_result;
-                    } else {
-                        skills_mod.freeHookResult(self.allocator, &plain_result);
-                    }
-                }
+    pub const InterruptRequestResult = struct {
+        requested: bool = false,
+        active_tool: ?[]u8 = null,
 
-                skills_mod.freeHookResult(self.allocator, &hook_result);
-                // on_channel_send_after is observational — response already committed
-            }
+        pub fn deinit(self: *InterruptRequestResult, allocator: Allocator) void {
+            if (self.active_tool) |name| allocator.free(name);
+            self.active_tool = null;
         }
+    };
 
-        return final_response;
+    /// Request interruption of a currently running turn for a session.
+    /// Returns whether it was signaled and the active tool snapshot (if any).
+    pub fn requestTurnInterrupt(self: *SessionManager, session_key: []const u8) InterruptRequestResult {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const session = self.sessions.get(session_key) orelse return .{};
+        if (!session.turn_running.load(.acquire)) return .{};
+        session.agent.requestInterrupt();
+        return .{
+            .requested = true,
+            .active_tool = session.agent.snapshotActiveToolName(self.allocator) catch null,
+        };
     }
 
     /// Number of active sessions.
@@ -1578,8 +1041,50 @@ test "session has correct initial state" {
 
     const s = try sm.getOrCreate("test:init");
     try testing.expectEqual(@as(u64, 0), s.turn_count);
+    try testing.expect(!s.turn_running.load(.acquire));
     try testing.expect(!s.agent.has_system_prompt);
     try testing.expectEqual(@as(usize, 0), s.agent.historyLen());
+}
+
+test "requestTurnInterrupt signals only active sessions" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session = try sm.getOrCreate("interrupt:1");
+    var none = sm.requestTurnInterrupt("interrupt:1");
+    defer none.deinit(testing.allocator);
+    try testing.expect(!none.requested);
+
+    session.turn_running.store(true, .release);
+    defer session.turn_running.store(false, .release);
+    var yes = sm.requestTurnInterrupt("interrupt:1");
+    defer yes.deinit(testing.allocator);
+    try testing.expect(yes.requested);
+    try testing.expect(session.agent.interrupt_requested.load(.acquire));
+}
+
+test "requestTurnInterrupt returns active tool snapshot when available" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session = try sm.getOrCreate("interrupt:tool");
+    session.turn_running.store(true, .release);
+    defer session.turn_running.store(false, .release);
+
+    session.agent.tool_state_mu.lock();
+    if (session.agent.active_tool_name) |old| testing.allocator.free(old);
+    session.agent.active_tool_name = try testing.allocator.dupe(u8, "shell");
+    session.agent.tool_state_mu.unlock();
+
+    var res = sm.requestTurnInterrupt("interrupt:tool");
+    defer res.deinit(testing.allocator);
+    try testing.expect(res.requested);
+    try testing.expect(res.active_tool != null);
+    try testing.expectEqualStrings("shell", res.active_tool.?);
 }
 
 // ---------------------------------------------------------------------------
@@ -1999,7 +1504,7 @@ test "concurrent getOrCreate same key — single Session created" {
     var handles: [num_threads]std.Thread = undefined;
 
     for (0..num_threads) |t| {
-        handles[t] = try std.Thread.spawn(.{ .stack_size = 64 * 1024 }, struct {
+        handles[t] = try std.Thread.spawn(.{ .stack_size = thread_stacks.COORDINATION_STACK_SIZE }, struct {
             fn run(mgr: *SessionManager, out: **Session) void {
                 out.* = mgr.getOrCreate("shared:key") catch unreachable;
             }
@@ -2029,7 +1534,7 @@ test "concurrent getOrCreate different keys — separate Sessions" {
 
     for (0..num_threads) |t| {
         keys[t] = std.fmt.bufPrint(&key_bufs[t], "key:{d}", .{t}) catch "?";
-        handles[t] = try std.Thread.spawn(.{ .stack_size = 64 * 1024 }, struct {
+        handles[t] = try std.Thread.spawn(.{ .stack_size = thread_stacks.COORDINATION_STACK_SIZE }, struct {
             fn run(mgr: *SessionManager, key: []const u8, out: **Session) void {
                 out.* = mgr.getOrCreate(key) catch unreachable;
             }
@@ -2060,7 +1565,9 @@ test "concurrent processMessage different keys — no crash" {
 
     for (0..num_threads) |t| {
         keys[t] = std.fmt.bufPrint(&key_bufs[t], "conc:{d}", .{t}) catch "?";
-        handles[t] = try std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, struct {
+        // Match the runtime worker stack budget used for threaded session
+        // turns so this test exercises concurrency rather than a tiny stack.
+        handles[t] = try std.Thread.spawn(.{ .stack_size = thread_stacks.SESSION_TURN_STACK_SIZE }, struct {
             fn run(mgr: *SessionManager, key: []const u8, alloc: Allocator) void {
                 for (0..3) |_| {
                     const resp = mgr.processMessage(key, "hello", null) catch return;
@@ -2095,7 +1602,9 @@ test "concurrent processMessage with sqlite memory does not panic" {
 
     for (0..num_threads) |t| {
         keys[t] = std.fmt.bufPrint(&key_bufs[t], "sqlite-conc:{d}", .{t}) catch "?";
-        handles[t] = try std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, struct {
+        // This path still executes a full session turn, so keep it aligned
+        // with the runtime stack budget for threaded message processing.
+        handles[t] = try std.Thread.spawn(.{ .stack_size = thread_stacks.SESSION_TURN_STACK_SIZE }, struct {
             fn run(mgr: *SessionManager, key: []const u8, alloc: Allocator, failed_flag: *std.atomic.Value(bool)) void {
                 for (0..5) |_| {
                     const resp = mgr.processMessage(key, "hello sqlite", null) catch {
@@ -2189,591 +1698,4 @@ test "reloadSkillsAll does not affect session count" {
 
     _ = sm.reloadSkillsAll();
     try testing.expectEqual(@as(usize, 2), sm.sessionCount());
-}
-
-// ---------------------------------------------------------------------------
-// 7. applyModelOverride sub-agent / tools-reviewer fallback tests
-// ---------------------------------------------------------------------------
-
-test "applyModelOverride sets sub_agent_model from channel override" {
-    var mock = MockProvider{ .response = "ok" };
-    const cfg = testConfig();
-    var sm = testSessionManager(testing.allocator, &mock, &cfg);
-    defer sm.deinit();
-
-    const s = try sm.getOrCreate("override:sa1");
-    // Simulate global sub_agent_model already set on agent
-    s.agent.sub_agent_model = "global/sub-agent-model";
-
-    // Channel override explicitly sets sub_agent_model
-    SessionManager.applyModelOverride(&s.agent, .{
-        .sub_agent_model = "channel/sub-agent-model",
-    });
-    try testing.expectEqualStrings("channel/sub-agent-model", s.agent.sub_agent_model.?);
-}
-
-test "applyModelOverride sub_agent_model falls back to channel general model" {
-    var mock = MockProvider{ .response = "ok" };
-    const cfg = testConfig();
-    var sm = testSessionManager(testing.allocator, &mock, &cfg);
-    defer sm.deinit();
-
-    const s = try sm.getOrCreate("override:sa2");
-    s.agent.sub_agent_model = "global/sub-agent-model";
-
-    // Channel has general model but no sub_agent_model
-    SessionManager.applyModelOverride(&s.agent, .{
-        .model = "channel/general-model",
-    });
-    // sub_agent_model should use channel's general model
-    try testing.expectEqualStrings("channel/general-model", s.agent.sub_agent_model.?);
-}
-
-test "applyModelOverride sub_agent_model keeps global when no channel override" {
-    var mock = MockProvider{ .response = "ok" };
-    const cfg = testConfig();
-    var sm = testSessionManager(testing.allocator, &mock, &cfg);
-    defer sm.deinit();
-
-    const s = try sm.getOrCreate("override:sa3");
-    s.agent.sub_agent_model = "global/sub-agent-model";
-
-    // Channel override has no model and no sub_agent_model
-    SessionManager.applyModelOverride(&s.agent, .{
-        .temperature = 0.5,
-    });
-    // sub_agent_model should stay as global
-    try testing.expectEqualStrings("global/sub-agent-model", s.agent.sub_agent_model.?);
-}
-
-test "applyModelOverride sub_agent_model channel-specific beats channel general" {
-    var mock = MockProvider{ .response = "ok" };
-    const cfg = testConfig();
-    var sm = testSessionManager(testing.allocator, &mock, &cfg);
-    defer sm.deinit();
-
-    const s = try sm.getOrCreate("override:sa4");
-    s.agent.sub_agent_model = "global/sub-agent-model";
-
-    // Channel has both general model and sub_agent_model
-    SessionManager.applyModelOverride(&s.agent, .{
-        .model = "channel/general-model",
-        .sub_agent_model = "channel/sub-agent-specific",
-    });
-    // sub_agent_model should use the channel-specific one, not general
-    try testing.expectEqualStrings("channel/sub-agent-specific", s.agent.sub_agent_model.?);
-}
-
-test "applyModelOverride tools_reviewer_model from channel override" {
-    var mock = MockProvider{ .response = "ok" };
-    const cfg = testConfig();
-    var sm = testSessionManager(testing.allocator, &mock, &cfg);
-    defer sm.deinit();
-
-    const s = try sm.getOrCreate("override:tr1");
-    s.agent.tools_reviewer_model = "global/tools-reviewer-model";
-
-    SessionManager.applyModelOverride(&s.agent, .{
-        .tools_reviewer_model = "channel/tools-reviewer-model",
-    });
-    try testing.expectEqualStrings("channel/tools-reviewer-model", s.agent.tools_reviewer_model.?);
-}
-
-test "applyModelOverride tools_reviewer_model falls back to channel general model" {
-    var mock = MockProvider{ .response = "ok" };
-    const cfg = testConfig();
-    var sm = testSessionManager(testing.allocator, &mock, &cfg);
-    defer sm.deinit();
-
-    const s = try sm.getOrCreate("override:tr2");
-    s.agent.tools_reviewer_model = "global/tools-reviewer-model";
-
-    SessionManager.applyModelOverride(&s.agent, .{
-        .model = "channel/general-model",
-    });
-    try testing.expectEqualStrings("channel/general-model", s.agent.tools_reviewer_model.?);
-}
-
-test "applyModelOverride tools_reviewer_model keeps global when no channel override" {
-    var mock = MockProvider{ .response = "ok" };
-    const cfg = testConfig();
-    var sm = testSessionManager(testing.allocator, &mock, &cfg);
-    defer sm.deinit();
-
-    const s = try sm.getOrCreate("override:tr3");
-    s.agent.tools_reviewer_model = "global/tools-reviewer-model";
-
-    SessionManager.applyModelOverride(&s.agent, .{
-        .temperature = 0.5,
-    });
-    try testing.expectEqualStrings("global/tools-reviewer-model", s.agent.tools_reviewer_model.?);
-}
-
-test "applyModelOverride sub_agent_provider from channel override" {
-    var mock = MockProvider{ .response = "ok" };
-    const cfg = testConfig();
-    var sm = testSessionManager(testing.allocator, &mock, &cfg);
-    defer sm.deinit();
-
-    const s = try sm.getOrCreate("override:sap1");
-    s.agent.sub_agent_provider = null;
-
-    SessionManager.applyModelOverride(&s.agent, .{
-        .sub_agent_provider = "anthropic",
-    });
-    try testing.expectEqualStrings("anthropic", s.agent.sub_agent_provider.?);
-}
-
-test "applyModelOverride sub_agent_provider falls back to channel general provider" {
-    var mock = MockProvider{ .response = "ok" };
-    const cfg = testConfig();
-    var sm = testSessionManager(testing.allocator, &mock, &cfg);
-    defer sm.deinit();
-
-    const s = try sm.getOrCreate("override:sap2");
-    s.agent.sub_agent_provider = null;
-
-    SessionManager.applyModelOverride(&s.agent, .{
-        .provider = "openrouter",
-    });
-    try testing.expectEqualStrings("openrouter", s.agent.sub_agent_provider.?);
-}
-
-test "applyModelOverride tools_reviewer_provider from channel override" {
-    var mock = MockProvider{ .response = "ok" };
-    const cfg = testConfig();
-    var sm = testSessionManager(testing.allocator, &mock, &cfg);
-    defer sm.deinit();
-
-    const s = try sm.getOrCreate("override:trp1");
-    s.agent.tools_reviewer_provider = null;
-
-    SessionManager.applyModelOverride(&s.agent, .{
-        .tools_reviewer_provider = "gemini",
-    });
-    try testing.expectEqualStrings("gemini", s.agent.tools_reviewer_provider.?);
-}
-
-test "applyModelOverride tools_reviewer_provider falls back to channel general provider" {
-    var mock = MockProvider{ .response = "ok" };
-    const cfg = testConfig();
-    var sm = testSessionManager(testing.allocator, &mock, &cfg);
-    defer sm.deinit();
-
-    const s = try sm.getOrCreate("override:trp2");
-    s.agent.tools_reviewer_provider = null;
-
-    SessionManager.applyModelOverride(&s.agent, .{
-        .provider = "openai",
-    });
-    try testing.expectEqualStrings("openai", s.agent.tools_reviewer_provider.?);
-}
-
-// ---------------------------------------------------------------------------
-// 8. applyModelOverride unified fields: temperature no-cascade, base_url, max_context_tokens
-// ---------------------------------------------------------------------------
-
-test "applyModelOverride: general temperature does NOT cascade to sub_agent" {
-    var mock = MockProvider{ .response = "ok" };
-    const cfg = testConfig();
-    var sm = testSessionManager(testing.allocator, &mock, &cfg);
-    defer sm.deinit();
-
-    const s = try sm.getOrCreate("override:temp_nocascade1");
-    // Agent starts with sub_agent_temperature from global init (null = use compiled default 0.3)
-    s.agent.sub_agent_temperature = null;
-    s.agent.tools_reviewer_temperature = null;
-
-    // Channel override sets general temperature but NOT sub_agent/tools_reviewer temperature
-    SessionManager.applyModelOverride(&s.agent, .{
-        .temperature = 0.9,
-    });
-    // General temperature IS applied
-    try testing.expectEqual(@as(f64, 0.9), s.agent.temperature);
-    // sub_agent_temperature must remain null (compiled default 0.3 will be used at call time)
-    try testing.expect(s.agent.sub_agent_temperature == null);
-    // tools_reviewer_temperature must remain null (compiled default 0.1 will be used at call time)
-    try testing.expect(s.agent.tools_reviewer_temperature == null);
-}
-
-test "applyModelOverride: explicit sub_agent_temperature overrides agent value" {
-    var mock = MockProvider{ .response = "ok" };
-    const cfg = testConfig();
-    var sm = testSessionManager(testing.allocator, &mock, &cfg);
-    defer sm.deinit();
-
-    const s = try sm.getOrCreate("override:temp_explicit1");
-    s.agent.sub_agent_temperature = null;
-
-    SessionManager.applyModelOverride(&s.agent, .{
-        .sub_agent_temperature = 0.5,
-    });
-    try testing.expect(@abs(s.agent.sub_agent_temperature.? - 0.5) < 0.001);
-}
-
-test "applyModelOverride: explicit tools_reviewer_temperature overrides agent value" {
-    var mock = MockProvider{ .response = "ok" };
-    const cfg = testConfig();
-    var sm = testSessionManager(testing.allocator, &mock, &cfg);
-    defer sm.deinit();
-
-    const s = try sm.getOrCreate("override:temp_explicit2");
-    s.agent.tools_reviewer_temperature = null;
-
-    SessionManager.applyModelOverride(&s.agent, .{
-        .tools_reviewer_temperature = 0.2,
-    });
-    try testing.expect(@abs(s.agent.tools_reviewer_temperature.? - 0.2) < 0.001);
-}
-
-test "applyModelOverride: sub_agent_max_context_tokens only set when > 0" {
-    var mock = MockProvider{ .response = "ok" };
-    const cfg = testConfig();
-    var sm = testSessionManager(testing.allocator, &mock, &cfg);
-    defer sm.deinit();
-
-    const s = try sm.getOrCreate("override:sa_ctx1");
-    s.agent.sub_agent_max_context_tokens = 8192;
-
-    // Override with 0 → keeps existing
-    SessionManager.applyModelOverride(&s.agent, .{
-        .sub_agent_max_context_tokens = 0,
-    });
-    try testing.expectEqual(@as(u64, 8192), s.agent.sub_agent_max_context_tokens);
-
-    // Override with > 0 → applies
-    SessionManager.applyModelOverride(&s.agent, .{
-        .sub_agent_max_context_tokens = 16384,
-    });
-    try testing.expectEqual(@as(u64, 16384), s.agent.sub_agent_max_context_tokens);
-}
-
-test "applyModelOverride: sub_agent_base_url only set when non-null" {
-    var mock = MockProvider{ .response = "ok" };
-    const cfg = testConfig();
-    var sm = testSessionManager(testing.allocator, &mock, &cfg);
-    defer sm.deinit();
-
-    const s = try sm.getOrCreate("override:sa_url1");
-    s.agent.sub_agent_base_url = "https://existing.example.com";
-
-    // Override with null → keeps existing
-    SessionManager.applyModelOverride(&s.agent, .{
-        .sub_agent_base_url = null,
-    });
-    try testing.expectEqualStrings("https://existing.example.com", s.agent.sub_agent_base_url.?);
-
-    // Override with value → applies
-    SessionManager.applyModelOverride(&s.agent, .{
-        .sub_agent_base_url = "https://new.example.com",
-    });
-    try testing.expectEqualStrings("https://new.example.com", s.agent.sub_agent_base_url.?);
-}
-
-test "applyModelOverride: sub_agent_max_iterations and review_after per-channel" {
-    var mock = MockProvider{ .response = "ok" };
-    const cfg = testConfig();
-    var sm = testSessionManager(testing.allocator, &mock, &cfg);
-    defer sm.deinit();
-
-    const s = try sm.getOrCreate("override:sa_iters1");
-    s.agent.sub_agent_max_iterations = 5;
-    s.agent.sub_agent_review_after = 3;
-
-    // Override with 0 → keeps existing
-    SessionManager.applyModelOverride(&s.agent, .{
-        .sub_agent_max_iterations = 0,
-        .sub_agent_review_after = 0,
-    });
-    try testing.expectEqual(@as(u32, 5), s.agent.sub_agent_max_iterations);
-    try testing.expectEqual(@as(u32, 3), s.agent.sub_agent_review_after);
-
-    // Override with > 0 → applies
-    SessionManager.applyModelOverride(&s.agent, .{
-        .sub_agent_max_iterations = 10,
-        .sub_agent_review_after = 7,
-    });
-    try testing.expectEqual(@as(u32, 10), s.agent.sub_agent_max_iterations);
-    try testing.expectEqual(@as(u32, 7), s.agent.sub_agent_review_after);
-}
-
-test "applyModelOverride full fallback chain: channel sub_agent > channel general > global sub_agent" {
-    var mock = MockProvider{ .response = "ok" };
-    const cfg = testConfig();
-    var sm = testSessionManager(testing.allocator, &mock, &cfg);
-    defer sm.deinit();
-
-    // Test 1: global sub_agent_model set, no channel override → keeps global
-    {
-        const s = try sm.getOrCreate("override:chain1");
-        s.agent.sub_agent_model = "global/sa";
-        s.agent.sub_agent_provider = "global-prov";
-        s.agent.tools_reviewer_model = "global/tr";
-        s.agent.tools_reviewer_provider = "global-prov";
-
-        SessionManager.applyModelOverride(&s.agent, .{});
-
-        try testing.expectEqualStrings("global/sa", s.agent.sub_agent_model.?);
-        try testing.expectEqualStrings("global-prov", s.agent.sub_agent_provider.?);
-        try testing.expectEqualStrings("global/tr", s.agent.tools_reviewer_model.?);
-        try testing.expectEqualStrings("global-prov", s.agent.tools_reviewer_provider.?);
-    }
-
-    // Test 2: global sub_agent_model set, channel has general model → channel general wins
-    {
-        const s = try sm.getOrCreate("override:chain2");
-        s.agent.sub_agent_model = "global/sa";
-        s.agent.sub_agent_provider = "global-prov";
-
-        SessionManager.applyModelOverride(&s.agent, .{
-            .provider = "ch-prov",
-            .model = "ch/general",
-        });
-
-        try testing.expectEqualStrings("ch/general", s.agent.sub_agent_model.?);
-        try testing.expectEqualStrings("ch-prov", s.agent.sub_agent_provider.?);
-    }
-
-    // Test 3: global + channel general + channel specific → channel specific wins
-    {
-        const s = try sm.getOrCreate("override:chain3");
-        s.agent.sub_agent_model = "global/sa";
-        s.agent.sub_agent_provider = "global-prov";
-
-        SessionManager.applyModelOverride(&s.agent, .{
-            .provider = "ch-prov",
-            .model = "ch/general",
-            .sub_agent_provider = "ch-sa-prov",
-            .sub_agent_model = "ch/sa-specific",
-        });
-
-        try testing.expectEqualStrings("ch/sa-specific", s.agent.sub_agent_model.?);
-        try testing.expectEqualStrings("ch-sa-prov", s.agent.sub_agent_provider.?);
-    }
-}
-
-test "updateModelParamsExcludingPrefixes skips mqtt and redis_stream sessions" {
-    var mock = MockProvider{ .response = "ok" };
-    const cfg = testConfig();
-    var sm = testSessionManager(testing.allocator, &mock, &cfg);
-    defer sm.deinit();
-
-    // Create sessions across multiple channel types
-    _ = try sm.getOrCreate("telegram:default:user1");
-    _ = try sm.getOrCreate("discord:default:user2");
-    _ = try sm.getOrCreate("slack:default:user3");
-    _ = try sm.getOrCreate("mqtt:account1:topic1");
-    _ = try sm.getOrCreate("redis_stream:account2:topic2");
-
-    const exclude = &[_][]const u8{ "mqtt:", "redis_stream:" };
-    const updated = sm.updateModelParamsExcludingPrefixes(.{ .model = "global-new" }, exclude);
-
-    // Only Telegram, Discord, Slack should be updated (3), not MQTT/RS (2)
-    try testing.expectEqual(@as(usize, 3), updated);
-
-    // Verify non-excluded sessions were updated
-    const s_tg = try sm.getOrCreate("telegram:default:user1");
-    try testing.expectEqualStrings("global-new", s_tg.agent.default_model);
-    const s_dc = try sm.getOrCreate("discord:default:user2");
-    try testing.expectEqualStrings("global-new", s_dc.agent.default_model);
-    const s_sl = try sm.getOrCreate("slack:default:user3");
-    try testing.expectEqualStrings("global-new", s_sl.agent.default_model);
-
-    // Verify excluded sessions were NOT updated
-    const s_mqtt = try sm.getOrCreate("mqtt:account1:topic1");
-    try testing.expectEqualStrings("test/mock-model", s_mqtt.agent.default_model);
-    const s_rs = try sm.getOrCreate("redis_stream:account2:topic2");
-    try testing.expectEqualStrings("test/mock-model", s_rs.agent.default_model);
-}
-
-test "updateModelParamsExcludingPrefixes with empty exclude updates all" {
-    var mock = MockProvider{ .response = "ok" };
-    const cfg = testConfig();
-    var sm = testSessionManager(testing.allocator, &mock, &cfg);
-    defer sm.deinit();
-
-    _ = try sm.getOrCreate("telegram:default:user1");
-    _ = try sm.getOrCreate("mqtt:account1:topic1");
-
-    const exclude = &[_][]const u8{};
-    const updated = sm.updateModelParamsExcludingPrefixes(.{ .model = "all-new" }, exclude);
-    try testing.expectEqual(@as(usize, 2), updated);
-
-    const s1 = try sm.getOrCreate("telegram:default:user1");
-    try testing.expectEqualStrings("all-new", s1.agent.default_model);
-    const s2 = try sm.getOrCreate("mqtt:account1:topic1");
-    try testing.expectEqualStrings("all-new", s2.agent.default_model);
-}
-
-test "updateModelParamsExcludingPrefixes covers all non-endpoint channel types" {
-    var mock = MockProvider{ .response = "ok" };
-    const cfg = testConfig();
-    var sm = testSessionManager(testing.allocator, &mock, &cfg);
-    defer sm.deinit();
-
-    // Create sessions for many different channel types
-    _ = try sm.getOrCreate("telegram:default:u1");
-    _ = try sm.getOrCreate("discord:default:u2");
-    _ = try sm.getOrCreate("slack:default:u3");
-    _ = try sm.getOrCreate("signal:default:u4");
-    _ = try sm.getOrCreate("matrix:default:u5");
-    _ = try sm.getOrCreate("irc:default:u6");
-    _ = try sm.getOrCreate("web:default:u7");
-    _ = try sm.getOrCreate("whatsapp:default:u8");
-    _ = try sm.getOrCreate("mattermost:default:u9");
-    _ = try sm.getOrCreate("imessage:default:u10");
-    _ = try sm.getOrCreate("mqtt:a1:t1");
-    _ = try sm.getOrCreate("redis_stream:a2:t2");
-
-    const exclude = &[_][]const u8{ "mqtt:", "redis_stream:" };
-    const updated = sm.updateModelParamsExcludingPrefixes(.{ .provider = "new-prov" }, exclude);
-
-    // 10 non-endpoint channels updated, 2 endpoint channels skipped
-    try testing.expectEqual(@as(usize, 10), updated);
-
-    // Spot-check a few updated sessions
-    const s_tg = try sm.getOrCreate("telegram:default:u1");
-    try testing.expectEqualStrings("new-prov", s_tg.agent.default_provider);
-    const s_web = try sm.getOrCreate("web:default:u7");
-    try testing.expectEqualStrings("new-prov", s_web.agent.default_provider);
-
-    // Verify MQTT/RS not updated
-    const s_mqtt = try sm.getOrCreate("mqtt:a1:t1");
-    try testing.expect(s_mqtt.agent.default_provider.len > 0);
-    try testing.expect(!std.mem.eql(u8, s_mqtt.agent.default_provider, "new-prov"));
-}
-
-test "refreshNonModelConfig updates config-derived fields on all sessions" {
-    var mock = MockProvider{ .response = "ok" };
-    const cfg = testConfig();
-    var sm = testSessionManager(testing.allocator, &mock, &cfg);
-    defer sm.deinit();
-
-    _ = try sm.getOrCreate("telegram:default:user1");
-    _ = try sm.getOrCreate("discord:default:user2");
-
-    // Build a new config with different non-model settings
-    var new_cfg = testConfig();
-    new_cfg.reasoning_effort = "high";
-    new_cfg.agent.max_tool_iterations = 42;
-    new_cfg.agent.max_history_messages = 200;
-    new_cfg.agent.status_show_emojis = false;
-    new_cfg.autonomy.level = .read_only;
-
-    const exclude = &[_][]const u8{ "mqtt:", "redis_stream:" };
-    const refreshed = sm.refreshNonModelConfig(&new_cfg, exclude);
-    try testing.expectEqual(@as(usize, 2), refreshed);
-
-    const s1 = try sm.getOrCreate("telegram:default:user1");
-    try testing.expectEqualStrings("high", s1.agent.reasoning_effort.?);
-    try testing.expectEqual(@as(u32, 42), s1.agent.max_tool_iterations);
-    try testing.expectEqual(@as(u32, 200), s1.agent.max_history_messages);
-    try testing.expect(!s1.agent.status_show_emojis);
-    try testing.expectEqualStrings("deny", s1.agent.exec_security.toSlice());
-    try testing.expectEqualStrings("off", s1.agent.exec_ask.toSlice());
-
-    const s2 = try sm.getOrCreate("discord:default:user2");
-    try testing.expectEqualStrings("high", s2.agent.reasoning_effort.?);
-    try testing.expectEqual(@as(u32, 42), s2.agent.max_tool_iterations);
-}
-
-test "refreshNonModelConfig does not change model fields" {
-    var mock = MockProvider{ .response = "ok" };
-    const cfg = testConfig();
-    var sm = testSessionManager(testing.allocator, &mock, &cfg);
-    defer sm.deinit();
-
-    _ = try sm.getOrCreate("telegram:default:user1");
-
-    // Change the default_model in the new config — refreshNonModelConfig should NOT touch it
-    var new_cfg = testConfig();
-    new_cfg.default_model = "other/model";
-    new_cfg.reasoning_effort = "low";
-
-    const no_exclude = &[_][]const u8{};
-    _ = sm.refreshNonModelConfig(&new_cfg, no_exclude);
-
-    const s = try sm.getOrCreate("telegram:default:user1");
-    // model_name should still be the original
-    try testing.expectEqualStrings("test/mock-model", s.agent.model_name);
-    // but reasoning_effort should be updated
-    try testing.expectEqualStrings("low", s.agent.reasoning_effort.?);
-}
-
-test "refreshNonModelConfig excludes mqtt and redis_stream sessions" {
-    var mock = MockProvider{ .response = "ok" };
-    const cfg = testConfig();
-    var sm = testSessionManager(testing.allocator, &mock, &cfg);
-    defer sm.deinit();
-
-    _ = try sm.getOrCreate("telegram:default:user1");
-    _ = try sm.getOrCreate("mqtt:account1:topic1");
-    _ = try sm.getOrCreate("redis_stream:account2:topic2");
-
-    var new_cfg = testConfig();
-    new_cfg.agent.sub_agent_max_iterations = 99;
-    new_cfg.agent.sub_agent_review_after = 77;
-    new_cfg.reasoning_effort = "high";
-
-    const exclude = &[_][]const u8{ "mqtt:", "redis_stream:" };
-    const refreshed = sm.refreshNonModelConfig(&new_cfg, exclude);
-
-    // Only Telegram updated (1), not MQTT/RS (2)
-    try testing.expectEqual(@as(usize, 1), refreshed);
-
-    // Telegram session got the update
-    const s_tg = try sm.getOrCreate("telegram:default:user1");
-    try testing.expectEqual(@as(u32, 99), s_tg.agent.sub_agent_max_iterations);
-    try testing.expectEqualStrings("high", s_tg.agent.reasoning_effort.?);
-
-    // MQTT session was NOT updated (still has default values)
-    const s_mqtt = try sm.getOrCreate("mqtt:account1:topic1");
-    try testing.expect(s_mqtt.agent.sub_agent_max_iterations != 99);
-    try testing.expect(s_mqtt.agent.reasoning_effort == null);
-}
-
-test "updateProvider propagates new provider to existing sessions" {
-    var mock_a = MockProvider{ .response = "provider-a" };
-    var mock_b = MockProvider{ .response = "provider-b" };
-    var cfg = testConfig();
-
-    var sm = testSessionManager(testing.allocator, &mock_a, &cfg);
-    defer sm.deinit();
-
-    // Create two sessions using the original provider.
-    const s1 = try sm.getOrCreate("telegram:default:user1");
-    const s2 = try sm.getOrCreate("telegram:default:user2");
-
-    // Both sessions should reference mock_a's vtable.
-    try testing.expectEqualStrings("mock", s1.agent.provider.getName());
-    try testing.expectEqualStrings("mock", s2.agent.provider.getName());
-
-    // Swap provider.
-    sm.updateProvider(mock_b.provider());
-
-    // Session manager and existing sessions all point to mock_b.
-    try testing.expect(sm.provider.ptr == @as(*anyopaque, @ptrCast(&mock_b)));
-    try testing.expect(s1.agent.provider.ptr == @as(*anyopaque, @ptrCast(&mock_b)));
-    try testing.expect(s2.agent.provider.ptr == @as(*anyopaque, @ptrCast(&mock_b)));
-
-    // New session also gets mock_b.
-    const s3 = try sm.getOrCreate("telegram:default:user3");
-    try testing.expect(s3.agent.provider.ptr == @as(*anyopaque, @ptrCast(&mock_b)));
-}
-
-test "processMessage returns RegistryDraining error when registry is draining" {
-    const alloc = testing.allocator;
-    var mock = MockProvider{ .response = "should not be reached" };
-    const cfg = testConfig();
-    var sm = testSessionManager(alloc, &mock, &cfg);
-    defer sm.deinit();
-
-    // Create a registry and set it as draining.
-    var reg = tools_mod.ToolRegistry.init(alloc);
-    defer reg.deinit();
-    reg.draining.store(true, .release);
-    sm.tool_registry = &reg;
-
-    const result = sm.processMessage("drain:test", "hello", null);
-    try testing.expectError(error.RegistryDraining, result);
 }

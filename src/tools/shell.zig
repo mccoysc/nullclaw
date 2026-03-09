@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const platform = @import("../platform.zig");
 const root = @import("root.zig");
 const Tool = root.Tool;
@@ -6,6 +7,7 @@ const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 const isResolvedPathAllowed = @import("path_security.zig").isResolvedPathAllowed;
 const SecurityPolicy = @import("../security/policy.zig").SecurityPolicy;
+const json_miniparse = @import("../json_miniparse.zig");
 const UNAVAILABLE_WORKSPACE_SENTINEL = "/__nullclaw_workspace_unavailable__";
 
 /// Default maximum shell command execution time (nanoseconds).
@@ -13,9 +15,43 @@ const DEFAULT_SHELL_TIMEOUT_NS: u64 = 60 * std.time.ns_per_s;
 /// Default maximum output size in bytes (1MB).
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 1_048_576;
 /// Environment variables safe to pass to shell commands.
-const SAFE_ENV_VARS = [_][]const u8{
-    "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
-};
+const SAFE_ENV_VARS: []const []const u8 = if (builtin.os.tag == .windows)
+    &.{
+        "PATH",
+        "HOME",
+        "TERM",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "USER",
+        "SHELL",
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        "SystemRoot",
+        "WINDIR",
+        "COMSPEC",
+        "PATHEXT",
+    }
+else
+    &.{
+        "PATH",
+        "HOME",
+        "TERM",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "USER",
+        "SHELL",
+        "TMPDIR",
+    };
+
+fn safeEnvVarAllowed(key: []const u8) bool {
+    for (SAFE_ENV_VARS) |allowed| {
+        if (std.mem.eql(u8, allowed, key)) return true;
+    }
+    return false;
+}
 
 fn normalizeCommandInput(command: []const u8) []const u8 {
     const trimmed = std.mem.trim(u8, command, " \t\r\n");
@@ -112,7 +148,7 @@ pub const ShellTool = struct {
         // then re-add only safe, functional variables.
         var env = std.process.EnvMap.init(allocator);
         defer env.deinit();
-        for (&SAFE_ENV_VARS) |key| {
+        for (SAFE_ENV_VARS) |key| {
             if (platform.getEnvOrNull(allocator, key)) |val| {
                 defer allocator.free(val);
                 try env.put(key, val);
@@ -134,6 +170,9 @@ pub const ShellTool = struct {
             return ToolResult{ .success = true, .output = try allocator.dupe(u8, "(no output)") };
         }
         defer allocator.free(result.stdout);
+        if (result.interrupted) {
+            return ToolResult{ .success = false, .output = "", .error_msg = "Interrupted by /stop" };
+        }
         if (result.exit_code != null) {
             const err_out = try allocator.dupe(u8, if (result.stderr.len > 0) result.stderr else "Command failed with non-zero exit code");
             return ToolResult{ .success = false, .output = "", .error_msg = err_out };
@@ -145,66 +184,17 @@ pub const ShellTool = struct {
 /// Extract a string field value from a JSON blob (minimal parser — no allocations).
 /// NOTE: Prefer root.getString() with pre-parsed ObjectMap for tool implementations.
 pub fn parseStringField(json: []const u8, key: []const u8) ?[]const u8 {
-    // Find "key": "value"
-    // Build the search pattern: "key":"  or "key" : "
-    var needle_buf: [256]u8 = undefined;
-    const quoted_key = std.fmt.bufPrint(&needle_buf, "\"{s}\"", .{key}) catch return null;
-
-    const key_pos = std.mem.indexOf(u8, json, quoted_key) orelse return null;
-    const after_key = json[key_pos + quoted_key.len ..];
-
-    // Skip whitespace and colon
-    var i: usize = 0;
-    while (i < after_key.len and (after_key[i] == ' ' or after_key[i] == ':' or after_key[i] == '\t' or after_key[i] == '\n')) : (i += 1) {}
-
-    if (i >= after_key.len or after_key[i] != '"') return null;
-    i += 1; // skip opening quote
-
-    // Find closing quote (handle escaped quotes)
-    const start = i;
-    while (i < after_key.len) : (i += 1) {
-        if (after_key[i] == '\\' and i + 1 < after_key.len) {
-            i += 1; // skip escaped char
-            continue;
-        }
-        if (after_key[i] == '"') {
-            return after_key[start..i];
-        }
-    }
-    return null;
+    return json_miniparse.parseStringField(json, key);
 }
 
 /// Extract a boolean field value from a JSON blob.
 pub fn parseBoolField(json: []const u8, key: []const u8) ?bool {
-    var needle_buf: [256]u8 = undefined;
-    const quoted_key = std.fmt.bufPrint(&needle_buf, "\"{s}\"", .{key}) catch return null;
-    const key_pos = std.mem.indexOf(u8, json, quoted_key) orelse return null;
-    const after_key = json[key_pos + quoted_key.len ..];
-
-    var i: usize = 0;
-    while (i < after_key.len and (after_key[i] == ' ' or after_key[i] == ':' or after_key[i] == '\t' or after_key[i] == '\n')) : (i += 1) {}
-
-    if (i + 4 <= after_key.len and std.mem.eql(u8, after_key[i..][0..4], "true")) return true;
-    if (i + 5 <= after_key.len and std.mem.eql(u8, after_key[i..][0..5], "false")) return false;
-    return null;
+    return json_miniparse.parseBoolField(json, key);
 }
 
 /// Extract an integer field value from a JSON blob.
 pub fn parseIntField(json: []const u8, key: []const u8) ?i64 {
-    var needle_buf: [256]u8 = undefined;
-    const quoted_key = std.fmt.bufPrint(&needle_buf, "\"{s}\"", .{key}) catch return null;
-    const key_pos = std.mem.indexOf(u8, json, quoted_key) orelse return null;
-    const after_key = json[key_pos + quoted_key.len ..];
-
-    var i: usize = 0;
-    while (i < after_key.len and (after_key[i] == ' ' or after_key[i] == ':' or after_key[i] == '\t' or after_key[i] == '\n')) : (i += 1) {}
-
-    const start = i;
-    if (i < after_key.len and after_key[i] == '-') i += 1;
-    while (i < after_key.len and after_key[i] >= '0' and after_key[i] <= '9') : (i += 1) {}
-    if (i == start) return null;
-
-    return std.fmt.parseInt(i64, after_key[start..i], 10) catch null;
+    return json_miniparse.parseIntField(json, key);
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
@@ -245,6 +235,26 @@ test "shell captures failing command" {
     try std.testing.expect(!result.success);
 }
 
+test "shell reports interruption when cancel flag is set" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    var st = ShellTool{ .workspace_dir = "." };
+    const t = st.tool();
+    const parsed = try root.parseTestArgs("{\"command\": \"sleep 5\"}");
+    defer parsed.deinit();
+
+    var cancel = std.atomic.Value(bool).init(true);
+    @import("process_util.zig").setThreadInterruptFlag(&cancel);
+    defer @import("process_util.zig").setThreadInterruptFlag(null);
+
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+
+    try std.testing.expect(!result.success);
+    try std.testing.expect(result.error_msg != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "Interrupted") != null);
+}
+
 test "shell missing command param" {
     var st = ShellTool{ .workspace_dir = "." };
     const t = st.tool();
@@ -253,6 +263,17 @@ test "shell missing command param" {
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     try std.testing.expect(!result.success);
     try std.testing.expect(result.error_msg != null);
+}
+
+test "shell safe env keeps required Windows variables" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+
+    try std.testing.expect(safeEnvVarAllowed("SystemRoot"));
+    try std.testing.expect(safeEnvVarAllowed("WINDIR"));
+    try std.testing.expect(safeEnvVarAllowed("COMSPEC"));
+    try std.testing.expect(safeEnvVarAllowed("PATHEXT"));
+    try std.testing.expect(safeEnvVarAllowed("TEMP"));
+    try std.testing.expect(safeEnvVarAllowed("TMP"));
 }
 
 test "parseStringField basic" {
@@ -288,7 +309,6 @@ test "parseIntField negative" {
 }
 
 test "shell cwd inside workspace works without allowed_paths" {
-    const builtin = @import("builtin");
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest; // pwd not available on Windows
 
     var tmp_dir = std.testing.tmpDir(.{});
@@ -310,7 +330,6 @@ test "shell cwd inside workspace works without allowed_paths" {
 }
 
 test "shell cwd outside workspace without allowed_paths is rejected" {
-    const builtin = @import("builtin");
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest; // pwd not available on Windows
 
     var tmp_dir = std.testing.tmpDir(.{});
@@ -347,7 +366,6 @@ test "shell cwd relative path is rejected" {
 }
 
 test "shell cwd with allowed_paths runs in cwd" {
-    const builtin = @import("builtin");
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest; // pwd not available on Windows
 
     var tmp_dir = std.testing.tmpDir(.{});
@@ -424,7 +442,6 @@ test "shell ApprovalRequired propagates oom for error message allocation" {
 }
 
 test "shell wildcard policy permits command outside default allowlist" {
-    const builtin = @import("builtin");
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
 
     const policy_mod = @import("../security/policy.zig");
@@ -469,8 +486,32 @@ test "shell wildcard policy permits command outside default allowlist" {
     try std.testing.expect(result.success);
 }
 
+test "shell wildcard policy allows stderr redirect to dev null" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const policy_mod = @import("../security/policy.zig");
+    var tracker = policy_mod.RateTracker.init(std.testing.allocator, 10000);
+    defer tracker.deinit();
+    var wildcard_policy = policy_mod.SecurityPolicy{
+        .autonomy = .full,
+        .workspace_dir = "/tmp",
+        .allowed_commands = &.{"*"},
+        .block_high_risk_commands = false,
+        .require_approval_for_medium_risk = false,
+        .tracker = &tracker,
+    };
+
+    var st = ShellTool{ .workspace_dir = "/tmp", .policy = &wildcard_policy };
+    const parsed = try root.parseTestArgs("{\"command\": \"ls /definitely-missing-file 2>/dev/null || echo missing\"}");
+    defer parsed.deinit();
+    const result = try st.execute(std.testing.allocator, parsed.value.object);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer if (result.error_msg) |e| std.testing.allocator.free(e);
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "missing") != null);
+}
+
 test "shell accepts markdown-fenced command payload" {
-    const builtin = @import("builtin");
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
 
     const policy_mod = @import("../security/policy.zig");
@@ -519,7 +560,6 @@ test "shell keeps subshell backticks blocked after fenced markdown normalization
 }
 
 test "shell without policy executes command" {
-    const builtin = @import("builtin");
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
 
     var st = ShellTool{ .workspace_dir = "/tmp", .policy = null };

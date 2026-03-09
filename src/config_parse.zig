@@ -364,40 +364,6 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
         }
     }
 
-    // Global sub-agent / tools-reviewer model overrides
-    if (root.get("sub_agent_provider")) |v| {
-        if (v == .string) self.sub_agent_provider = try self.allocator.dupe(u8, v.string);
-    }
-    if (root.get("sub_agent_model")) |v| {
-        if (v == .string) self.sub_agent_model = try self.allocator.dupe(u8, v.string);
-    }
-    if (root.get("sub_agent_temperature")) |v| {
-        if (v == .float) self.sub_agent_temperature = v.float;
-        if (v == .integer) self.sub_agent_temperature = @floatFromInt(v.integer);
-    }
-    if (root.get("sub_agent_max_context_tokens")) |v| {
-        if (v == .integer and v.integer >= 0) self.sub_agent_max_context_tokens = @intCast(v.integer);
-    }
-    if (root.get("sub_agent_base_url")) |v| {
-        if (v == .string) self.sub_agent_base_url = try self.allocator.dupe(u8, v.string);
-    }
-    if (root.get("tools_reviewer_provider")) |v| {
-        if (v == .string) self.tools_reviewer_provider = try self.allocator.dupe(u8, v.string);
-    }
-    if (root.get("tools_reviewer_model")) |v| {
-        if (v == .string) self.tools_reviewer_model = try self.allocator.dupe(u8, v.string);
-    }
-    if (root.get("tools_reviewer_temperature")) |v| {
-        if (v == .float) self.tools_reviewer_temperature = v.float;
-        if (v == .integer) self.tools_reviewer_temperature = @floatFromInt(v.integer);
-    }
-    if (root.get("tools_reviewer_max_context_tokens")) |v| {
-        if (v == .integer and v.integer >= 0) self.tools_reviewer_max_context_tokens = @intCast(v.integer);
-    }
-    if (root.get("tools_reviewer_base_url")) |v| {
-        if (v == .string) self.tools_reviewer_base_url = try self.allocator.dupe(u8, v.string);
-    }
-
     // Model routes
     if (root.get("model_routes")) |v| {
         if (v == .array) {
@@ -854,11 +820,11 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (ag.object.get("message_timeout_secs")) |v| {
                 if (v == .integer) self.agent.message_timeout_secs = @intCast(v.integer);
             }
-            if (ag.object.get("sub_agent_max_iterations")) |v| {
-                if (v == .integer and v.integer > 0) self.agent.sub_agent_max_iterations = @intCast(v.integer);
+            if (ag.object.get("vision_disabled_models")) |v| {
+                if (v == .array) self.agent.vision_disabled_models = try parseStringArray(self.allocator, v.array);
             }
-            if (ag.object.get("sub_agent_review_after")) |v| {
-                if (v == .integer and v.integer > 0) self.agent.sub_agent_review_after = @intCast(v.integer);
+            if (ag.object.get("auto_disable_vision_on_error")) |v| {
+                if (v == .bool) self.agent.auto_disable_vision_on_error = v.bool;
             }
             // tool_filter_groups: array of { mode, tools, keywords? }
             if (ag.object.get("tool_filter_groups")) |fg_val| {
@@ -906,55 +872,6 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             }
             if (tl.object.get("web_fetch_max_chars")) |v| {
                 if (v == .integer) self.tools.web_fetch_max_chars = @intCast(v.integer);
-            }
-            // tools.plugins — external SO/python/node plugin sources
-            if (tl.object.get("plugins")) |pl| {
-                if (pl == .object) {
-                    if (pl.object.get("hot_reload_interval_secs")) |v| {
-                        if (v == .integer and v.integer >= 0)
-                            self.tools.plugins.hot_reload_interval_secs = @intCast(v.integer);
-                    }
-                    // Parse helper: array of {kind, path} objects → []ExternalToolConfig
-                    const parse_entries = struct {
-                        fn call(
-                            alloc: std.mem.Allocator,
-                            arr: std.json.Value,
-                        ) ![]const types.ExternalToolConfig {
-                            if (arr != .array) return error.InvalidConfig;
-                            const items = arr.array.items;
-                            var list: std.ArrayListUnmanaged(types.ExternalToolConfig) = .empty;
-                            errdefer {
-                                for (list.items) |entry| alloc.free(entry.path);
-                                list.deinit(alloc);
-                            }
-                            for (items) |item| {
-                                if (item != .object) continue;
-                                const kind_v = item.object.get("kind") orelse continue;
-                                const path_v = item.object.get("path") orelse continue;
-                                if (kind_v != .string or path_v != .string) continue;
-                                const kind = std.meta.stringToEnum(
-                                    types.ExternalToolKind,
-                                    kind_v.string,
-                                ) orelse continue;
-                                // Ensure capacity before duping the path so that a
-                                // list growth failure doesn't leave an allocated-but-
-                                // unenqueued path behind (which the errdefer wouldn't see).
-                                try list.ensureUnusedCapacity(alloc, 1);
-                                const path = try alloc.dupe(u8, path_v.string);
-                                list.appendAssumeCapacity(.{ .kind = kind, .path = path });
-                            }
-                            return list.toOwnedSlice(alloc);
-                        }
-                    }.call;
-                    if (pl.object.get("add")) |arr|
-                        self.tools.plugins.add = try parse_entries(self.allocator, arr);
-                    if (pl.object.get("overwrite")) |arr|
-                        self.tools.plugins.overwrite = try parse_entries(self.allocator, arr);
-                    if (pl.object.get("current_tools_list_path")) |v| {
-                        if (v == .string)
-                            self.tools.plugins.current_tools_list_path = try self.allocator.dupe(u8, v.string);
-                    }
-                }
             }
             // tools.media.audio → self.audio_media
             if (tl.object.get("media")) |media| {
