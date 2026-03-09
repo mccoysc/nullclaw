@@ -200,6 +200,18 @@ pub const AgentConfig = struct {
     /// When true, automatically adds the current model to vision_disabled_models
     /// upon receiving a "model does not support vision" error.
     auto_disable_vision_on_error: bool = true,
+    /// Hard cap on LLM context tokens. When the estimated token count reaches
+    /// this limit, auto-compaction is triggered immediately. 0 = use default
+    /// token_limit logic (model-based resolution).
+    max_context_tokens: u64 = 0,
+    /// Maximum iterations for the skill sub-agent turn loop (tool calls only).
+    /// 0 = use compiled default (128).
+    sub_agent_max_iterations: u32 = 0,
+    /// After this many consecutive tool-call iterations in the sub-agent loop,
+    /// trigger an LLM review to decide whether the loop is stuck.
+    /// 0 = use compiled default (5).  Clamped to max_iterations-1 at runtime;
+    /// if max_iterations <= 1 the review is effectively disabled.
+    sub_agent_review_after: u32 = 0,
 };
 
 pub const ToolsConfig = struct {
@@ -207,6 +219,42 @@ pub const ToolsConfig = struct {
     shell_max_output_bytes: u32 = 1_048_576, // 1MB
     max_file_size_bytes: u32 = 10_485_760, // 10MB — shared file_read/edit/append
     web_fetch_max_chars: u32 = 100_000,
+    /// External tool plugins loaded at startup (and on hot reload).
+    plugins: ToolPluginsConfig = .{},
+};
+
+/// Kind of external tool source.
+pub const ExternalToolKind = enum {
+    /// Native shared library (.so / .dll / .dylib).
+    /// Must export `nullclaw_tools_list` and `nullclaw_tools_free` — see loader_so.zig.
+    so,
+    /// Python 3 script. Requires `python3` in PATH.
+    /// Must accept `--nullclaw-list` and `--nullclaw-call <name> <json>`.
+    python,
+    /// Node.js script. Requires `node` in PATH.
+    /// Same CLI protocol as `python`.
+    node,
+};
+
+/// One external tool source entry (a library or a script).
+pub const ExternalToolConfig = struct {
+    kind: ExternalToolKind,
+    /// Absolute or workspace-relative path to the library / script file.
+    path: []const u8,
+};
+
+/// Dynamic plugin section inside ToolsConfig.
+pub const ToolPluginsConfig = struct {
+    overwrite: []const ExternalToolConfig = &.{},
+    add: []const ExternalToolConfig = &.{},
+    /// How often (in seconds) the plugins config is checked for changes.
+    /// 0 disables hot-reload polling. Default: 5.
+    hot_reload_interval_secs: u64 = 5,
+    /// Optional filesystem path where nullclaw writes the current effective tool
+    /// list as a JSON array after startup and after every hot-reload cycle.
+    /// Each entry: { "name", "description", "params_json", "source" }
+    /// null (default) disables the write-back.
+    current_tools_list_path: ?[]const u8 = null,
 };
 
 pub const ModelRouteConfig = struct {
@@ -607,6 +655,134 @@ pub const WebConfig = struct {
     }
 };
 
+/// Per-channel model configuration overrides.
+pub const ChannelModelOverride = struct {
+    /// Override the LLM provider (e.g. "openrouter", "anthropic").
+    provider: ?[]const u8 = null,
+    /// Override the model name (e.g. "openrouter/minimax/minimax-m2.5").
+    model: ?[]const u8 = null,
+    /// Override the maximum context tokens for this channel.
+    /// When reached, auto-compaction is triggered.
+    max_context_tokens: u64 = 0,
+    /// Override the temperature for this channel.
+    temperature: ?f64 = null,
+    /// Override the sub-agent LLM provider for this channel.
+    /// Fallback: channel general provider → global sub_agent_provider → global default_provider.
+    sub_agent_provider: ?[]const u8 = null,
+    /// Override the sub-agent LLM model for this channel.
+    /// Fallback: channel general model → global sub_agent_model → global default_model.
+    sub_agent_model: ?[]const u8 = null,
+    /// Override the sub-agent temperature for this channel.
+    sub_agent_temperature: ?f64 = null,
+    /// Override the sub-agent max context tokens for this channel.
+    sub_agent_max_context_tokens: u64 = 0,
+    /// Override the sub-agent provider base URL for this channel.
+    sub_agent_base_url: ?[]const u8 = null,
+    /// Override the tools reviewer LLM provider for this channel.
+    /// Fallback: channel general provider → global tools_reviewer_provider → global default_provider.
+    tools_reviewer_provider: ?[]const u8 = null,
+    /// Override the tools reviewer LLM model for this channel.
+    /// Fallback: channel general model → global tools_reviewer_model → global default_model.
+    tools_reviewer_model: ?[]const u8 = null,
+    /// Override the tools reviewer temperature for this channel.
+    tools_reviewer_temperature: ?f64 = null,
+    /// Override the tools reviewer max context tokens for this channel.
+    tools_reviewer_max_context_tokens: u64 = 0,
+    /// Override the tools reviewer provider base URL for this channel.
+    tools_reviewer_base_url: ?[]const u8 = null,
+    /// Override the sub-agent max iterations for this channel.
+    /// 0 = use global agent.sub_agent_max_iterations or compiled default.
+    sub_agent_max_iterations: u32 = 0,
+    /// Override the sub-agent review_after for this channel.
+    /// 0 = use global agent.sub_agent_review_after or compiled default.
+    sub_agent_review_after: u32 = 0,
+};
+
+pub const MqttEndpointConfig = struct {
+    /// Unique identifier for this endpoint.  Used to correlate running sessions
+    /// with config entries across hot-reloads.  Auto-generated during onboarding
+    /// if not provided.
+    endpoint_id: []const u8 = "",
+    /// Broker host (e.g. "broker.example.com").
+    host: []const u8,
+    /// Broker port (default 1883 for TCP, 8883 for TLS).
+    port: u16 = 1883,
+    /// Optional username for broker authentication.
+    username: ?[]const u8 = null,
+    /// Optional password for broker authentication.
+    password: ?[]const u8 = null,
+    /// Use TLS for the connection.
+    tls: bool = false,
+    /// Optional client ID (auto-generated if not set).
+    client_id: ?[]const u8 = null,
+    /// Peer's P256 public key (hex-encoded, uncompressed) — used to verify inbound messages.
+    peer_pubkey: []const u8,
+    /// Local P256 private key (hex-encoded) — used to sign outbound messages.
+    /// Generated randomly during onboarding if not provided.
+    local_privkey: []const u8,
+    /// Local P256 public key (hex-encoded, uncompressed) — derived from local_privkey.
+    /// Published so the peer can verify our signatures.
+    local_pubkey: []const u8,
+    /// Topic to subscribe to (listen for inbound messages).
+    listen_topic: []const u8,
+    /// Topic to publish replies on. If empty or equal to listen_topic,
+    /// the channel uses the same topic for both directions and filters
+    /// out messages signed by our own key.
+    reply_topic: ?[]const u8 = null,
+    /// Per-channel model configuration overrides.
+    /// When set, these override the global model/provider/temperature/max_context_tokens.
+    model_override: ChannelModelOverride = .{},
+};
+
+pub const MqttConfig = struct {
+    account_id: []const u8 = "default",
+    endpoints: []const MqttEndpointConfig = &.{},
+};
+
+/// A single Redis Stream endpoint configuration.
+pub const RedisStreamEndpointConfig = struct {
+    /// Unique identifier for this endpoint.  Used to correlate running sessions
+    /// with config entries across hot-reloads.  Auto-generated during onboarding
+    /// if not provided.
+    endpoint_id: []const u8 = "",
+    /// Redis host (e.g. "localhost").
+    host: []const u8 = "localhost",
+    /// Redis port.
+    port: u16 = 6379,
+    /// Optional Redis password (AUTH).
+    password: ?[]const u8 = null,
+    /// Redis database index.
+    db: u16 = 0,
+    /// Use TLS for the connection.
+    tls: bool = false,
+    /// Optional username (Redis 6+ ACL).
+    username: ?[]const u8 = null,
+    /// Peer's P256 public key (hex-encoded, uncompressed) — used to verify inbound messages.
+    peer_pubkey: []const u8,
+    /// Local P256 private key (hex-encoded) — used to sign outbound messages.
+    local_privkey: []const u8,
+    /// Local P256 public key (hex-encoded, uncompressed) — derived from local_privkey.
+    local_pubkey: []const u8,
+    /// Stream key to read from (listen for inbound messages).
+    listen_topic: []const u8,
+    /// Stream key to write replies to. If empty or equal to listen_topic,
+    /// the channel uses the same stream for both directions and filters
+    /// out messages signed by our own key.
+    reply_topic: ?[]const u8 = null,
+    /// Consumer group name for XREADGROUP.
+    consumer_group: []const u8 = "nullclaw",
+    /// Consumer name within the group.
+    consumer_name: []const u8 = "default",
+    /// Per-channel model configuration overrides.
+    /// When set, these override the global model/provider/temperature/max_context_tokens.
+    model_override: ChannelModelOverride = .{},
+};
+
+pub const RedisStreamConfig = struct {
+    account_id: []const u8 = "default",
+    endpoints: []const RedisStreamEndpointConfig = &.{},
+};
+
 pub const NostrConfig = struct {
     /// Private key: must be enc2:-encrypted via SecretStore (use onboarding wizard or SecretStore.encryptSecret).
     /// Not required when bunker_uri is set (external bunker handles signing).
@@ -673,6 +849,8 @@ pub const ChannelsConfig = struct {
     onebot: []const OneBotConfig = &.{},
     maixcam: []const MaixCamConfig = &.{},
     web: []const WebConfig = &.{},
+    mqtt: []const MqttConfig = &.{},
+    redis_stream: []const RedisStreamConfig = &.{},
     nostr: ?*NostrConfig = null,
 
     fn primaryAccount(comptime T: type, items: []const T) ?T {

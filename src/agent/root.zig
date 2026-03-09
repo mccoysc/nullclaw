@@ -495,12 +495,12 @@ pub const Agent = struct {
             .tools_reviewer_max_context_tokens = cfg.tools_reviewer_max_context_tokens,
             .tools_reviewer_base_url = cfg.tools_reviewer_base_url,
             .exec_security = switch (cfg.autonomy.level) {
-                .full => .full,
+                .full, .yolo => .full,
                 .read_only => .deny,
                 .supervised => .allowlist,
             },
             .exec_ask = switch (cfg.autonomy.level) {
-                .full, .read_only => .off,
+                .full, .yolo, .read_only => .off,
                 .supervised => .on_miss,
             },
             .async_skill_queue = skills_mod.AsyncSkillQueue.init(allocator),
