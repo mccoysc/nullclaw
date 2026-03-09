@@ -63,6 +63,8 @@
 - [Gateway API](./gateway-api.md)
 - [命令参考](./commands.md)
 - [开发指南](./development.md)
+- [Skills 使用指南](./skills.md)
+- [配置热重载](./config-hot-reload.md)
 
 ## 先看这 3 条
 

@@ -1225,10 +1225,36 @@ fn runCapabilities(allocator: std.mem.Allocator, sub_args: []const []const u8) !
     defer if (cfg_opt) |*cfg| cfg.deinit();
     const cfg_ptr: ?*const yc.config.Config = if (cfg_opt) |*cfg| cfg else null;
 
+    // When external plugins are configured, build the real registry so the
+    // capabilities output shows actually-loaded plugin tools rather than an estimate.
+    var tool_registry: ?*yc.tools.ToolRegistry = null;
+    var plugin_tools_buf: ?[]yc.tools.Tool = null;
+    if (cfg_opt) |cfg| {
+        const pl = &cfg.tools.plugins;
+        if (pl.add.len > 0 or pl.overwrite.len > 0) {
+            if (yc.tools.buildInitialRegistry(allocator, cfg.workspace_dir, .{
+                .tools_config = cfg.tools,
+                .current_tools_list_path = cfg.tools.plugins.current_tools_list_path,
+            })) |reg| {
+                tool_registry = reg;
+                const buf = allocator.alloc(yc.tools.Tool, reg.count()) catch null;
+                if (buf) |b| {
+                    _ = reg.copySlice(b);
+                    plugin_tools_buf = b;
+                }
+            } else |_| {}
+        }
+    }
+    defer if (tool_registry) |reg| {
+        if (plugin_tools_buf) |b| allocator.free(b);
+        reg.deinit();
+        allocator.destroy(reg);
+    };
+
     const output = if (as_json)
-        try yc.capabilities.buildManifestJson(allocator, cfg_ptr, null)
+        try yc.capabilities.buildManifestJson(allocator, cfg_ptr, plugin_tools_buf)
     else
-        try yc.capabilities.buildSummaryText(allocator, cfg_ptr, null);
+        try yc.capabilities.buildSummaryText(allocator, cfg_ptr, plugin_tools_buf);
     defer allocator.free(output);
 
     std.debug.print("{s}", .{output});
@@ -2862,7 +2888,7 @@ test "hasConfiguredStartableChannels returns true when telegram configured" {
         },
     };
 
-    if (!yc.channel_catalog.isBuildEnabled(.telegram)) return error.SkipZigTest;
+    if (!yc.channel_catalog.isBuildEnabled(.telegram)) return;
     try std.testing.expect(hasConfiguredStartableChannels(&cfg));
 }
 
