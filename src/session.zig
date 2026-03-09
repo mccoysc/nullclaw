@@ -275,12 +275,20 @@ pub const SessionManager = struct {
         agent.reasoning_effort = cfg.reasoning_effort;
         agent.status_show_emojis = cfg.agent.status_show_emojis;
         agent.exec_security = switch (cfg.autonomy.level) {
+<<<<<<< Updated upstream
             .full, .yolo => .full,
+=======
+            .full => .full,
+>>>>>>> Stashed changes
             .read_only => .deny,
             .supervised => .allowlist,
         };
         agent.exec_ask = switch (cfg.autonomy.level) {
+<<<<<<< Updated upstream
             .full, .yolo, .read_only => .off,
+=======
+            .full, .read_only => .off,
+>>>>>>> Stashed changes
             .supervised => .on_miss,
         };
         // Agent-loop settings
