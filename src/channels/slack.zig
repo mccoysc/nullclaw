@@ -466,7 +466,7 @@ pub const SlackChannel = struct {
             false;
         const effective_thread_ts: ?[]const u8 = switch (self.reply_to_mode) {
             .off => if (is_thread_reply) thread_ts else null,
-            .all => thread_ts orelse message_ts,
+            .thread, .direct, .all => thread_ts orelse message_ts,
         };
 
         // Build chat_id: "channel_id:thread_ts" for threaded replies, plain channel_id otherwise.

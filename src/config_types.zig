@@ -297,6 +297,8 @@ pub const TelegramConfig = struct {
     interactive: TelegramInteractiveConfig = .{},
     /// When true, only respond to messages that @mention the bot (in groups).
     require_mention: bool = false,
+    /// Enable streaming mode for voice calls
+    streaming: bool = false,
 };
 
 pub const DiscordConfig = struct {
@@ -314,6 +316,13 @@ pub const SlackReceiveMode = enum {
     http,
 };
 
+pub const SlackReplyToMode = enum {
+    off,
+    thread,
+    direct,
+    all,
+};
+
 pub const SlackConfig = struct {
     account_id: []const u8 = "default",
     mode: SlackReceiveMode = .socket,
@@ -325,6 +334,7 @@ pub const SlackConfig = struct {
     allow_from: []const []const u8 = &.{},
     dm_policy: []const u8 = "pairing",
     group_policy: []const u8 = "mention_only",
+    reply_to_mode: SlackReplyToMode = .off,
 };
 
 pub const WebhookConfig = struct {
