@@ -249,10 +249,18 @@ pub fn wrapMeta(
 
 // End-to-end: compile examples/plugins/example_plugin.c, load it via
 // openSo/wrapMeta, execute both exported tools, verify output.
-// Linux only — DynLib + dlopen with .so files is not meaningful elsewhere.
+// Skip on platforms without DynLib support or without a C compiler.
 test "loader_so: e2e compile and execute example_plugin.c" {
     const builtin = @import("builtin");
-    if (comptime builtin.os.tag != .linux) return;
+
+    // Skip platforms that don't support dynamic library loading
+    // std.DynLib is supported on: linux, macos, windows, freebsd, netbsd, openbsd
+    const os_tag = builtin.os.tag;
+    const supports_dynlib = switch (os_tag) {
+        .linux, .macos, .windows, .freebsd, .netbsd, .openbsd => true,
+        else => false,
+    };
+    if (comptime !supports_dynlib) return;
 
     const allocator = std.testing.allocator;
 
@@ -263,17 +271,27 @@ test "loader_so: e2e compile and execute example_plugin.c" {
     const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
     defer allocator.free(tmp_path);
 
-    const so_path = try std.fmt.allocPrint(allocator, "{s}/example_plugin.so", .{tmp_path});
+    // Platform-specific extension and compiler flags
+    const ext = switch (builtin.os.tag) {
+        .macos => "dylib",
+        .windows => "dll",
+        else => "so", // linux, freebsd, netbsd, openbsd
+    };
+    const so_path = try std.fmt.allocPrint(allocator, "{s}/example_plugin.{s}", .{ tmp_path, ext });
     defer allocator.free(so_path);
 
     // src path: resolve examples/plugins/example_plugin.c from CWD (repo root).
     const c_path = try std.fs.cwd().realpathAlloc(allocator, "examples/plugins/example_plugin.c");
     defer allocator.free(c_path);
 
-    // Compile with cc.
+    // Compile with cc - platform-specific flags
+    const compile_argv: []const []const u8 = switch (builtin.os.tag) {
+        .macos => &[_][]const u8{ "cc", "-shared", "-fPIC", "-o", so_path, c_path, "-undefined", "dynamic_lookup" },
+        .windows => &[_][]const u8{ "gcc", "-shared", "-o", so_path, c_path },
+        else => &[_][]const u8{ "cc", "-shared", "-fPIC", "-o", so_path, c_path }, // linux, freebsd, netbsd, openbsd
+    };
     {
-        const argv = [_][]const u8{ "cc", "-shared", "-fPIC", "-o", so_path, c_path };
-        var child = std.process.Child.init(&argv, allocator);
+        var child = std.process.Child.init(compile_argv, allocator);
         child.stdout_behavior = .Ignore;
         child.stderr_behavior = .Ignore;
         try child.spawn();
