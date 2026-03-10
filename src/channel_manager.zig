@@ -2618,6 +2618,20 @@ test "subagentConfigChanged detects default_provider change" {
     try std.testing.expect(subagentConfigChanged(&a, &b));
 }
 
+test "subagentConfigChanged detects default_model change" {
+    var a = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .default_model = "gpt-4o-mini",
+    };
+
+    var b = a;
+    b.default_model = "gpt-4o";
+
+    try std.testing.expect(subagentConfigChanged(&a, &b));
+}
+
 test "subagentConfigChanged returns false for identical configs" {
     const cfg = Config{
         .workspace_dir = "/tmp",
