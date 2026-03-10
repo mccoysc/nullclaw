@@ -458,6 +458,24 @@ pub const ChannelManager = struct {
             if (providerConfigChanged(old_config, new_config)) {
                 rt.rebuildProvider(new_config);
             }
+
+            // Even if provider credentials haven't changed, sub-agent specific
+            // config (sub_agent_provider, sub_agent_model, etc.) may have changed.
+            // Update the subagent manager to use the new provider entries.
+            if (subagentConfigChanged(old_config, new_config)) {
+                if (rt.subagent_manager) |mgr| {
+                    // Update provider list - use new_config.providers since we
+                    // know provider credentials themselves didn't change.
+                    mgr.configured_providers = new_config.providers;
+                    // Update sub-agent specific settings
+                    mgr.sub_agent_provider = new_config.sub_agent_provider;
+                    mgr.sub_agent_model = new_config.sub_agent_model;
+                    // Update the default provider if sub_agent_provider is not set
+                    mgr.default_provider = new_config.default_provider;
+                    mgr.default_model = new_config.default_model;
+                    log.info("Subagent manager config updated for sub-agent specific changes", .{});
+                }
+            }
         }
 
         log.info("Config reload complete", .{});
@@ -1181,6 +1199,27 @@ fn providerConfigChanged(old: *const Config, new: *const Config) bool {
     // Retry settings changed.
     if (old.reliability.provider_retries != new.reliability.provider_retries) return true;
     if (old.reliability.provider_backoff_ms != new.reliability.provider_backoff_ms) return true;
+
+    return false;
+}
+
+/// Check if sub-agent specific config changed that requires updating the
+/// subagent manager. This is separate from providerConfigChanged because
+/// sub-agent config can change (e.g., sub_agent_provider) even when the
+/// main provider credentials haven't changed.
+fn subagentConfigChanged(old: *const Config, new: *const Config) bool {
+    // sub_agent_provider and sub_agent_model determine which provider/model
+    // the subagent uses. If these change, we need to update the subagent manager.
+    if (!optionalStrEql(old.sub_agent_provider, new.sub_agent_provider)) return true;
+    if (!optionalStrEql(old.sub_agent_model, new.sub_agent_model)) return true;
+    if (!optionalStrEql(old.sub_agent_base_url, new.sub_agent_base_url)) return true;
+    if (!optionalF64Eql(old.sub_agent_temperature, new.sub_agent_temperature)) return true;
+    if (old.sub_agent_max_context_tokens != new.sub_agent_max_context_tokens) return true;
+
+    // Also check if the default provider/model changed, since these are used
+    // as fallbacks when sub_agent_provider/model are not set.
+    if (!std.mem.eql(u8, old.default_provider, new.default_provider)) return true;
+    if (!optionalStrEql(old.default_model, new.default_model)) return true;
 
     return false;
 }
@@ -2520,4 +2559,75 @@ test "providerConfigChanged detects fallback_providers change" {
     b.reliability.fallback_providers = &.{"anthropic"};
 
     try std.testing.expect(providerConfigChanged(&a, &b));
+}
+
+test "subagentConfigChanged detects sub_agent_provider change" {
+    var a = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .default_model = "test/model",
+    };
+
+    var b = a;
+    b.sub_agent_provider = "openai";
+
+    try std.testing.expect(subagentConfigChanged(&a, &b));
+    try std.testing.expect(!subagentConfigChanged(&a, &a));
+}
+
+test "subagentConfigChanged detects sub_agent_model change" {
+    var a = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .default_model = "test/model",
+    };
+
+    var b = a;
+    b.sub_agent_model = "gpt-4o-mini";
+
+    try std.testing.expect(subagentConfigChanged(&a, &b));
+}
+
+test "subagentConfigChanged detects sub_agent_base_url change" {
+    var a = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .default_model = "test/model",
+    };
+
+    var b = a;
+    b.sub_agent_base_url = "https://custom.example.com";
+
+    try std.testing.expect(subagentConfigChanged(&a, &b));
+}
+
+test "subagentConfigChanged detects default_provider change" {
+    var a = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .default_model = "test/model",
+    };
+
+    var b = a;
+    b.default_provider = "anthropic";
+
+    try std.testing.expect(subagentConfigChanged(&a, &b));
+}
+
+test "subagentConfigChanged returns false for identical configs" {
+    const cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .default_model = "test/model",
+        .sub_agent_provider = "openai",
+        .sub_agent_model = "gpt-4o-mini",
+        .sub_agent_base_url = "https://api.openai.com",
+    };
+
+    try std.testing.expect(!subagentConfigChanged(&cfg, &cfg));
 }
