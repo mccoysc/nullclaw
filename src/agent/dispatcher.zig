@@ -870,6 +870,123 @@ fn parseToolCallJson(allocator: std.mem.Allocator, json_str: []const u8) !Parsed
     return parseToolCallJsonInner(allocator, parsed);
 }
 
+/// Heuristic detection of potentially malformed tool calls that might be recoverable.
+/// This detects common format-level anomalies without being specific to any model.
+/// Returns true if the text appears to contain a malformed tool call that could be fixed.
+pub fn looksLikeMalformedToolCall(text: []const u8) bool {
+    // Skip empty or too short/long texts
+    if (text.len < 8 or text.len > 8192) return false;
+
+    // Pattern 1: Square bracket tool call markers (e.g. [TOOL_CALL], [/TOOL_CALL])
+    // These are often generated incorrectly by models
+    if (containsIgnoreCase(text, "[TOOL_CALL]") or
+        containsIgnoreCase(text, "[/TOOL_CALL]") or
+        containsIgnoreCase(text, "[tool_call]") or
+        containsIgnoreCase(text, "[/tool_call]"))
+    {
+        return true;
+    }
+
+    // Pattern 2: Malformed <invoke xxx= or <invoke name= patterns (missing proper format)
+    // e.g., "<invoke shell>" instead of "<invoke name=\"shell\">"
+    if (std.mem.indexOf(u8, text, "<invoke ") != null or
+        std.mem.indexOf(u8, text, "<invoke>") != null)
+    {
+        // Check if it's missing the proper name= attribute
+        const invoke_start = std.mem.indexOf(u8, text, "<invoke") orelse return false;
+        const after_invoke = text[invoke_start + 7 ..];
+        // If we see a space followed by something that's not "name=" or a quote, it's malformed
+        const first_char = std.mem.trimLeft(u8, after_invoke, " \t")[0];
+        if (first_char != '"' and first_char != '\'' and first_char != 'n' and first_char != '>') {
+            return true;
+        }
+    }
+
+    // Pattern 3: Tool call name without proper JSON structure
+    // e.g., "shell", "file_read" appearing near the start followed by arguments
+    const name_patterns = [_][]const u8{
+        "\"name\"",
+        "\"arguments\"",
+        "\"command\"",
+        "\"path\"",
+    };
+    var has_name_component = false;
+    for (name_patterns) |pattern| {
+        if (std.mem.indexOf(u8, text, pattern) != null) {
+            has_name_component = true;
+            break;
+        }
+    }
+
+    // If we have tool call keywords but no proper JSON structure, might be malformed
+    if (has_name_component) {
+        // Check if there's a JSON object but it's incomplete or malformed
+        const has_open_brace = std.mem.indexOfScalar(u8, text, '{');
+        const has_close_brace = std.mem.indexOfScalar(u8, text, '}');
+
+        // Has JSON-like parts but unbalanced braces suggests malformed
+        if (has_open_brace != null and has_close_brace == null) return true;
+        if (has_open_brace == null and has_close_brace != null) return true;
+
+        // Count braces - if unbalanced, likely malformed
+        var brace_count: i32 = 0;
+        for (text) |c| {
+            if (c == '{') brace_count += 1;
+            if (c == '}') brace_count -= 1;
+        }
+        if (brace_count != 0) return true;
+
+        // Has tool call components but no proper <tool_call> wrapper
+        if (std.mem.indexOf(u8, text, "<tool_call>") == null and
+            std.mem.indexOf(u8, text, "<invoke ") == null and
+            std.mem.indexOf(u8, text, "<function=") == null)
+        {
+            // Tool keywords present but no proper wrapper - could be recoverable
+            return true;
+        }
+    }
+
+    // Pattern 4: Very short tool-like content that looks like it should be a tool call
+    // but wasn't wrapped in proper tags.
+    // e.g., just "shell" or "file_read" at the start of response
+    // Instead of hardcoding specific tool names, detect patterns that are commonly used
+    // as tool names: lowercase identifiers at the start followed by common patterns.
+    const trimmed = std.mem.trim(u8, text, " \t\n\r");
+
+    // Check for patterns that look like tool names: lowercase word followed by space or {
+    // This catches common tool naming patterns without hardcoding specific names.
+    if (trimmed.len >= 3) {
+        // Look for lowercase identifier pattern at start (common in tool names)
+        var i: usize = 0;
+        var has_lowercase_start = false;
+        while (i < trimmed.len and i < 20) : (i += 1) {
+            const c = trimmed[i];
+            if (i == 0) {
+                has_lowercase_start = (c >= 'a' and c <= 'z');
+            }
+            if (c == '_' or c == '-' or (c >= 'a' and c <= 'z') or (c >= '0' and c <= '9')) {
+                continue;
+            }
+            break;
+        }
+
+        // If starts with lowercase identifier, check if followed by patterns common in tool calls
+        if (has_lowercase_start and i > 2 and i < trimmed.len) {
+            const next_char = trimmed[i];
+            if (next_char == ' ' or next_char == '\n' or next_char == '\r' or next_char == '{') {
+                // This looks like a tool-like identifier at the start
+                // Check if there's JSON-like content after it
+                const after_id = trimmed[i..];
+                if (std.mem.indexOfScalar(u8, after_id, '{') != null) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    return false;
+}
+
 fn parseToolCallJsonInner(allocator: std.mem.Allocator, parsed: std.json.Parsed(std.json.Value)) !ParsedToolCall {
     defer parsed.deinit();
 
@@ -2854,4 +2971,66 @@ test "buildAssistantHistoryWithToolCalls escapes special chars in name" {
     defer parsed.deinit();
     const name = parsed.value.object.get("name").?.string;
     try std.testing.expectEqualStrings("shell\"injection", name);
+}
+
+/// Build a repair prompt for fixing malformed tool calls.
+/// This function builds a prompt that asks an LLM to:
+/// 1. Determine if the malformed content matches any of the available tools
+/// 2. If it matches, repair it according to the correct tool definition format
+/// 3. If it doesn't match any tool, return "CANNOT_REPAIR" to indicate no repair is possible
+///
+/// The caller should use this with their own LLM, then parse the result.
+pub fn buildRepairPrompt(
+    allocator: std.mem.Allocator,
+    malformed_content: []const u8,
+    available_tools: anytype,
+) ![]const u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+
+    try w.writeAll("You are a tool call repair assistant. Your task is to analyze the given content and determine if it appears to be a malformed tool call attempt.\n\n");
+
+    try w.writeAll("## Available Tools\n");
+    try w.writeAll("Only consider these tools for matching:\n\n");
+
+    for (available_tools) |t| {
+        try w.writeAll("- **");
+        try w.writeAll(t.name());
+        try w.writeAll("**: ");
+        try w.writeAll(t.description());
+        try w.writeAll("\nParameters: `");
+        try w.writeAll(t.parametersJson());
+        try w.writeAll("`\n\n");
+    }
+
+    try w.writeAll("## Malformed Content to Repair\n\n");
+    try w.writeAll("```\n");
+    try w.writeAll(malformed_content);
+    try w.writeAll("\n```\n\n");
+
+    try w.writeAll("## Instructions\n\n");
+    try w.writeAll("1. Analyze the malformed content above carefully.\n");
+    try w.writeAll("2. Determine if it appears to be an attempt to call ONE of the available tools listed above.\n");
+    try w.writeAll("   - Look for hints like: tool names (shell, file_read, web_fetch, etc.), parameter names (command, path, url, etc.), or command-like content.\n");
+    try w.writeAll("   - If it clearly doesn't match ANY available tool, respond with just: CANNOT_REPAIR\n");
+    try w.writeAll("3. If it DOES match a tool, output the correctly formatted tool call in this EXACT format:\n");
+    try w.writeAll("   ```\n");
+    try w.writeAll("   <tool_call>\n");
+    try w.writeAll("   {\"name\": \"tool_name\", \"arguments\": {\"param\": \"value\"}}\n");
+    try w.writeAll("   </tool_call>\n");
+    try w.writeAll("   ```\n");
+    try w.writeAll("   - Use the exact tool name from the available tools list.\n");
+    try w.writeAll("   - The arguments must be valid JSON object format.\n");
+    try w.writeAll("   - Do NOT add any explanation or surrounding text.\n");
+    try w.writeAll("\n## Your Response\n\n");
+
+    return try buf.toOwnedSlice(allocator);
+}
+
+/// Check if the LLM repair response indicates the content cannot be repaired.
+/// Returns true if the response contains only "CANNOT_REPAIR" (case-insensitive, trimmed).
+pub fn isUnrepairableContent(llm_response: []const u8) bool {
+    const trimmed = std.mem.trim(u8, llm_response, " \t\n\r");
+    return std.ascii.eqlIgnoreCase(trimmed, "CANNOT_REPAIR");
 }

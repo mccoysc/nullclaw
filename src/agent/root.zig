@@ -41,6 +41,10 @@ pub const memory_loader = @import("memory_loader.zig");
 pub const commands = @import("commands.zig");
 const ParsedToolCall = dispatcher.ParsedToolCall;
 const ToolExecutionResult = dispatcher.ToolExecutionResult;
+const looksLikeMalformedToolCall = dispatcher.looksLikeMalformedToolCall;
+const repairJson = dispatcher.repairJson;
+const buildRepairPrompt = dispatcher.buildRepairPrompt;
+const isUnrepairableContent = dispatcher.isUnrepairableContent;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Constants
@@ -1716,6 +1720,73 @@ pub const Agent = struct {
                 response_text;
 
             if (parsed_calls.len == 0) {
+                // ── Recovery: try to detect and repair malformed tool calls ──
+                // If parsing yielded no calls but the response looks like a malformed
+                // tool call (e.g., model output broken JSON), attempt LLM repair.
+                if (!is_streaming and response_text.len > 0 and iteration + 1 < self.max_tool_iterations) {
+                    if (looksLikeMalformedToolCall(response_text)) {
+                        log.info("detected malformed tool call, attempting LLM repair", .{});
+                        // Build repair prompt with available tools
+                        const repair_prompt_text = buildRepairPrompt(
+                            self.allocator,
+                            response_text,
+                            self.tools,
+                        ) catch null;
+                        if (repair_prompt_text) |prompt_text| {
+                            defer self.allocator.free(prompt_text);
+                            // Call LLM to repair the malformed tool call
+                            const repair_response = self.provider.chat(
+                                self.allocator,
+                                .{
+                                    .messages = &[_]ChatMessage{
+                                        .{ .role = .system, .content = prompt_text },
+                                        .{ .role = .user, .content = "Please repair the malformed tool call above." },
+                                    },
+                                    .model = self.model_name,
+                                    .temperature = 0.1,
+                                    .max_tokens = 512,
+                                    .tools = null,
+                                    .timeout_secs = self.message_timeout_secs,
+                                },
+                                self.model_name,
+                                0.1,
+                            ) catch null;
+                            if (repair_response) |repaired| {
+                                defer self.freeResponseFields(@constCast(&repaired));
+                                const repaired_text = repaired.contentOrEmpty();
+                                // Check if unrepairable
+                                if (!isUnrepairableContent(repaired_text)) {
+                                    // Try to parse the repaired response as tool calls
+                                    const xml_parsed = dispatcher.parseToolCalls(self.allocator, repaired_text) catch null;
+                                    if (xml_parsed != null and xml_parsed.?.calls.len > 0) {
+                                        // Free old parsed_calls if owned
+                                        if (free_parsed_calls) {
+                                            for (parsed_calls) |call| {
+                                                self.allocator.free(call.name);
+                                                self.allocator.free(call.arguments_json);
+                                                if (call.tool_call_id) |id| self.allocator.free(id);
+                                            }
+                                            self.allocator.free(parsed_calls);
+                                        }
+                                        parsed_calls = xml_parsed.?.calls;
+                                        free_parsed_calls = true;
+                                        parsed_text = if (xml_parsed.?.text.len > 0) try self.allocator.dupe(u8, xml_parsed.?.text) else "";
+                                        free_parsed_text = parsed_text.len > 0;
+                                        // If we successfully recovered, use repaired content for history
+                                        assistant_history_content = try self.allocator.dupe(u8, repaired_text);
+                                        free_assistant_history = true;
+                                        log.info("malformed tool call repaired successfully", .{});
+                                        // Jump to tool execution with recovered calls
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                        // Repair failed or unrepairable — continue with normal flow
+                        log.info("malformed tool call repair failed, falling back", .{});
+                    }
+                }
+
                 // Guardrail: if the model promises "I'll try/check now" but emits no
                 // tool call, force one follow-up completion to either act now or
                 // explicitly state the limitation without deferred promises.
@@ -2410,6 +2481,55 @@ pub const Agent = struct {
                 if (xml_parsed) |xp| {
                     parsed_calls = xp.calls;
                     has_tool_calls = xp.calls.len > 0;
+                }
+                // ── Recovery: try to detect and repair malformed tool calls in sub-agent ──
+                if (!has_tool_calls and response_text.len > 0) {
+                    if (looksLikeMalformedToolCall(response_text)) {
+                        log.info("sub-agent: detected malformed tool call, attempting LLM repair", .{});
+                        // Build repair prompt with available tools (same as main loop)
+                        const repair_prompt_text = buildRepairPrompt(
+                            arena,
+                            response_text,
+                            self.tools,
+                        ) catch null;
+                        if (repair_prompt_text) |prompt_text| {
+                            defer arena.free(prompt_text);
+                            // Call sub-agent's provider/model to repair the malformed tool call
+                            const repair_response = sa_provider.chat(
+                                arena,
+                                .{
+                                    .messages = &[_]ChatMessage{
+                                        .{ .role = .system, .content = prompt_text },
+                                        .{ .role = .user, .content = "Please repair the malformed tool call above." },
+                                    },
+                                    .model = sa_model,
+                                    .temperature = 0.1,
+                                    .max_tokens = 512,
+                                    .tools = null,
+                                    .timeout_secs = self.message_timeout_secs,
+                                },
+                                sa_model,
+                                0.1,
+                            ) catch null;
+                            if (repair_response) |repaired| {
+                                defer self.freeResponseFields(@constCast(&repaired));
+                                const repaired_text = repaired.contentOrEmpty();
+                                // Check if unrepairable
+                                if (!isUnrepairableContent(repaired_text)) {
+                                    // Try to parse the repaired response as tool calls
+                                    const repaired_parsed = dispatcher.parseToolCalls(arena, repaired_text) catch null;
+                                    if (repaired_parsed != null and repaired_parsed.?.calls.len > 0) {
+                                        parsed_calls = repaired_parsed.?.calls;
+                                        has_tool_calls = true;
+                                        log.info("sub-agent: malformed tool call repaired successfully", .{});
+                                    }
+                                }
+                            }
+                            if (!has_tool_calls) {
+                                log.info("sub-agent: malformed tool call repair failed, falling back", .{});
+                            }
+                        }
+                    }
                 }
             }
 
