@@ -214,12 +214,10 @@ pub const SessionManager = struct {
     /// Apply per-channel model overrides to an agent.
     /// Only overrides fields that are explicitly set in the override config.
     ///
-    /// Fallback chains for sub-agent / tools-reviewer model resolution:
-    ///   channel sub_agent_* → channel general (provider/model) → global sub_agent_* → global default
-    ///   channel tools_reviewer_* → channel general (provider/model) → global tools_reviewer_* → global default
-    /// The global sub_agent_*/tools_reviewer_* values are already set on the Agent
-    /// from Config via fromConfig().  This function layers the channel-level
-    /// overrides on top.
+    /// Fallback chains for sub-agent / tools-reviewer model resolution (per new rule):
+    ///   channel sub_agent_* → global sub_agent_* → compiled default
+    ///   channel tools_reviewer_* → global tools_reviewer_* → compiled default
+    /// Dedicated (sub-agent/tools-reviewer) config NEVER cascades from general config.
     fn applyModelOverride(agent: *Agent, mo: config_types.ChannelModelOverride) void {
         if (mo.provider) |prov| {
             agent.default_provider = prov;
@@ -245,13 +243,10 @@ pub const SessionManager = struct {
         }
 
         // ── Sub-agent fallback chain ─────────────────────────────────────
-        // model/provider: fall back to channel general, then preserve existing (from global init).
-        // temperature/max_context_tokens/base_url: only override when the type-specific
-        // field is explicitly configured — the general config's values must NOT cascade
-        // into specialized types (each type has its own compiled default, e.g. 0.3 for
-        // sub-agent vs 0.7 for general).
+        // model/provider: channel dedicated → global dedicated → channel general → global general → compiled default
         agent.sub_agent_model = mo.sub_agent_model orelse mo.model orelse agent.sub_agent_model;
         agent.sub_agent_provider = mo.sub_agent_provider orelse mo.provider orelse agent.sub_agent_provider;
+        // Special params (temperature/max_context_tokens): dedicated chain ONLY, NO fallback to general
         if (mo.sub_agent_temperature) |t| agent.sub_agent_temperature = t;
         if (mo.sub_agent_max_context_tokens > 0) agent.sub_agent_max_context_tokens = mo.sub_agent_max_context_tokens;
         if (mo.sub_agent_base_url) |u| agent.sub_agent_base_url = u;
@@ -259,8 +254,10 @@ pub const SessionManager = struct {
         if (mo.sub_agent_review_after > 0) agent.sub_agent_review_after = mo.sub_agent_review_after;
 
         // ── Tools-reviewer fallback chain ────────────────────────────────
+        // model/provider: channel dedicated → global dedicated → channel general → global general → compiled default
         agent.tools_reviewer_model = mo.tools_reviewer_model orelse mo.model orelse agent.tools_reviewer_model;
         agent.tools_reviewer_provider = mo.tools_reviewer_provider orelse mo.provider orelse agent.tools_reviewer_provider;
+        // Special params (temperature/max_context_tokens): dedicated chain ONLY, NO fallback to general
         if (mo.tools_reviewer_temperature) |t| agent.tools_reviewer_temperature = t;
         if (mo.tools_reviewer_max_context_tokens > 0) agent.tools_reviewer_max_context_tokens = mo.tools_reviewer_max_context_tokens;
         if (mo.tools_reviewer_base_url) |u| agent.tools_reviewer_base_url = u;
@@ -2219,13 +2216,14 @@ test "applyModelOverride sub_agent_model falls back to channel general model" {
     defer sm.deinit();
 
     const s = try sm.getOrCreate("override:sa2");
-    s.agent.sub_agent_model = "global/sub-agent-model";
+    s.agent.sub_agent_model = null; // No global set
 
     // Channel has general model but no sub_agent_model
+    // sub_agent_model SHOULD use channel's general model (per new rule)
     SessionManager.applyModelOverride(&s.agent, .{
         .model = "channel/general-model",
     });
-    // sub_agent_model should use channel's general model
+    // sub_agent_model should use channel general
     try testing.expectEqualStrings("channel/general-model", s.agent.sub_agent_model.?);
 }
 
@@ -2286,11 +2284,14 @@ test "applyModelOverride tools_reviewer_model falls back to channel general mode
     defer sm.deinit();
 
     const s = try sm.getOrCreate("override:tr2");
-    s.agent.tools_reviewer_model = "global/tools-reviewer-model";
+    s.agent.tools_reviewer_model = null; // No global set
 
+    // Channel has general model but no tools_reviewer_model
+    // tools_reviewer_model SHOULD use channel's general model (per new rule)
     SessionManager.applyModelOverride(&s.agent, .{
         .model = "channel/general-model",
     });
+    // tools_reviewer_model should use channel general
     try testing.expectEqualStrings("channel/general-model", s.agent.tools_reviewer_model.?);
 }
 
@@ -2333,9 +2334,12 @@ test "applyModelOverride sub_agent_provider falls back to channel general provid
     const s = try sm.getOrCreate("override:sap2");
     s.agent.sub_agent_provider = null;
 
+    // Channel has general provider but no sub_agent_provider
+    // sub_agent_provider SHOULD use channel's general provider (per new rule)
     SessionManager.applyModelOverride(&s.agent, .{
         .provider = "openrouter",
     });
+    // sub_agent_provider should use channel general
     try testing.expectEqualStrings("openrouter", s.agent.sub_agent_provider.?);
 }
 
@@ -2363,9 +2367,12 @@ test "applyModelOverride tools_reviewer_provider falls back to channel general p
     const s = try sm.getOrCreate("override:trp2");
     s.agent.tools_reviewer_provider = null;
 
+    // Channel has general provider but no tools_reviewer_provider
+    // tools_reviewer_provider SHOULD use channel's general provider (per new rule)
     SessionManager.applyModelOverride(&s.agent, .{
         .provider = "openai",
     });
+    // tools_reviewer_provider should use channel general
     try testing.expectEqualStrings("openai", s.agent.tools_reviewer_provider.?);
 }
 
@@ -2497,7 +2504,7 @@ test "applyModelOverride: sub_agent_max_iterations and review_after per-channel"
     try testing.expectEqual(@as(u32, 7), s.agent.sub_agent_review_after);
 }
 
-test "applyModelOverride full fallback chain: channel sub_agent > channel general > global sub_agent" {
+test "applyModelOverride full fallback chain: channel specific > global > channel general > global general > compiled default" {
     var mock = MockProvider{ .response = "ok" };
     const cfg = testConfig();
     var sm = testSessionManager(testing.allocator, &mock, &cfg);
@@ -2519,19 +2526,23 @@ test "applyModelOverride full fallback chain: channel sub_agent > channel genera
         try testing.expectEqualStrings("global-prov", s.agent.tools_reviewer_provider.?);
     }
 
-    // Test 2: global sub_agent_model set, channel has general model → channel general wins
+    // Test 2: global sub_agent_model set, channel has general model → uses channel general (NEW fallback behavior)
     {
         const s = try sm.getOrCreate("override:chain2");
-        s.agent.sub_agent_model = "global/sa";
-        s.agent.sub_agent_provider = "global-prov";
+        s.agent.sub_agent_model = null; // No global set
+        s.agent.sub_agent_provider = null;
 
         SessionManager.applyModelOverride(&s.agent, .{
             .provider = "ch-prov",
             .model = "ch/general",
         });
 
+        // Dedicated config DOES fall back to general config (new behavior)
         try testing.expectEqualStrings("ch/general", s.agent.sub_agent_model.?);
         try testing.expectEqualStrings("ch-prov", s.agent.sub_agent_provider.?);
+        // General model/provider ARE overridden
+        try testing.expectEqualStrings("ch/general", s.agent.default_model);
+        try testing.expectEqualStrings("ch-prov", s.agent.default_provider);
     }
 
     // Test 3: global + channel general + channel specific → channel specific wins
