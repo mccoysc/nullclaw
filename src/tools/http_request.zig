@@ -67,7 +67,7 @@ pub const HttpRequestTool = struct {
 
         // SSRF protection and DNS-rebinding hardening:
         // resolve once, validate global address, and connect directly to it.
-        const connect_host = net_security.resolveConnectHost(allocator, host, resolved_port) catch |err| switch (err) {
+        const connect_host = net_security.resolveConnectHost(allocator, host, resolved_port, null) catch |err| switch (err) {
             error.LocalAddressBlocked => return ToolResult.fail("Blocked local/private host"),
             else => return ToolResult.fail("Unable to verify host safety"),
         };

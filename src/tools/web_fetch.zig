@@ -54,7 +54,7 @@ pub const WebFetchTool = struct {
         // resolve once, validate global address, and connect directly to it.
         const host = net_security.extractHost(url) orelse
             return ToolResult.fail("Invalid URL: cannot extract host");
-        const connect_host = net_security.resolveConnectHost(allocator, host, resolved_port) catch |err| switch (err) {
+        const connect_host = net_security.resolveConnectHost(allocator, host, resolved_port, null) catch |err| switch (err) {
             error.LocalAddressBlocked => return ToolResult.fail("Blocked local/private host"),
             else => return ToolResult.fail("Unable to verify host safety"),
         };
@@ -490,9 +490,20 @@ test "WebFetchTool loopback decimal alias blocked" {
 }
 
 test "WebFetchTool blocked when host is not in allowlist" {
-    // Skip this test - behavior varies by DNS resolution environment
-    // On some systems/containers, google.com might resolve to a local address or fail DNS
-    return error.SkipZigTest;
+    // This test verifies that when allowlist is configured with a specific domain,
+    // requests to other domains are blocked.
+    // We test the allowlist logic directly without requiring DNS resolution.
+
+    const domains = [_][]const u8{"example.com"};
+
+    // First, verify the allowlist logic directly without making actual requests
+    // google.com should NOT match allowlist ["example.com"]
+    const host_matches = net_security.hostMatchesAllowlist("google.com", &domains);
+    try testing.expect(!host_matches); // google.com should NOT match allowlist ["example.com"]
+
+    // Also verify that example.com IS in the allowlist
+    const example_matches = net_security.hostMatchesAllowlist("example.com", &domains);
+    try testing.expect(example_matches);
 }
 
 test "WebFetchTool local host remains blocked with allowlist configured" {
