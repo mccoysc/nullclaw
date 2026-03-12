@@ -29,19 +29,18 @@ fn finalizeStreamResult(
     };
 }
 
-/// Read and log curl's stderr output when the process fails.
+/// Read stderr pipe into an owned buffer. Returns empty slice on failure.
+/// Must be called before child.wait() to avoid pipe deadlock.
+fn drainStderr(allocator: std.mem.Allocator, stderr_pipe: ?std.fs.File) []const u8 {
+    const stderr_file = stderr_pipe orelse return &.{};
+    return stderr_file.readToEndAlloc(allocator, 4096) catch return &.{};
+}
+
+/// Log pre-read curl stderr content when the process fails.
 /// Helps diagnose network errors (DNS, TLS, timeout, proxy, etc.).
-fn logCurlStderr(allocator: std.mem.Allocator, stderr_pipe: ?std.fs.File, exit_code: ?u8) void {
-    const stderr_file = stderr_pipe orelse {
-        log.err("curlStream failed (exit_code={?d}) stderr not available", .{exit_code});
-        return;
-    };
-    const stderr_output = stderr_file.readToEndAlloc(allocator, 4096) catch {
-        log.err("curlStream failed (exit_code={?d}) could not read stderr", .{exit_code});
-        return;
-    };
-    defer allocator.free(stderr_output);
-    const trimmed = std.mem.trimRight(u8, stderr_output, " \t\r\n");
+fn logCurlStderr(allocator: std.mem.Allocator, stderr_content: []const u8, exit_code: ?u8) void {
+    _ = allocator;
+    const trimmed = std.mem.trimRight(u8, stderr_content, " \t\r\n");
     if (trimmed.len > 0) {
         log.err("curlStream failed (exit_code={?d}): {s}", .{ exit_code, trimmed });
     } else {
@@ -351,13 +350,20 @@ pub fn curlStream(
             if (parsed) |p| {
                 defer p.deinit();
                 if (error_classify.classifyKnownApiError(p.value.object)) |kind| {
+                    // Drain stderr before wait to avoid pipe deadlock
+                    const early_stderr = drainStderr(allocator, child.stderr);
+                    defer allocator.free(early_stderr);
                     _ = child.wait() catch {};
                     return error_classify.kindToError(kind);
                 }
             }
 
-            // Return a meaningful error
-            _ = child.wait() catch {};
+            // Drain stderr before wait to avoid pipe deadlock
+            {
+                const early_stderr = drainStderr(allocator, child.stderr);
+                defer allocator.free(early_stderr);
+                _ = child.wait() catch {};
+            }
             debug_log.err("Server returned JSON error: {s}", .{json_response});
             return error.ServerError;
         }
@@ -423,6 +429,10 @@ pub fn curlStream(
         }
     }
 
+    // Drain stderr before wait() to avoid pipe deadlock
+    const stderr_content = drainStderr(allocator, child.stderr);
+    defer allocator.free(stderr_content);
+
     if (log_enabled) {
         debug_log.info("waiting for curl process to exit...", .{});
     }
@@ -445,7 +455,7 @@ pub fn curlStream(
                 callback(ctx, root.StreamChunk.finalChunk());
                 return finalizeStreamResult(allocator, accumulated.items, null);
             }
-            logCurlStderr(allocator, child.stderr, code);
+            logCurlStderr(allocator, stderr_content, code);
             return error.CurlFailed;
         },
         else => {
@@ -454,7 +464,7 @@ pub fn curlStream(
                 callback(ctx, root.StreamChunk.finalChunk());
                 return finalizeStreamResult(allocator, accumulated.items, null);
             }
-            logCurlStderr(allocator, child.stderr, null);
+            logCurlStderr(allocator, stderr_content, null);
             return error.CurlFailed;
         },
     }
@@ -697,6 +707,10 @@ pub fn curlStreamAnthropic(
         if (n == 0) break;
     }
 
+    // Drain stderr before wait() to avoid pipe deadlock
+    const stderr_content = drainStderr(allocator, child.stderr);
+    defer allocator.free(stderr_content);
+
     const term = child.wait() catch |err| {
         log.err("curlStreamAnthropic child.wait failed: {}", .{err});
         if (saw_done) {
@@ -713,7 +727,7 @@ pub fn curlStreamAnthropic(
                 callback(ctx, root.StreamChunk.finalChunk());
                 return finalizeStreamResult(allocator, accumulated.items, output_tokens);
             }
-            logCurlStderr(allocator, child.stderr, code);
+            logCurlStderr(allocator, stderr_content, code);
             return error.CurlFailed;
         },
         else => {
@@ -722,7 +736,7 @@ pub fn curlStreamAnthropic(
                 callback(ctx, root.StreamChunk.finalChunk());
                 return finalizeStreamResult(allocator, accumulated.items, output_tokens);
             }
-            logCurlStderr(allocator, child.stderr, null);
+            logCurlStderr(allocator, stderr_content, null);
             return error.CurlFailed;
         },
     }
@@ -895,11 +909,19 @@ test "extractAnthropicUsage correct JSON returns token count" {
     try std.testing.expect(result == 57);
 }
 
-test "logCurlStderr with null pipe does not crash" {
-    // Passing null stderr pipe should log gracefully without crashing
-    logCurlStderr(std.testing.allocator, null, 7);
+test "drainStderr with null pipe returns empty" {
+    const result = drainStderr(std.testing.allocator, null);
+    try std.testing.expectEqual(@as(usize, 0), result.len);
+}
+
+test "logCurlStderr with empty content does not crash" {
+    logCurlStderr(std.testing.allocator, &.{}, 7);
 }
 
 test "logCurlStderr with null exit code does not crash" {
-    logCurlStderr(std.testing.allocator, null, null);
+    logCurlStderr(std.testing.allocator, &.{}, null);
+}
+
+test "logCurlStderr with content logs message" {
+    logCurlStderr(std.testing.allocator, "curl: (6) Could not resolve host", 6);
 }
