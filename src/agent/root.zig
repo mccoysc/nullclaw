@@ -1216,12 +1216,18 @@ pub const Agent = struct {
             try memory_loader.enrichMessageWithRuntime(self.allocator, mem, self.mem_rt, effective_user_message, self.memory_session_id)
         else
             try self.allocator.dupe(u8, effective_user_message);
-        errdefer self.allocator.free(enriched);
 
-        try self.history.append(self.allocator, .{
+        // Ownership of `enriched` transfers to history on successful append.
+        // Free only if the append itself fails; after that, history owns it
+        // and will free it during deinit — no errdefer past this point to
+        // avoid a double-free when turn() errors out later.
+        self.history.append(self.allocator, .{
             .role = .user,
             .content = enriched,
-        });
+        }) catch |err| {
+            self.allocator.free(enriched);
+            return err;
+        };
 
         // Load skills once for hook evaluation across the entire turn.
         // Must be loaded before cache check so on_llm_request hooks can
