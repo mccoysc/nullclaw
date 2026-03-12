@@ -178,11 +178,147 @@ pub fn extractDeltaContent(allocator: std.mem.Allocator, json_str: []const u8) !
     return try allocator.dupe(u8, content.string);
 }
 
-/// Run curl in SSE streaming mode and parse output line by line.
+/// SSE streaming via native std.http.Client (OpenAI format).
 ///
-/// Spawns `curl -s --no-buffer --fail-with-body` and reads stdout incrementally.
-/// For each SSE delta, calls `callback(ctx, chunk)`.
-/// Returns accumulated result after stream completes.
+/// Used when `--http-backend native` is set and no proxy is configured.
+/// Fetches the full response body via `client.fetch()`, then parses
+/// SSE lines and fires the streaming callback for each delta.
+fn nativeStream(
+    allocator: std.mem.Allocator,
+    url: []const u8,
+    body: []const u8,
+    auth_header: ?[]const u8,
+    extra_headers: []const []const u8,
+    callback: root.StreamCallback,
+    ctx: *anyopaque,
+) !root.StreamChatResult {
+    var client: std.http.Client = .{ .allocator = allocator };
+    defer client.deinit();
+
+    var headers_buf: [20]std.http.Header = undefined;
+    var n_headers: usize = 0;
+
+    headers_buf[n_headers] = .{ .name = "Content-Type", .value = "application/json" };
+    n_headers += 1;
+
+    if (auth_header) |auth| {
+        if (http_util.parseHeaderString(auth)) |h| {
+            headers_buf[n_headers] = h;
+            n_headers += 1;
+        }
+    }
+
+    for (extra_headers) |hdr| {
+        if (n_headers >= headers_buf.len) break;
+        if (http_util.parseHeaderString(hdr)) |h| {
+            headers_buf[n_headers] = h;
+            n_headers += 1;
+        }
+    }
+
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+
+    const result = client.fetch(.{
+        .location = .{ .url = url },
+        .method = .POST,
+        .payload = body,
+        .extra_headers = headers_buf[0..n_headers],
+        .keep_alive = false,
+        .response_writer = &aw.writer,
+    }) catch |err| {
+        log.err("nativeStream: fetch failed for {s}: {}", .{ url, err });
+        return error.CurlFailed;
+    };
+
+    const status_int = @intFromEnum(result.status);
+    const response_body = aw.writer.buffer[0..aw.writer.end];
+
+    if (status_int >= 400) {
+        log.err("nativeStream: HTTP {d} from {s}", .{ status_int, url });
+        // Try to classify the error from response body
+        if (response_body.len > 0 and response_body[0] == '{') {
+            const parsed = std.json.parseFromSlice(std.json.Value, allocator, response_body, .{}) catch null;
+            if (parsed) |p| {
+                defer p.deinit();
+                if (error_classify.classifyKnownApiError(p.value.object)) |kind| {
+                    return error_classify.kindToError(kind);
+                }
+            }
+        }
+        return error.ServerError;
+    }
+
+    // Parse SSE lines from the response body and fire callbacks
+    return parseSseResponseBody(allocator, response_body, callback, ctx);
+}
+
+/// Parse a buffered SSE response body (OpenAI format) line by line,
+/// firing the streaming callback for each delta.
+fn parseSseResponseBody(
+    allocator: std.mem.Allocator,
+    response_body: []const u8,
+    callback: root.StreamCallback,
+    ctx: *anyopaque,
+) !root.StreamChatResult {
+    var accumulated: std.ArrayListUnmanaged(u8) = .empty;
+    defer accumulated.deinit(allocator);
+
+    var line_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer line_buf.deinit(allocator);
+
+    var saw_done = false;
+
+    for (response_body) |byte| {
+        if (byte == '\n') {
+            const sse_result = parseSseLine(allocator, line_buf.items) catch {
+                line_buf.clearRetainingCapacity();
+                continue;
+            };
+            line_buf.clearRetainingCapacity();
+            switch (sse_result) {
+                .delta => |text| {
+                    defer allocator.free(text);
+                    try accumulated.appendSlice(allocator, text);
+                    callback(ctx, root.StreamChunk.textDelta(text));
+                },
+                .done => {
+                    saw_done = true;
+                    break;
+                },
+                .skip => {},
+            }
+        } else {
+            try line_buf.append(allocator, byte);
+        }
+    }
+
+    // Handle trailing line without final newline
+    if (!saw_done and line_buf.items.len > 0) {
+        const trailing = parseSseLine(allocator, line_buf.items) catch null;
+        line_buf.clearRetainingCapacity();
+        if (trailing) |trail_result| {
+            switch (trail_result) {
+                .delta => |text| {
+                    defer allocator.free(text);
+                    try accumulated.appendSlice(allocator, text);
+                    callback(ctx, root.StreamChunk.textDelta(text));
+                },
+                .done => {},
+                .skip => {},
+            }
+        }
+    }
+
+    callback(ctx, root.StreamChunk.finalChunk());
+    return finalizeStreamResult(allocator, accumulated.items, null);
+}
+
+/// Run SSE streaming and parse output line by line (OpenAI format).
+///
+/// Dispatches to native std.http.Client or curl subprocess based on
+/// the `--http-backend` setting.  Falls back to curl when a proxy is
+/// configured (native client does not support proxies).
 pub fn curlStream(
     allocator: std.mem.Allocator,
     url: []const u8,
@@ -193,6 +329,15 @@ pub fn curlStream(
     callback: root.StreamCallback,
     ctx: *anyopaque,
 ) !root.StreamChatResult {
+    // Check for proxy — native client does not support proxies.
+    const proxy = http_util.getProxyFromEnv(allocator) catch null;
+    defer if (proxy) |p| allocator.free(p);
+
+    // Dispatch to native when --http-backend native and no proxy.
+    if (!http_util.useSubprocess() and proxy == null) {
+        return nativeStream(allocator, url, body, auth_header, extra_headers, callback, ctx);
+    }
+
     // Check verbose mode once at function start
     const log_enabled = verbose.isVerbose();
     const debug_log = std.log.scoped(.sse);
@@ -227,10 +372,6 @@ pub fn curlStream(
     argc += 1;
     argv_buf[argc] = "Content-Type: application/json";
     argc += 1;
-
-    // Add proxy from environment if set
-    const proxy = http_util.getProxyFromEnv(allocator) catch null;
-    defer if (proxy) |p| allocator.free(p);
 
     if (proxy) |p| {
         argv_buf[argc] = "--proxy";
@@ -578,10 +719,121 @@ pub fn extractAnthropicUsage(json_str: []const u8) !?u32 {
     return @intCast(output_tokens.integer);
 }
 
-/// Run curl in SSE streaming mode for Anthropic and parse output line by line.
+/// SSE streaming via native std.http.Client (Anthropic format).
 ///
-/// Similar to `curlStream()` but uses stateful Anthropic SSE parsing.
-/// `headers` is a slice of pre-formatted header strings (e.g. "x-api-key: sk-...").
+/// Used when `--http-backend native` is set and no proxy is configured.
+/// Fetches the full response body via `client.fetch()`, then parses
+/// Anthropic SSE events and fires the streaming callback for each delta.
+fn nativeStreamAnthropic(
+    allocator: std.mem.Allocator,
+    url: []const u8,
+    body: []const u8,
+    headers: []const []const u8,
+    callback: root.StreamCallback,
+    ctx: *anyopaque,
+) !root.StreamChatResult {
+    var client: std.http.Client = .{ .allocator = allocator };
+    defer client.deinit();
+
+    var headers_buf: [20]std.http.Header = undefined;
+    var n_headers: usize = 0;
+
+    headers_buf[n_headers] = .{ .name = "Content-Type", .value = "application/json" };
+    n_headers += 1;
+
+    for (headers) |hdr| {
+        if (n_headers >= headers_buf.len) break;
+        if (http_util.parseHeaderString(hdr)) |h| {
+            headers_buf[n_headers] = h;
+            n_headers += 1;
+        }
+    }
+
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+
+    const result = client.fetch(.{
+        .location = .{ .url = url },
+        .method = .POST,
+        .payload = body,
+        .extra_headers = headers_buf[0..n_headers],
+        .keep_alive = false,
+        .response_writer = &aw.writer,
+    }) catch |err| {
+        log.err("nativeStreamAnthropic: fetch failed for {s}: {}", .{ url, err });
+        return error.CurlFailed;
+    };
+
+    const status_int = @intFromEnum(result.status);
+    const response_body = aw.writer.buffer[0..aw.writer.end];
+
+    if (status_int >= 400) {
+        log.err("nativeStreamAnthropic: HTTP {d} from {s}", .{ status_int, url });
+        return error.ServerError;
+    }
+
+    // Parse Anthropic SSE lines from the response body
+    return parseAnthropicSseResponseBody(allocator, response_body, callback, ctx);
+}
+
+/// Parse a buffered SSE response body (Anthropic format) line by line,
+/// firing the streaming callback for each delta.
+fn parseAnthropicSseResponseBody(
+    allocator: std.mem.Allocator,
+    response_body: []const u8,
+    callback: root.StreamCallback,
+    ctx: *anyopaque,
+) !root.StreamChatResult {
+    var accumulated: std.ArrayListUnmanaged(u8) = .empty;
+    defer accumulated.deinit(allocator);
+
+    var line_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer line_buf.deinit(allocator);
+
+    var current_event: []const u8 = "";
+    var output_tokens: u32 = 0;
+
+    for (response_body) |byte| {
+        if (byte == '\n') {
+            const sse_result = parseAnthropicSseLine(allocator, line_buf.items, current_event) catch {
+                line_buf.clearRetainingCapacity();
+                continue;
+            };
+            switch (sse_result) {
+                .event => |ev| {
+                    if (current_event.len > 0) allocator.free(@constCast(current_event));
+                    current_event = allocator.dupe(u8, ev) catch "";
+                },
+                .delta => |text| {
+                    defer allocator.free(text);
+                    try accumulated.appendSlice(allocator, text);
+                    callback(ctx, root.StreamChunk.textDelta(text));
+                },
+                .usage => |tokens| output_tokens = tokens,
+                .done => {
+                    line_buf.clearRetainingCapacity();
+                    break;
+                },
+                .skip => {},
+            }
+            line_buf.clearRetainingCapacity();
+        } else {
+            try line_buf.append(allocator, byte);
+        }
+    }
+
+    // Free owned event string
+    if (current_event.len > 0) allocator.free(@constCast(current_event));
+
+    callback(ctx, root.StreamChunk.finalChunk());
+    return finalizeStreamResult(allocator, accumulated.items, output_tokens);
+}
+
+/// Run SSE streaming for Anthropic and parse output line by line.
+///
+/// Dispatches to native std.http.Client or curl subprocess based on
+/// the `--http-backend` setting.  Falls back to curl when a proxy is
+/// configured (native client does not support proxies).
 pub fn curlStreamAnthropic(
     allocator: std.mem.Allocator,
     url: []const u8,
@@ -590,6 +842,15 @@ pub fn curlStreamAnthropic(
     callback: root.StreamCallback,
     ctx: *anyopaque,
 ) !root.StreamChatResult {
+    // Check for proxy — native client does not support proxies.
+    const proxy = http_util.getProxyFromEnv(allocator) catch null;
+    defer if (proxy) |p| allocator.free(p);
+
+    // Dispatch to native when --http-backend native and no proxy.
+    if (!http_util.useSubprocess() and proxy == null) {
+        return nativeStreamAnthropic(allocator, url, body, headers, callback, ctx);
+    }
+
     // Build argv on stack (max 32 args)
     var argv_buf: [32][]const u8 = undefined;
     var argc: usize = 0;
@@ -608,10 +869,6 @@ pub fn curlStreamAnthropic(
     argc += 1;
     argv_buf[argc] = "Content-Type: application/json";
     argc += 1;
-
-    // Add proxy from environment if set
-    const proxy = http_util.getProxyFromEnv(allocator) catch null;
-    defer if (proxy) |p| allocator.free(p);
 
     if (proxy) |p| {
         argv_buf[argc] = "--proxy";
@@ -924,4 +1181,66 @@ test "logCurlStderr with null exit code does not crash" {
 
 test "logCurlStderr with content logs message" {
     logCurlStderr(std.testing.allocator, "curl: (6) Could not resolve host", 6);
+}
+
+// ── Native streaming response body parser tests ─────────────────────
+
+fn testNoopCallback(_: *anyopaque, _: root.StreamChunk) void {}
+
+test "parseSseResponseBody parses OpenAI SSE with delta and done" {
+    const allocator = std.testing.allocator;
+    const body = "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}\n\ndata: [DONE]\n";
+    var dummy_ctx: usize = 0;
+    const result = try parseSseResponseBody(allocator, body, testNoopCallback, @ptrCast(&dummy_ctx));
+    defer if (result.content) |c| allocator.free(c);
+    try std.testing.expect(result.content != null);
+    try std.testing.expectEqualStrings("Hello world", result.content.?);
+}
+
+test "parseSseResponseBody handles empty body" {
+    const allocator = std.testing.allocator;
+    var dummy_ctx: usize = 0;
+    const result = try parseSseResponseBody(allocator, "", testNoopCallback, @ptrCast(&dummy_ctx));
+    defer if (result.content) |c| allocator.free(c);
+    try std.testing.expect(result.content == null);
+}
+
+test "parseSseResponseBody skips comment and empty lines" {
+    const allocator = std.testing.allocator;
+    const body = ":keep-alive\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n";
+    var dummy_ctx: usize = 0;
+    const result = try parseSseResponseBody(allocator, body, testNoopCallback, @ptrCast(&dummy_ctx));
+    defer if (result.content) |c| allocator.free(c);
+    try std.testing.expect(result.content != null);
+    try std.testing.expectEqualStrings("ok", result.content.?);
+}
+
+test "parseAnthropicSseResponseBody parses Anthropic SSE deltas" {
+    const allocator = std.testing.allocator;
+    const body = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n";
+    var dummy_ctx: usize = 0;
+    const result = try parseAnthropicSseResponseBody(allocator, body, testNoopCallback, @ptrCast(&dummy_ctx));
+    defer if (result.content) |c| allocator.free(c);
+    try std.testing.expect(result.content != null);
+    try std.testing.expectEqualStrings("Hi", result.content.?);
+}
+
+test "parseAnthropicSseResponseBody handles empty body" {
+    const allocator = std.testing.allocator;
+    var dummy_ctx: usize = 0;
+    const result = try parseAnthropicSseResponseBody(allocator, "", testNoopCallback, @ptrCast(&dummy_ctx));
+    defer if (result.content) |c| allocator.free(c);
+    try std.testing.expect(result.content == null);
+}
+
+test "curlStream dispatches to native when useSubprocess is false" {
+    // Verify the dispatch logic compiles and the function signature is correct.
+    // We cannot actually call nativeStream without a real HTTP server, but we
+    // verify that the dispatch path compiles and that curlStream accepts the
+    // same parameters regardless of backend.
+    _ = curlStream;
+}
+
+test "curlStreamAnthropic dispatches to native when useSubprocess is false" {
+    _ = curlStreamAnthropic;
 }

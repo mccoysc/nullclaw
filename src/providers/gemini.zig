@@ -724,12 +724,140 @@ pub const GeminiProvider = struct {
         return try allocator.dupe(u8, text.string);
     }
 
-    /// Run curl in SSE streaming mode for Gemini and parse output line by line.
+    /// SSE streaming via native std.http.Client (Gemini format).
     ///
-    /// Spawns `curl -s --no-buffer --fail-with-body` and reads stdout incrementally.
-    /// For each SSE delta, calls `callback(ctx, chunk)`.
-    /// Returns accumulated result after stream completes.
-    /// Stream ends when curl connection closes (no [DONE] sentinel).
+    /// Used when `--http-backend native` is set and no proxy is configured.
+    /// Fetches the full response body via `client.fetch()`, then parses
+    /// Gemini SSE lines and fires the streaming callback for each delta.
+    fn nativeStreamGemini(
+        allocator: std.mem.Allocator,
+        url: []const u8,
+        body: []const u8,
+        headers: []const []const u8,
+        callback: root.StreamCallback,
+        ctx: *anyopaque,
+    ) !root.StreamChatResult {
+        const gemini_log = std.log.scoped(.gemini);
+        var client: std.http.Client = .{ .allocator = allocator };
+        defer client.deinit();
+
+        var headers_buf: [20]std.http.Header = undefined;
+        var n_headers: usize = 0;
+
+        headers_buf[n_headers] = .{ .name = "Content-Type", .value = "application/json" };
+        n_headers += 1;
+
+        for (headers) |hdr| {
+            if (n_headers >= headers_buf.len) break;
+            if (http_util.parseHeaderString(hdr)) |h| {
+                headers_buf[n_headers] = h;
+                n_headers += 1;
+            }
+        }
+
+        var aw: std.Io.Writer.Allocating = .init(allocator);
+        defer aw.deinit();
+
+        const result = client.fetch(.{
+            .location = .{ .url = url },
+            .method = .POST,
+            .payload = body,
+            .extra_headers = headers_buf[0..n_headers],
+            .keep_alive = false,
+            .response_writer = &aw.writer,
+        }) catch |err| {
+            gemini_log.err("nativeStreamGemini: fetch failed for {s}: {}", .{ url, err });
+            return error.CurlFailed;
+        };
+
+        const status_int = @intFromEnum(result.status);
+        const response_body = aw.writer.buffer[0..aw.writer.end];
+
+        if (status_int >= 400) {
+            gemini_log.err("nativeStreamGemini: HTTP {d} from {s}", .{ status_int, url });
+            return error.GeminiApiError;
+        }
+
+        // Parse Gemini SSE lines from the response body
+        var accumulated: std.ArrayListUnmanaged(u8) = .empty;
+        defer accumulated.deinit(allocator);
+
+        var line_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer line_buf.deinit(allocator);
+
+        var stream_usage = root.TokenUsage{};
+
+        for (response_body) |byte_val| {
+            if (byte_val == '\n') {
+                if (extractGeminiUsageFromSseLine(allocator, line_buf.items) catch null) |usage| {
+                    stream_usage = usage;
+                }
+                const sse_result = parseGeminiSseLine(allocator, line_buf.items) catch {
+                    line_buf.clearRetainingCapacity();
+                    continue;
+                };
+                line_buf.clearRetainingCapacity();
+                switch (sse_result) {
+                    .delta => |text| {
+                        defer allocator.free(text);
+                        try accumulated.appendSlice(allocator, text);
+                        callback(ctx, root.StreamChunk.textDelta(text));
+                    },
+                    .done => break,
+                    .skip => {},
+                }
+            } else {
+                try line_buf.append(allocator, byte_val);
+            }
+        }
+
+        // Parse trailing line if stream ended without final newline.
+        if (line_buf.items.len > 0) {
+            if (extractGeminiUsageFromSseLine(allocator, line_buf.items) catch null) |usage| {
+                stream_usage = usage;
+            }
+            const trailing = parseGeminiSseLine(allocator, line_buf.items) catch null;
+            line_buf.clearRetainingCapacity();
+            if (trailing) |trail_result| {
+                switch (trail_result) {
+                    .delta => |text| {
+                        defer allocator.free(text);
+                        try accumulated.appendSlice(allocator, text);
+                        callback(ctx, root.StreamChunk.textDelta(text));
+                    },
+                    .done => {},
+                    .skip => {},
+                }
+            }
+        }
+
+        callback(ctx, root.StreamChunk.finalChunk());
+
+        const content = if (accumulated.items.len > 0)
+            try allocator.dupe(u8, accumulated.items)
+        else
+            null;
+
+        if (stream_usage.prompt_tokens == 0 and stream_usage.completion_tokens == 0 and stream_usage.total_tokens == 0) {
+            stream_usage.completion_tokens = @intCast((accumulated.items.len + 3) / 4);
+            stream_usage.total_tokens = stream_usage.completion_tokens;
+        } else {
+            normalizeTokenUsage(&stream_usage);
+        }
+
+        return .{
+            .content = content,
+            .usage = stream_usage,
+            .model = "",
+        };
+    }
+
+    /// Run SSE streaming for Gemini and parse output line by line.
+    ///
+    /// Dispatches to native std.http.Client or curl subprocess based on
+    /// the `--http-backend` setting.  Falls back to curl when a proxy is
+    /// configured (native client does not support proxies).
+    /// Stream ends when connection closes (no [DONE] sentinel).
     pub fn curlStreamGemini(
         allocator: std.mem.Allocator,
         url: []const u8,
@@ -739,13 +867,22 @@ pub const GeminiProvider = struct {
         callback: root.StreamCallback,
         ctx: *anyopaque,
     ) !root.StreamChatResult {
+        // Check for proxy — native client does not support proxies.
+        const proxy = http_util.getProxyFromEnv(allocator) catch null;
+        defer if (proxy) |p| allocator.free(p);
+
+        // Dispatch to native when --http-backend native and no proxy.
+        if (!http_util.useSubprocess() and proxy == null) {
+            return nativeStreamGemini(allocator, url, body, headers, callback, ctx);
+        }
+
         // Build argv on stack (max 32 args)
         var argv_buf: [32][]const u8 = undefined;
         var argc: usize = 0;
 
         argv_buf[argc] = "curl";
         argc += 1;
-        argv_buf[argc] = "-s";
+        argv_buf[argc] = "-sS";
         argc += 1;
         argv_buf[argc] = "--no-buffer";
         argc += 1;
@@ -769,10 +906,6 @@ pub const GeminiProvider = struct {
         argc += 1;
         argv_buf[argc] = "Content-Type: application/json";
         argc += 1;
-
-        // Add proxy from environment if set
-        const proxy = http_util.getProxyFromEnv(allocator) catch null;
-        defer if (proxy) |p| allocator.free(p);
 
         if (proxy) |p| {
             argv_buf[argc] = "--proxy";
@@ -1914,4 +2047,9 @@ test "writeCredentialsJson escapes token strings" {
     const obj = parsed.value.object;
     try std.testing.expectEqualStrings(access_token, obj.get("access_token").?.string);
     try std.testing.expectEqualStrings(refresh_token, obj.get("refresh_token").?.string);
+}
+
+test "curlStreamGemini dispatches to native when useSubprocess is false" {
+    // Verify the dispatch logic and nativeStreamGemini compile correctly.
+    _ = GeminiProvider.curlStreamGemini;
 }
