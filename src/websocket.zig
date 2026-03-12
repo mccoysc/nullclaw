@@ -349,6 +349,13 @@ pub const WsClient = struct {
         try self.writeFrameLocked(.text, text);
     }
 
+    /// Send a binary frame (acquires write_mu).
+    pub fn writeBinary(self: *WsClient, data: []const u8) !void {
+        self.write_mu.lock();
+        defer self.write_mu.unlock();
+        try self.writeFrameLocked(.binary, data);
+    }
+
     /// Send a close frame (acquires write_mu, ignores errors).
     pub fn writeClose(self: *WsClient) void {
         self.write_mu.lock();
@@ -386,7 +393,7 @@ pub const WsClient = struct {
                     }
                 },
                 .ping => {}, // auto-handled inside readFrame
-                .binary => {}, // Discord uses text only
+                .binary => {}, // binary frames handled by readFrame() directly
                 else => {},
             }
         }
