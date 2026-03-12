@@ -297,8 +297,8 @@ pub const TelegramConfig = struct {
     interactive: TelegramInteractiveConfig = .{},
     /// When true, only respond to messages that @mention the bot (in groups).
     require_mention: bool = false,
-    /// Enable streaming mode for voice calls
-    streaming: bool = false,
+    /// Enable streaming mode for text output
+    streaming: bool = true,
 };
 
 pub const DiscordConfig = struct {

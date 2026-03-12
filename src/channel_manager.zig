@@ -436,11 +436,15 @@ pub const ChannelManager = struct {
         };
         new_config.* = new_config_val;
 
+        log.info("checkConfigReload: new config loaded, default_provider='{s}', providers.len={d}", .{ new_config.default_provider, new_config.providers.len });
+
         // Diff and apply changes
         self.applyConfigReload(new_config, state);
 
         // Save old config pointer before overwriting — needed for provider change detection.
         const old_config = self.config;
+
+        log.info("checkConfigReload: old config default_provider='{s}', providers.len={d}", .{ old_config.default_provider, old_config.providers.len });
 
         // Store the old config (don't free — running channels may still reference it)
         self.prev_configs.append(self.allocator, @constCast(self.config)) catch {};
@@ -455,7 +459,10 @@ pub const ChannelManager = struct {
 
             // If provider credentials or default_provider changed, rebuild the
             // provider bundle so existing sessions pick up the new API key.
-            if (providerConfigChanged(old_config, new_config)) {
+            const provider_changed = providerConfigChanged(old_config, new_config);
+            log.info("checkConfigReload: providerConfigChanged returned {}", .{provider_changed});
+            if (provider_changed) {
+                log.info("checkConfigReload: calling rebuildProvider", .{});
                 rt.rebuildProvider(new_config);
             }
 
@@ -475,6 +482,21 @@ pub const ChannelManager = struct {
                     mgr.default_model = new_config.default_model;
                     log.info("Subagent manager config updated for sub-agent specific changes", .{});
                 }
+            }
+
+            // Update http_request tool config (allowed_domains, max_response_size)
+            if (httpRequestConfigChanged(old_config, new_config)) {
+                rt.updateHttpRequestConfig(
+                    new_config.http_request.enabled,
+                    new_config.http_request.max_response_size,
+                    new_config.http_request.timeout_secs,
+                    new_config.http_request.allowed_domains,
+                    new_config.http_request.proxy,
+                    new_config.http_request.search_base_url,
+                    new_config.http_request.search_provider,
+                    new_config.http_request.search_fallback_providers,
+                );
+                log.info("http_request tool config hot-reloaded", .{});
             }
         }
 
@@ -1172,34 +1194,74 @@ fn globalModelConfigChanged(old: *const Config, new: *const Config) bool {
 /// triggers a provider rebuild.
 fn providerConfigChanged(old: *const Config, new: *const Config) bool {
     // Default provider name changed → need a new provider.
-    if (!std.mem.eql(u8, old.default_provider, new.default_provider)) return true;
+    if (!std.mem.eql(u8, old.default_provider, new.default_provider)) {
+        log.info("providerConfigChanged: default_provider changed from '{s}' to '{s}'", .{ old.default_provider, new.default_provider });
+        return true;
+    }
 
     // Compare provider entries: count, names, api_keys, base_urls.
-    if (old.providers.len != new.providers.len) return true;
+    if (old.providers.len != new.providers.len) {
+        log.info("providerConfigChanged: providers.len changed from {d} to {d}", .{ old.providers.len, new.providers.len });
+        return true;
+    }
     for (old.providers, new.providers) |o, n| {
-        if (!std.mem.eql(u8, o.name, n.name)) return true;
-        if (!optionalStrEql(o.api_key, n.api_key)) return true;
-        if (!optionalStrEql(o.base_url, n.base_url)) return true;
-        if (!optionalStrEql(o.user_agent, n.user_agent)) return true;
-        if (o.native_tools != n.native_tools) return true;
+        if (!std.mem.eql(u8, o.name, n.name)) {
+            log.info("providerConfigChanged: provider name changed from '{s}' to '{s}'", .{ o.name, n.name });
+            return true;
+        }
+        if (!optionalStrEql(o.api_key, n.api_key)) {
+            log.info("providerConfigChanged: provider '{s}' api_key changed", .{o.name});
+            return true;
+        }
+        if (!optionalStrEql(o.base_url, n.base_url)) {
+            log.info("providerConfigChanged: provider '{s}' base_url changed", .{o.name});
+            return true;
+        }
+        if (!optionalStrEql(o.user_agent, n.user_agent)) {
+            log.info("providerConfigChanged: provider '{s}' user_agent changed", .{o.name});
+            return true;
+        }
+        if (o.native_tools != n.native_tools) {
+            log.info("providerConfigChanged: provider '{s}' native_tools changed from {s} to {s}", .{ o.name, @as([]const u8, if (o.native_tools) "true" else "false"), @as([]const u8, if (n.native_tools) "true" else "false") });
+            return true;
+        }
     }
 
     // Reliability API keys (key rotation) changed.
-    if (old.reliability.api_keys.len != new.reliability.api_keys.len) return true;
+    if (old.reliability.api_keys.len != new.reliability.api_keys.len) {
+        log.info("providerConfigChanged: reliability.api_keys.len changed from {d} to {d}", .{ old.reliability.api_keys.len, new.reliability.api_keys.len });
+        return true;
+    }
     for (old.reliability.api_keys, new.reliability.api_keys) |o, n| {
-        if (!std.mem.eql(u8, o, n)) return true;
+        if (!std.mem.eql(u8, o, n)) {
+            log.info("providerConfigChanged: reliability.api_keys element changed", .{});
+            return true;
+        }
     }
 
     // Fallback provider list changed.
-    if (old.reliability.fallback_providers.len != new.reliability.fallback_providers.len) return true;
+    if (old.reliability.fallback_providers.len != new.reliability.fallback_providers.len) {
+        log.info("providerConfigChanged: reliability.fallback_providers.len changed from {d} to {d}", .{ old.reliability.fallback_providers.len, new.reliability.fallback_providers.len });
+        return true;
+    }
     for (old.reliability.fallback_providers, new.reliability.fallback_providers) |o, n| {
-        if (!std.mem.eql(u8, o, n)) return true;
+        if (!std.mem.eql(u8, o, n)) {
+            log.info("providerConfigChanged: reliability.fallback_providers element changed from '{s}' to '{s}'", .{ o, n });
+            return true;
+        }
     }
 
     // Retry settings changed.
-    if (old.reliability.provider_retries != new.reliability.provider_retries) return true;
-    if (old.reliability.provider_backoff_ms != new.reliability.provider_backoff_ms) return true;
+    if (old.reliability.provider_retries != new.reliability.provider_retries) {
+        log.info("providerConfigChanged: provider_retries changed from {d} to {d}", .{ old.reliability.provider_retries, new.reliability.provider_retries });
+        return true;
+    }
+    if (old.reliability.provider_backoff_ms != new.reliability.provider_backoff_ms) {
+        log.info("providerConfigChanged: provider_backoff_ms changed from {d} to {d}", .{ old.reliability.provider_backoff_ms, new.reliability.provider_backoff_ms });
+        return true;
+    }
 
+    log.info("providerConfigChanged: no changes detected", .{});
     return false;
 }
 
@@ -1221,6 +1283,33 @@ fn subagentConfigChanged(old: *const Config, new: *const Config) bool {
     if (!std.mem.eql(u8, old.default_provider, new.default_provider)) return true;
     if (!optionalStrEql(old.default_model, new.default_model)) return true;
 
+    return false;
+}
+
+/// Check if http_request tool config changed between old and new configs.
+fn httpRequestConfigChanged(old: *const Config, new: *const Config) bool {
+    // Check enabled
+    if (old.http_request.enabled != new.http_request.enabled) return true;
+    // Check max_response_size
+    if (old.http_request.max_response_size != new.http_request.max_response_size) return true;
+    // Check timeout_secs
+    if (old.http_request.timeout_secs != new.http_request.timeout_secs) return true;
+    // Check allowed_domains
+    if (old.http_request.allowed_domains.len != new.http_request.allowed_domains.len) return true;
+    for (old.http_request.allowed_domains, new.http_request.allowed_domains) |old_domain, new_domain| {
+        if (!std.mem.eql(u8, old_domain, new_domain)) return true;
+    }
+    // Check proxy (optional string)
+    if (!optionalStrEql(old.http_request.proxy, new.http_request.proxy)) return true;
+    // Check search_base_url (optional string)
+    if (!optionalStrEql(old.http_request.search_base_url, new.http_request.search_base_url)) return true;
+    // Check search_provider
+    if (!std.mem.eql(u8, old.http_request.search_provider, new.http_request.search_provider)) return true;
+    // Check search_fallback_providers
+    if (old.http_request.search_fallback_providers.len != new.http_request.search_fallback_providers.len) return true;
+    for (old.http_request.search_fallback_providers, new.http_request.search_fallback_providers) |old_fp, new_fp| {
+        if (!std.mem.eql(u8, old_fp, new_fp)) return true;
+    }
     return false;
 }
 

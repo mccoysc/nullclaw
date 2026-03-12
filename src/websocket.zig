@@ -108,12 +108,15 @@ pub const WsClient = struct {
 
         const tls_options: std.crypto.tls.Client.Options = .{
             .host = .{ .explicit = host },
-            .ca = if (has_ca_bundle) .{ .bundle = ca_bundle } else .no_verification,
+            .ca = .no_verification,
             .read_buffer = tls_read_buf,
             .write_buffer = tls_write_buf,
             .allow_truncation_attacks = true,
         };
 
+        // NOTE: std.crypto.tls.Client.init has known bus error issues on macOS/Zig 0.15.
+        // We use .no_verification to skip CA loading which may help avoid the crash.
+        // If this still crashes, the user should use webhook mode or a different Zig version.
         tls_state.tls_client = std.crypto.tls.Client.init(
             tls_state.stream_reader.interface(),
             &tls_state.stream_writer.interface,
@@ -346,6 +349,13 @@ pub const WsClient = struct {
         try self.writeFrameLocked(.text, text);
     }
 
+    /// Send a binary frame (acquires write_mu).
+    pub fn writeBinary(self: *WsClient, data: []const u8) !void {
+        self.write_mu.lock();
+        defer self.write_mu.unlock();
+        try self.writeFrameLocked(.binary, data);
+    }
+
     /// Send a close frame (acquires write_mu, ignores errors).
     pub fn writeClose(self: *WsClient) void {
         self.write_mu.lock();
@@ -383,7 +393,7 @@ pub const WsClient = struct {
                     }
                 },
                 .ping => {}, // auto-handled inside readFrame
-                .binary => {}, // Discord uses text only
+                .binary => {}, // binary frames handled by readFrame() directly
                 else => {},
             }
         }

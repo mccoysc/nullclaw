@@ -75,10 +75,18 @@ pub const Session = struct {
     session_key: []const u8, // owned copy
     turn_count: u64,
     mutex: std.Thread.Mutex,
+    /// Message queue for handling messages that arrive while processing
+    message_queue: std.ArrayListUnmanaged([]const u8) = .empty,
+    /// Whether the session is currently processing a message
+    is_processing: bool = false,
 
     pub fn deinit(self: *Session, allocator: Allocator) void {
         self.agent.deinit();
         allocator.free(self.session_key);
+        for (self.message_queue.items) |msg| {
+            allocator.free(msg);
+        }
+        self.message_queue.deinit(allocator);
     }
 };
 
@@ -436,6 +444,39 @@ pub const SessionManager = struct {
         }
     }
 
+    /// Queue checkpoint callback - invoked at LLM/tool execution gaps to check for queued messages.
+    /// Returns true if messages were consumed (agent should continue with new messages).
+    /// This enables interrupting long-running tool loops when user sends new messages.
+    /// NOTE: We transfer ownership of queued messages to agent.history, so we do NOT
+    /// free them here - history will free them when the agent is deinitialized.
+    fn sessionQueueCheckpoint(ctx_ptr: *anyopaque) bool {
+        const session: *Session = @ptrCast(@alignCast(ctx_ptr));
+        // Check if there are queued messages
+        if (session.message_queue.items.len == 0) {
+            return false;
+        }
+
+        // Add a system message explaining that previous task is incomplete
+        const interrupt_msg = "[System: 用户在任务执行过程中插入了新消息。请先确认之前的工作状态，然后根据新消息决定下一步动作。]";
+        session.agent.history.append(session.agent.allocator, .{
+            .role = .system,
+            .content = session.agent.allocator.dupe(u8, interrupt_msg) catch "",
+        }) catch {};
+
+        // Drain all queued messages into agent history as user messages
+        // The caller holds session.mutex, so this is safe
+        for (session.message_queue.items) |msg| {
+            session.agent.history.append(session.agent.allocator, .{
+                .role = .user,
+                .content = msg,
+            }) catch {};
+        }
+        // Clear the queue - we transferred ownership to history, so don't free
+        // The items will be freed when agent.history is deinitialized
+        session.message_queue.clearRetainingCapacity();
+        return true;
+    }
+
     /// Find or create a session for the given key. Thread-safe.
     pub fn getOrCreate(self: *SessionManager, session_key: []const u8) !*Session {
         self.mutex.lock();
@@ -443,6 +484,11 @@ pub const SessionManager = struct {
 
         if (self.sessions.get(session_key)) |session| {
             session.last_active = std.time.timestamp();
+            // Ensure queue checkpoint callback is wired for existing sessions too.
+            // This is needed because older sessions may not have had the callback set
+            // (it was added later to support message queue interruption).
+            session.agent.queue_checkpoint_callback = sessionQueueCheckpoint;
+            session.agent.queue_checkpoint_ctx = @ptrCast(session);
             return session;
         }
 
@@ -508,6 +554,11 @@ pub const SessionManager = struct {
             agent.usage_record_callback = usageRecordForwarder;
             agent.usage_record_ctx = @ptrCast(self);
         }
+
+        // Wire queue checkpoint callback to enable interrupting long-running tool loops
+        // when user sends new messages during processing.
+        agent.queue_checkpoint_callback = sessionQueueCheckpoint;
+        agent.queue_checkpoint_ctx = @ptrCast(session);
 
         // Apply remaining per-channel model overrides (provider, temperature,
         // sub_agent/tools_reviewer fields, etc.)
@@ -760,8 +811,31 @@ pub const SessionManager = struct {
 
         const session = try self.getOrCreate(session_key);
 
+        // Check if session is already processing a message.
+        // If so, queue this message and return immediately (non-blocking).
+        // This allows users to interrupt with new messages without waiting.
         session.mutex.lock();
         defer session.mutex.unlock();
+
+        if (session.is_processing) {
+            // Queue the incoming message for later processing
+            const owned_content = try self.allocator.dupe(u8, content);
+            errdefer self.allocator.free(owned_content);
+            try session.message_queue.append(self.allocator, owned_content);
+            if (self.config.diagnostics.log_message_receipts) {
+                log.info("message queued channel={s} session=0x{x} queue_len={d}", .{
+                    channel,
+                    session_hash,
+                    session.message_queue.items.len,
+                });
+            }
+            // Return a non-empty response to indicate message was queued
+            return try self.allocator.dupe(u8, "[message queued]");
+        }
+
+        // Mark session as processing and proceed with normal flow
+        session.is_processing = true;
+        errdefer session.is_processing = false;
 
         // Set conversation context for this turn (Signal-specific for now)
         session.agent.conversation_context = conversation_context;
@@ -819,6 +893,7 @@ pub const SessionManager = struct {
                             try self.allocator.dupe(u8, hook_result.content)
                         else
                             try self.allocator.dupe(u8, "[skill hook agent error]");
+                        session.is_processing = false;
                         return err_response;
                     },
                     .intercept => {
@@ -826,6 +901,7 @@ pub const SessionManager = struct {
                             try self.allocator.dupe(u8, hook_result.content)
                         else
                             try self.allocator.dupe(u8, "[intercepted by on_channel_receive_before hook]");
+                        session.is_processing = false;
                         return intercept_response;
                     },
                     .continue_with => {
@@ -843,6 +919,58 @@ pub const SessionManager = struct {
         errdefer self.allocator.free(response);
         session.turn_count += 1;
         session.last_active = std.time.timestamp();
+
+        // ── Drain message queue ──
+        // After each turn completes, check if there are queued messages
+        // and process them. This enables batch processing of interrupting messages.
+        while (session.message_queue.items.len > 0) {
+            // Drain all queued messages into a single batch
+            const queued_count = session.message_queue.items.len;
+            if (self.config.diagnostics.log_message_receipts) {
+                log.info("draining message queue channel={s} session=0x{x} count={d}", .{
+                    channel,
+                    session_hash,
+                    queued_count,
+                });
+            }
+
+            // Collect all queued messages
+            var batch_content: std.ArrayListUnmanaged(u8) = .empty;
+            defer batch_content.deinit(self.allocator);
+
+            // Free the queued message buffers after collecting
+            for (session.message_queue.items) |msg| {
+                if (batch_content.items.len > 0) {
+                    batch_content.appendSlice(self.allocator, "\n---\n") catch {};
+                }
+                batch_content.appendSlice(self.allocator, msg) catch {};
+            }
+            // Clear and free the queue
+            for (session.message_queue.items) |msg| {
+                self.allocator.free(msg);
+            }
+            session.message_queue.clearRetainingCapacity();
+
+            // Process the batch as a single turn
+            const batch_response = try session.agent.turn(batch_content.items);
+            errdefer self.allocator.free(batch_response);
+            session.turn_count += 1;
+            session.last_active = std.time.timestamp();
+
+            if (self.config.diagnostics.log_message_receipts) {
+                log.info("queue batch processed channel={s} session=0x{x} new_turn_count={d}", .{
+                    channel,
+                    session_hash,
+                    session.turn_count,
+                });
+            }
+        }
+
+        // Mark session as no longer processing
+        // Note: is_processing remains true during queue draining because
+        // we hold the mutex and new messages should be queued, not processed
+        // immediately (they'll be picked up in the next drain cycle)
+        session.is_processing = false;
 
         // ── on_channel_receive_after hook ──
         var post_receive_response = response;
@@ -1232,6 +1360,52 @@ const DeltaCollector = struct {
     fn deinit(self: *DeltaCollector) void {
         self.data.deinit(self.allocator);
     }
+};
+
+/// MockErrorProvider — always returns error.CurlFailed, simulating network failure.
+const MockErrorProvider = struct {
+    const vtable = Provider.VTable{
+        .chatWithSystem = mockChatWithSystem,
+        .chat = mockChat,
+        .supportsNativeTools = mockSupportsNativeTools,
+        .getName = mockGetName,
+        .deinit = mockDeinit,
+    };
+
+    fn provider(self: *MockErrorProvider) Provider {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+    }
+
+    fn mockChatWithSystem(
+        _: *anyopaque,
+        _: Allocator,
+        _: ?[]const u8,
+        _: []const u8,
+        _: []const u8,
+        _: f64,
+    ) anyerror![]const u8 {
+        return error.CurlFailed;
+    }
+
+    fn mockChat(
+        _: *anyopaque,
+        _: Allocator,
+        _: providers.ChatRequest,
+        _: []const u8,
+        _: f64,
+    ) anyerror!providers.ChatResponse {
+        return error.CurlFailed;
+    }
+
+    fn mockSupportsNativeTools(_: *anyopaque) bool {
+        return false;
+    }
+
+    fn mockGetName(_: *anyopaque) []const u8 {
+        return "mock_error";
+    }
+
+    fn mockDeinit(_: *anyopaque) void {}
 };
 
 /// Create a test SessionManager with mock provider.
@@ -1888,6 +2062,109 @@ test "processMessage /restart clears autosave only for current session" {
     defer if (b_entry) |entry| entry.deinit(testing.allocator);
     try testing.expect(b_entry != null);
     try testing.expectEqualStrings("session b", b_entry.?.content);
+}
+
+// ---------------------------------------------------------------------------
+// 8. Message queue tests (interrupt handling)
+// ---------------------------------------------------------------------------
+
+test "processMessage queues messages when session is processing" {
+    var mock = MockProvider{ .response = "processing" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session = try sm.getOrCreate("queue:test");
+    try testing.expect(!session.is_processing);
+    try testing.expectEqual(@as(usize, 0), session.message_queue.items.len);
+
+    // First message starts processing (is_processing is set to true after lock)
+    // But since we don't hold the lock, simulate by setting is_processing manually
+    session.is_processing = true;
+
+    // Second message should be queued
+    const resp = try sm.processMessage("queue:test", "second message", null);
+    defer testing.allocator.free(resp);
+    try testing.expectEqualStrings("[message queued]", resp);
+    try testing.expectEqual(@as(usize, 1), session.message_queue.items.len);
+
+    // Clean up
+    session.is_processing = false;
+    for (session.message_queue.items) |msg| {
+        testing.allocator.free(msg);
+    }
+    session.message_queue.clearRetainingCapacity();
+}
+
+test "processMessage drains queue after turn completes" {
+    var mock = MockProvider{ .response = "done" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session = try sm.getOrCreate("queue:drain");
+    try testing.expect(!session.is_processing);
+    try testing.expectEqual(@as(usize, 0), session.message_queue.items.len);
+
+    // Simulate a message already in queue
+    try session.message_queue.append(testing.allocator, try testing.allocator.dupe(u8, "queued msg 1"));
+    try session.message_queue.append(testing.allocator, try testing.allocator.dupe(u8, "queued msg 2"));
+    try testing.expectEqual(@as(usize, 2), session.message_queue.items.len);
+
+    // Process a new message - this should drain the queue
+    const resp = try sm.processMessage("queue:drain", "new message", null);
+    defer testing.allocator.free(resp);
+    try testing.expectEqualStrings("done", resp);
+
+    // Queue should be drained
+    try testing.expectEqual(@as(usize, 0), session.message_queue.items.len);
+    try testing.expectEqual(@as(u64, 1), session.turn_count);
+}
+
+test "sessionQueueCheckpoint drains messages into history" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session = try sm.getOrCreate("checkpoint:test");
+
+    // Add messages to queue
+    try session.message_queue.append(testing.allocator, try testing.allocator.dupe(u8, "queue msg 1"));
+    try session.message_queue.append(testing.allocator, try testing.allocator.dupe(u8, "queue msg 2"));
+    try testing.expectEqual(@as(usize, 2), session.message_queue.items.len);
+
+    // Initial history length
+    const history_before = session.agent.history.items.len;
+
+    // Call the checkpoint function
+    const result = SessionManager.sessionQueueCheckpoint(@ptrCast(session));
+    try testing.expect(result); // Should return true because messages were consumed
+
+    // Queue should be cleared
+    try testing.expectEqual(@as(usize, 0), session.message_queue.items.len);
+
+    // History should have 1 system message + 2 new user messages = 3 total
+    try testing.expectEqual(@as(usize, history_before + 3), session.agent.history.items.len);
+    // role is of type providers.Role
+    // First entry is the system interrupt message
+    try testing.expectEqual(providers.Role.system, session.agent.history.items[history_before].role);
+    // Then the two user messages
+    try testing.expectEqual(providers.Role.user, session.agent.history.items[history_before + 1].role);
+    try testing.expectEqual(providers.Role.user, session.agent.history.items[history_before + 2].role);
+}
+
+test "sessionQueueCheckpoint returns false when queue is empty" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session = try sm.getOrCreate("checkpoint:empty");
+    try testing.expectEqual(@as(usize, 0), session.message_queue.items.len);
+
+    const result = SessionManager.sessionQueueCheckpoint(@ptrCast(session));
+    try testing.expect(!result); // Should return false because queue is empty
 }
 
 test "processMessage with sqlite memory first turn does not panic" {
@@ -2787,4 +3064,36 @@ test "processMessage returns RegistryDraining error when registry is draining" {
 
     const result = sm.processMessage("drain:test", "hello", null);
     try testing.expectError(error.RegistryDraining, result);
+}
+
+test "processMessage resets is_processing on provider error" {
+    var mock_err = MockErrorProvider{};
+    const cfg = testConfig();
+    var noop_obs = observability.NoopObserver{};
+    var sm = SessionManager.init(
+        testing.allocator,
+        &cfg,
+        mock_err.provider(),
+        &.{},
+        null,
+        noop_obs.observer(),
+        null,
+        null,
+    );
+    defer sm.deinit();
+
+    const session = try sm.getOrCreate("err:test");
+    try testing.expect(!session.is_processing);
+
+    // First call should fail with CurlFailed
+    const result = sm.processMessage("err:test", "hello", null);
+    try testing.expectError(error.CurlFailed, result);
+
+    // is_processing must be reset to false so subsequent messages are not queued
+    try testing.expect(!session.is_processing);
+
+    // Verify a second call also returns CurlFailed (not "[message queued]")
+    const result2 = sm.processMessage("err:test", "world", null);
+    try testing.expectError(error.CurlFailed, result2);
+    try testing.expect(!session.is_processing);
 }

@@ -2168,13 +2168,16 @@ pub const TelegramChannel = struct {
         self.bot_user_id = null;
     }
 
-    // ── Draft streaming (sendMessageDraft) ─────────────────────────
+    // ── Draft streaming (editMessageText) ───────────────────────
 
     fn deinitDraftBuffers(self: *TelegramChannel) void {
         telegram_draft_presenter.deinitDraftBuffers(self.allocator, &self.draft_buffers);
     }
 
-    fn sendDraft(self: *TelegramChannel, chat_id: []const u8, draft_id: u64, text: []const u8) void {
+    /// Send or edit a draft message for streaming output.
+    /// - First chunk: sends a new message via sendMessage, stores message_id in DraftState
+    /// - Subsequent chunks: edits the existing message via editMessageText
+    fn sendDraft(self: *TelegramChannel, chat_id: []const u8, state: *DraftState, text: []const u8) void {
         if (builtin.is_test) return;
         if (!telegram_draft_presenter.hasVisibleDraftText(text)) return;
 
@@ -2182,40 +2185,58 @@ pub const TelegramChannel = struct {
         const html_text = markdownToTelegramHtml(self.allocator, text) catch null;
         defer if (html_text) |h| self.allocator.free(h);
 
-        var body: std.ArrayListUnmanaged(u8) = .empty;
-        defer body.deinit(self.allocator);
+        if (state.message_id == null) {
+            // First chunk: send a new message
+            var body: std.ArrayListUnmanaged(u8) = .empty;
+            defer body.deinit(self.allocator);
 
-        body.appendSlice(self.allocator, "{\"chat_id\":") catch return;
-        body.appendSlice(self.allocator, chat_id) catch return;
-        body.appendSlice(self.allocator, ",\"draft_id\":") catch return;
-        var id_buf: [20]u8 = undefined;
-        const id_str = std.fmt.bufPrint(&id_buf, "{d}", .{draft_id}) catch return;
-        body.appendSlice(self.allocator, id_str) catch return;
-        body.appendSlice(self.allocator, ",\"text\":") catch return;
-        if (html_text) |h| {
-            root.json_util.appendJsonString(&body, self.allocator, h) catch return;
-            body.appendSlice(self.allocator, ",\"parse_mode\":\"HTML\"") catch return;
+            body.appendSlice(self.allocator, "{\"chat_id\":") catch return;
+            body.appendSlice(self.allocator, chat_id) catch return;
+            body.appendSlice(self.allocator, ",\"text\":") catch return;
+            if (html_text) |h| {
+                root.json_util.appendJsonString(&body, self.allocator, h) catch return;
+                body.appendSlice(self.allocator, ",\"parse_mode\":\"HTML\"") catch return;
+            } else {
+                root.json_util.appendJsonString(&body, self.allocator, text) catch return;
+            }
+            body.appendSlice(self.allocator, "}") catch return;
+
+            const resp = self.api().sendMessage(self.allocator, body.items, "10") catch |err| {
+                log.warn("sendMessage for draft failed: {}", .{err});
+                return;
+            };
+            defer self.allocator.free(resp);
+
+            if (telegram_api.responseHasTelegramError(resp)) {
+                log.warn("sendMessage API error: {s}", .{resp[0..@min(resp.len, 256)]});
+                return;
+            }
+
+            // Parse and store the message_id
+            if (telegram_api.parseSentMessageMeta(self.allocator, resp)) |meta| {
+                state.message_id = meta.message_id;
+            }
         } else {
-            root.json_util.appendJsonString(&body, self.allocator, text) catch return;
-        }
-        body.appendSlice(self.allocator, "}") catch return;
+            // Subsequent chunk: edit the existing message
+            const msg_id = state.message_id.?;
+            const resp = self.api().editMessageText(self.allocator, chat_id, msg_id, text) catch |err| {
+                log.warn("editMessageText for draft failed: {}", .{err});
+                return;
+            };
+            defer self.allocator.free(resp);
 
-        const resp = self.api().sendMessageDraft(self.allocator, body.items) catch |err| {
-            log.warn("sendMessageDraft request failed: {}", .{err});
-            return;
-        };
-        defer self.allocator.free(resp);
-
-        if (telegram_api.responseHasTelegramError(resp)) {
-            log.warn("sendMessageDraft API error: {s}", .{resp[0..@min(resp.len, 256)]});
+            if (telegram_api.responseHasTelegramError(resp)) {
+                log.warn("editMessageText API error: {s}", .{resp[0..@min(resp.len, 256)]});
+            }
         }
     }
 
     /// Staged outbound event handler for draft streaming.
     ///
     /// - `.chunk`: Accumulates text in a per-chat draft buffer and periodically
-    ///   flushes it to Telegram via `sendMessageDraft`, giving users a live
-    ///   preview of the response as it is generated.
+    ///   flushes it to Telegram via sendMessage (first chunk) or editMessageText
+    ///   (subsequent chunks), giving users a live preview of the response as it
+    ///   is generated.
     /// - `.final`: Cleans up the draft buffer and delivers the complete message
     ///   through the normal `vtableSend` path (which handles attachment markers,
     ///   interactive buttons, and message splitting). Callers must pass the full
@@ -2264,7 +2285,13 @@ pub const TelegramChannel = struct {
                 }
 
                 if (pending_flush) |flush| {
-                    self.sendDraft(target, flush.draft_id, flush.text);
+                    self.draft_mu.lock();
+                    defer self.draft_mu.unlock();
+
+                    // Re-fetch the DraftState pointer under lock
+                    if (self.draft_buffers.getPtr(target)) |state| {
+                        self.sendDraft(target, state, flush.text);
+                    }
                 }
             },
             .final => {

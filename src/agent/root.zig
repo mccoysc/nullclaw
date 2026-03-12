@@ -15,6 +15,7 @@ const ChatMessage = providers.ChatMessage;
 const ChatResponse = providers.ChatResponse;
 const ToolSpec = providers.ToolSpec;
 const tools_mod = @import("../tools/root.zig");
+const web_search_mod = @import("../tools/web_search.zig");
 const Tool = tools_mod.Tool;
 const ToolRegistry = tools_mod.ToolRegistry;
 const memory_mod = @import("../memory/root.zig");
@@ -229,6 +230,10 @@ pub const Agent = struct {
 
     pub const UsageRecordCallback = *const fn (ctx: *anyopaque, record: UsageRecord) void;
 
+    /// Queue checkpoint callback - invoked at LLM/tool execution gaps to check for queued messages.
+    /// Returns true if messages were consumed (agent should continue with new messages).
+    pub const QueueCheckpointCallback = *const fn (ctx: *anyopaque) bool;
+
     allocator: std.mem.Allocator,
     provider: Provider,
     tools: []const Tool,
@@ -353,6 +358,11 @@ pub const Agent = struct {
     usage_record_callback: ?UsageRecordCallback = null,
     /// Context pointer passed to usage_record_callback.
     usage_record_ctx: ?*anyopaque = null,
+    /// Optional queue checkpoint callback invoked at LLM/tool execution gaps.
+    /// When set, the agent checks for queued messages during tool execution loops.
+    queue_checkpoint_callback: ?QueueCheckpointCallback = null,
+    /// Context pointer passed to queue_checkpoint_callback.
+    queue_checkpoint_ctx: ?*anyopaque = null,
     /// Conversation context for the current turn (Signal-specific for now).
     conversation_context: ?prompt.ConversationContext = null,
 
@@ -1262,7 +1272,25 @@ pub const Agent = struct {
 
         var iteration: u32 = 0;
         var forced_follow_through_count: u32 = 0;
+        // Results buffer: declared here so it's accessible for queue checkpoint restart
+        var results_buf: std.ArrayListUnmanaged(ToolExecutionResult) = .empty;
+        defer results_buf.deinit(self.allocator);
+
         while (iteration < self.max_tool_iterations) : (iteration += 1) {
+            // ── Queue checkpoint: check for queued messages at iteration start (LLM call boundary) ──
+            // This enables interrupting the turn when user sends new messages during LLM processing.
+            if (self.emitQueueCheckpoint()) {
+                // Queued messages were consumed and added to history.
+                // Clear accumulated tool results and restart the turn loop with new messages.
+                log.info("queue checkpoint at iteration start: new messages consumed, restarting turn", .{});
+                // Free output strings before clearing buffer
+                for (results_buf.items) |result| {
+                    if (result.output.len > 0) self.allocator.free(@constCast(result.output));
+                }
+                results_buf.clearRetainingCapacity();
+                continue;
+            }
+
             _ = iter_arena.reset(.retain_capacity);
             const arena = iter_arena.allocator();
 
@@ -1909,8 +1937,6 @@ pub const Agent = struct {
             });
 
             // Execute each tool call
-            var results_buf: std.ArrayListUnmanaged(ToolExecutionResult) = .empty;
-            defer results_buf.deinit(self.allocator);
             try results_buf.ensureTotalCapacity(self.allocator, parsed_calls.len);
             const batch_updates_tools_md = tool_call_batch_updates_tools_md(arena, parsed_calls);
 
@@ -2047,7 +2073,55 @@ pub const Agent = struct {
                 } };
                 self.observer.recordEvent(&tool_event);
 
-                try results_buf.append(self.allocator, final_result);
+                // Duplicate output string with self.allocator to survive arena resets.
+                // The arena is reset at the start of each iteration, so we need to
+                // own the output memory separately.
+                const output_dup = if (final_result.output.len > 0)
+                    try self.allocator.dupe(u8, final_result.output)
+                else
+                    "";
+                const final_result_owned = ToolExecutionResult{
+                    .name = final_result.name,
+                    .output = output_dup,
+                    .success = final_result.success,
+                    .tool_call_id = final_result.tool_call_id,
+                };
+                try results_buf.append(self.allocator, final_result_owned);
+
+                // ── Queue checkpoint: check for queued messages at tool execution gaps ──
+                // This enables interrupting long-running tool loops when user sends new messages.
+                if (self.emitQueueCheckpoint()) {
+                    // Queued user messages detected. We must add accumulated tool results to history
+                    // BEFORE the checkpoint adds user messages, to preserve correct conversation order:
+                    // [original user msg] -> [tool results] -> [new user messages]
+                    // Otherwise user messages would appear before the tool results that were generated
+                    // in response to the original message.
+                    if (results_buf.items.len > 0) {
+                        const formatted_results = try dispatcher.formatToolResults(arena, results_buf.items);
+                        const scrubbed_results = try providers.scrubToolOutput(arena, formatted_results);
+                        const with_reflection = try std.fmt.allocPrint(
+                            arena,
+                            "{s}\n\nReflect on the tool results above and decide your next steps. " ++
+                                "If a tool failed due to policy/permissions, do not repeat the same blocked call; " ++
+                                "explain the limitation and choose a different available tool or ask the user for permission/config change. " ++
+                                "If a tool failed due to a transient issue (timeout/network/rate-limit), " ++
+                                "proactively retry up to 2 times with adjusted parameters before giving up.",
+                            .{scrubbed_results},
+                        );
+                        try self.history.append(self.allocator, .{
+                            .role = .user,
+                            .content = try self.allocator.dupe(u8, with_reflection),
+                        });
+                    }
+                    // Free output strings before clearing buffer
+                    for (results_buf.items) |res| {
+                        if (res.output.len > 0) self.allocator.free(@constCast(res.output));
+                    }
+                    results_buf.clearRetainingCapacity();
+                    // Now checkpoint will add queued user messages AFTER tool results
+                    log.info("queue checkpoint: tool results preserved, user messages will be processed", .{});
+                    break;
+                }
             }
 
             // Format tool results, scrub credentials, add reflection prompt, and add to history
@@ -2065,13 +2139,17 @@ pub const Agent = struct {
                 .content = try self.allocator.dupe(u8, with_reflection),
             });
 
+            // Free output strings in results_buf before clearing
+            for (results_buf.items) |res| {
+                if (res.output.len > 0) self.allocator.free(@constCast(res.output));
+            }
+            results_buf.clearRetainingCapacity();
+
             self.trimHistory();
 
             // Free provider response fields now that all borrows are consumed.
             self.freeResponseFields(&response);
         }
-
-        // ── Graceful degradation: tool iterations exhausted ──────────
         // Instead of returning an error, ask the LLM to summarize what it
         // has accomplished so far and return that as the final response.
         const exhausted_event = ObserverEvent{ .tool_iterations_exhausted = .{ .iterations = self.max_tool_iterations } };
@@ -2827,6 +2905,12 @@ pub const Agent = struct {
                 // (acquired before copySlice above), so no per-tool acquire needed.
 
                 const result = t.execute(tool_allocator, args) catch |err| {
+                    // After tool execution error, check if web_search should be removed from registry
+                    if (self.registry) |reg| {
+                        if (std.mem.eql(u8, call.name, "web_search") and web_search_mod.isToolRemovedFromRegistry()) {
+                            _ = reg.remove("web_search");
+                        }
+                    }
                     return .{
                         .name = call.name,
                         .output = @errorName(err),
@@ -2834,6 +2918,14 @@ pub const Agent = struct {
                         .tool_call_id = call.tool_call_id,
                     };
                 };
+
+                // Check if web_search should be removed from registry after successful/failed execution
+                if (self.registry) |reg| {
+                    if (std.mem.eql(u8, call.name, "web_search") and !result.success and web_search_mod.isToolRemovedFromRegistry()) {
+                        _ = reg.remove("web_search");
+                    }
+                }
+
                 return .{
                     .name = call.name,
                     .output = if (result.success) result.output else (result.error_msg orelse result.output),
@@ -2978,6 +3070,15 @@ pub const Agent = struct {
             .usage = .{},
         };
         self.emitUsageRecord(&failed, false);
+    }
+
+    /// Emit a queue checkpoint: check for queued messages at LLM/tool execution gaps.
+    /// Returns true if messages were consumed (agent should continue with new messages).
+    /// This enables interrupting long-running tool loops when user sends new messages.
+    fn emitQueueCheckpoint(self: *Agent) bool {
+        const cb = self.queue_checkpoint_callback orelse return false;
+        const ctx = self.queue_checkpoint_ctx orelse return false;
+        return cb(ctx);
     }
 
     /// Build provider-ready ChatMessage slice from owned history.

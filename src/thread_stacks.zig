@@ -16,7 +16,7 @@ pub const CONTROL_LOOP_STACK_SIZE: usize = 256 * 1024;
 /// Daemon-owned services such as the HTTP gateway, scheduler, and channel
 /// supervisor. These traverse deeper webhook, cron, and channel bootstrap
 /// paths than generic control loops.
-pub const DAEMON_SERVICE_STACK_SIZE: usize = 1024 * 1024;
+pub const DAEMON_SERVICE_STACK_SIZE: usize = 2 * 1024 * 1024;
 
 /// Long-lived network/runtime threads such as channel gateways, outbound
 /// dispatch, and subagents.
