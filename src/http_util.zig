@@ -701,7 +701,7 @@ fn curlGetSSESubprocess(
 // ═══════════════════════════════════════════════════════════════════════
 
 /// Parse a "Name: Value" header string into std.http.Header.
-fn parseHeaderString(header: []const u8) ?std.http.Header {
+pub fn parseHeaderString(header: []const u8) ?std.http.Header {
     const colon_pos = std.mem.indexOfScalar(u8, header, ':') orelse return null;
     const name = header[0..colon_pos];
     const rest = header[colon_pos + 1 ..];
