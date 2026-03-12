@@ -893,6 +893,7 @@ pub const SessionManager = struct {
                             try self.allocator.dupe(u8, hook_result.content)
                         else
                             try self.allocator.dupe(u8, "[skill hook agent error]");
+                        session.is_processing = false;
                         return err_response;
                     },
                     .intercept => {
@@ -900,6 +901,7 @@ pub const SessionManager = struct {
                             try self.allocator.dupe(u8, hook_result.content)
                         else
                             try self.allocator.dupe(u8, "[intercepted by on_channel_receive_before hook]");
+                        session.is_processing = false;
                         return intercept_response;
                     },
                     .continue_with => {
