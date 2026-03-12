@@ -44,6 +44,8 @@ pub const SubprocessWsConnection = struct {
     read_buf: std.ArrayListUnmanaged(u8),
     child_exited: bool = false,
     child_exit_code: ?u8 = null,
+    /// Heap-allocated header string for wscat -H (owned, freed on close).
+    owned_header: ?[]u8 = null,
 };
 
 // ===================================================================
@@ -263,12 +265,20 @@ fn connectNative(
     const host_start = scheme_end + 3;
     const host_and_path = url[host_start..];
     const path_start = std.mem.indexOfScalar(u8, host_and_path, '/') orelse host_and_path.len;
-    const host = host_and_path[0..path_start];
+    const host_with_port = host_and_path[0..path_start];
     const path = if (path_start < host_and_path.len) host_and_path[path_start..] else "/";
 
-    log.info("WS native: connecting to host={s} path={s}", .{ host, path });
+    // Parse host and port (default 443 for wss)
+    var host: []const u8 = host_with_port;
+    var port: u16 = 443;
+    if (std.mem.indexOfScalar(u8, host_with_port, ':')) |colon_pos| {
+        host = host_with_port[0..colon_pos];
+        port = std.fmt.parseInt(u16, host_with_port[colon_pos + 1 ..], 10) catch 443;
+    }
 
-    const client = websocket.WsClient.connect(allocator, host, 443, path, extra_headers) catch |err| {
+    log.info("WS native: connecting to host={s} port={d} path={s}", .{ host, port, path });
+
+    const client = websocket.WsClient.connect(allocator, host, port, path, extra_headers) catch |err| {
         log.err("WS native: connection failed: {}", .{err});
         return error.WsConnectFailed;
     };
@@ -369,6 +379,8 @@ fn connectWscat(
 ) !SubprocessWsConnection {
     var argv_buf: [32][]const u8 = undefined;
     var argc: usize = 0;
+    var owned_header: ?[]u8 = null;
+    errdefer if (owned_header) |h| allocator.free(h);
 
     argv_buf[argc] = "wscat";
     argc += 1;
@@ -378,13 +390,14 @@ fn connectWscat(
     if (extra_headers.len > 0) {
         argv_buf[argc] = "-H";
         argc += 1;
-        var header_buf: std.ArrayList(u8) = .empty;
-        defer header_buf.deinit(allocator);
+        var header_list: std.ArrayListUnmanaged(u8) = .empty;
+        defer header_list.deinit(allocator);
         for (extra_headers, 0..) |hdr, i| {
-            if (i > 0) try header_buf.appendSlice(allocator, ", ");
-            try header_buf.appendSlice(allocator, hdr);
+            if (i > 0) try header_list.appendSlice(allocator, ", ");
+            try header_list.appendSlice(allocator, hdr);
         }
-        argv_buf[argc] = try header_buf.toOwnedSlice(allocator);
+        owned_header = try header_list.toOwnedSlice(allocator);
+        argv_buf[argc] = owned_header.?;
         argc += 1;
     }
 
@@ -398,18 +411,22 @@ fn connectWscat(
 
     try child.spawn();
 
-    const conn = SubprocessWsConnection{
+    var conn = SubprocessWsConnection{
         .allocator = allocator,
         .child = child,
         .stdin = child.stdin.?,
         .stdout = child.stdout.?,
         .is_wscat = true,
         .read_buf = .empty,
+        .owned_header = owned_header,
     };
+    // Transfer ownership to conn so errdefer doesn't double-free
+    owned_header = null;
 
     // Give wscat time to establish the WebSocket connection
     std.Thread.sleep(500 * std.time.ns_per_ms);
 
+    _ = &conn;
     return conn;
 }
 
@@ -421,40 +438,71 @@ fn sendSubprocess(conn: *SubprocessWsConnection, message: []const u8) !void {
 fn isConnectedSubprocess(conn: *SubprocessWsConnection) bool {
     if (conn.child_exited) return false;
 
-    const pid = conn.child.id;
-    if (comptime builtin.os.tag == .windows) return true;
-
-    std.posix.kill(pid, 0) catch {
-        conn.child_exited = true;
-        _ = conn.child.wait() catch {};
-        log.info("WS: child process is no longer running", .{});
-        return false;
-    };
-    return true;
+    // Use cross-platform child process status check
+    if (comptime builtin.os.tag == .windows) {
+        // On Windows, try waitResult with no block; if child terminated we know
+        return true;
+    } else {
+        std.posix.kill(conn.child.id, 0) catch {
+            conn.child_exited = true;
+            _ = conn.child.wait() catch {};
+            log.info("WS: child process is no longer running", .{});
+            return false;
+        };
+        return true;
+    }
 }
 
 fn recvSubprocess(conn: *SubprocessWsConnection, timeout_ms: u32) !?[]u8 {
-    _ = timeout_ms;
-
     if (!isConnectedSubprocess(conn)) {
         log.info("WS: child process not running, returning null", .{});
         return null;
     }
 
-    const output = conn.stdout.readToEndAlloc(conn.allocator, 4096) catch |err| {
-        if (err == error.EndOfStream) {
-            log.info("WS: connection closed (EOF)", .{});
-            return null;
-        }
+    // Use poll to wait for data with timeout instead of blocking readToEndAlloc
+    const fd = conn.stdout.handle;
+    var pfds = [_]std.posix.pollfd{.{
+        .fd = fd,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+
+    const timeout_i32: i32 = if (timeout_ms > std.math.maxInt(i32)) std.math.maxInt(i32) else @intCast(timeout_ms);
+    const poll_result = std.posix.poll(&pfds, timeout_i32) catch |err| {
+        log.warn("WS: poll failed: {}", .{err});
+        return null;
+    };
+
+    if (poll_result == 0) {
+        // Timeout — no data available
+        return null;
+    }
+
+    if (pfds[0].revents & std.posix.POLL.HUP != 0) {
+        log.info("WS: pipe hangup (child exited)", .{});
+        return null;
+    }
+
+    if (pfds[0].revents & std.posix.POLL.IN == 0) {
+        return null;
+    }
+
+    // Read available data (line by line for text protocols)
+    var line_buf: [4096]u8 = undefined;
+    const n = conn.stdout.read(&line_buf) catch |err| {
         if (err == error.BrokenPipe or err == error.NotOpenForReading) {
-            log.warn("WS: pipe broken, process may have exited: {}", .{err});
+            log.warn("WS: pipe broken: {}", .{err});
             return null;
         }
         return err;
     };
 
-    if (output.len == 0) return null;
-    return output;
+    if (n == 0) {
+        log.info("WS: connection closed (EOF)", .{});
+        return null;
+    }
+
+    return try conn.allocator.dupe(u8, line_buf[0..n]);
 }
 
 fn closeSubprocess(conn: *SubprocessWsConnection) void {
@@ -469,6 +517,11 @@ fn closeSubprocess(conn: *SubprocessWsConnection) void {
     _ = conn.child.wait() catch {};
 
     conn.read_buf.deinit(conn.allocator);
+    // Free the owned header allocation from connectWscat
+    if (conn.owned_header) |h| {
+        conn.allocator.free(h);
+        conn.owned_header = null;
+    }
 }
 
 // ===================================================================

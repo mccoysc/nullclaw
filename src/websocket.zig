@@ -349,6 +349,13 @@ pub const WsClient = struct {
         try self.writeFrameLocked(.text, text);
     }
 
+    /// Send a binary frame (acquires write_mu).
+    pub fn writeBinary(self: *WsClient, data: []const u8) !void {
+        self.write_mu.lock();
+        defer self.write_mu.unlock();
+        try self.writeFrameLocked(.binary, data);
+    }
+
     /// Send a close frame (acquires write_mu, ignores errors).
     pub fn writeClose(self: *WsClient) void {
         self.write_mu.lock();
@@ -386,7 +393,17 @@ pub const WsClient = struct {
                     }
                 },
                 .ping => {}, // auto-handled inside readFrame
-                .binary => {}, // Discord uses text only
+                .binary => {
+                    try message.appendSlice(self.allocator, frame.payload);
+                    if (message.items.len > 4 * 1024 * 1024) {
+                        message.deinit(self.allocator);
+                        return error.MessageTooLarge;
+                    }
+                    if (frame.fin) {
+                        const slice = try message.toOwnedSlice(self.allocator);
+                        return slice;
+                    }
+                },
                 else => {},
             }
         }
