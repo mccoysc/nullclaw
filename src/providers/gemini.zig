@@ -871,8 +871,9 @@ pub const GeminiProvider = struct {
         const proxy = http_util.getProxyFromEnv(allocator) catch null;
         defer if (proxy) |p| allocator.free(p);
 
-        // Dispatch to native when --http-backend native and no proxy.
-        if (!http_util.useSubprocess() and proxy == null) {
+        // Dispatch to native when --http-backend native, no proxy, and no timeout
+        // (native std.http.Client does not support request timeouts).
+        if (!http_util.useSubprocess() and proxy == null and timeout_secs == 0) {
             return nativeStreamGemini(allocator, url, body, headers, callback, ctx);
         }
 
