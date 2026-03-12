@@ -536,24 +536,59 @@ pub const LarkChannel = struct {
             log.debug("lark: received {s} seq={d} payload_len={d}", .{ msg_type, frame.seq_id, payload.len });
 
             // Parse and dispatch the event
-            const messages = self.parseEventPayload(self.allocator, payload) catch |err| {
-                log.warn("lark: failed to parse event payload: {}", .{err});
-                return;
-            };
-            defer if (messages.len > 0) {
-                for (messages) |*m| {
-                    var mm = m.*;
-                    mm.deinit(self.allocator);
+            const resp_code: i32 = blk: {
+                const messages = self.parseEventPayload(self.allocator, payload) catch |err| {
+                    log.warn("lark: failed to parse event payload: {}", .{err});
+                    break :blk 500;
+                };
+                defer if (messages.len > 0) {
+                    for (messages) |*m| {
+                        var mm = m.*;
+                        mm.deinit(self.allocator);
+                    }
+                    self.allocator.free(messages);
+                };
+
+                for (messages) |m| {
+                    self.publishInboundMessage(m);
                 }
-                self.allocator.free(messages);
+                break :blk 200;
             };
 
-            for (messages) |m| {
-                self.publishInboundMessage(m);
-            }
+            // Send ACK back to Lark server (mirrors Go SDK handleDataFrame).
+            // The ACK is the same frame with a JSON {"code":NNN} payload and
+            // the original headers preserved.
+            self.sendDataAck(ws_client, frame, resp_code);
         } else {
             log.debug("lark: ignoring frame type={s} method={d}", .{ msg_type, frame.method });
         }
+    }
+
+    /// Send an acknowledgment frame back to the Lark server for a data frame.
+    /// Mirrors the Go SDK's handleDataFrame response: same frame structure with
+    /// a {"code":NNN} JSON payload.
+    fn sendDataAck(self: *LarkChannel, ws_client: *websocket.WsClient, frame: *const lark_proto.Frame, code: i32) void {
+        _ = self;
+        // Build JSON response payload: {"code":200} or {"code":500}
+        var resp_buf: [32]u8 = undefined;
+        const resp_payload = std.fmt.bufPrint(&resp_buf, "{{\"code\":{d}}}", .{code}) catch return;
+
+        const ack_frame = lark_proto.Frame{
+            .seq_id = frame.seq_id,
+            .log_id = frame.log_id,
+            .service = frame.service,
+            .method = frame.method,
+            .headers = frame.headers,
+            .payload = resp_payload,
+        };
+        var ack_buf: [1024]u8 = undefined;
+        const ack_data = lark_proto.encodeFrame(&ack_buf, &ack_frame) catch |err| {
+            log.warn("lark: failed to encode ack: {}", .{err});
+            return;
+        };
+        ws_client.writeBinary(ack_data) catch |err| {
+            log.warn("lark: failed to send ack: {}", .{err});
+        };
     }
 
     fn runWebsocketOnce(self: *LarkChannel) !void {
@@ -590,6 +625,11 @@ pub const LarkChannel = struct {
             return error.WsConnectFailed;
         };
         defer ws_client.deinit();
+
+        // Store the underlying socket FD so vtableStop can close it to
+        // interrupt the blocking readFrame() call during shutdown.
+        self.ws_fd.store(ws_client.stream.handle, .release);
+        defer self.ws_fd.store(invalid_socket, .release);
 
         self.connected.store(true, .release);
         defer self.connected.store(false, .release);
@@ -1671,4 +1711,80 @@ test "lark ws endpoint URL parsing with custom port" {
     }
     try std.testing.expectEqualStrings("custom.host.com", host);
     try std.testing.expectEqual(@as(u16, 8443), port);
+}
+
+test "sendDataAck builds valid ACK frame with code 200" {
+    // Verify that the ACK frame encoding mirrors the Go SDK format:
+    // same seq/log/service/method + headers + {"code":200} payload.
+    const allocator = std.testing.allocator;
+
+    const orig_headers = [_]lark_proto.Header{
+        .{ .key = lark_proto.HEADER_TYPE, .value = lark_proto.MSG_EVENT },
+        .{ .key = lark_proto.HEADER_MESSAGE_ID, .value = "msg_001" },
+    };
+    const orig_frame = lark_proto.Frame{
+        .seq_id = 99,
+        .log_id = 55,
+        .service = 33554678,
+        .method = lark_proto.METHOD_DATA,
+        .headers = &orig_headers,
+        .payload = "{\"event\":\"test\"}",
+    };
+
+    // Replicate what sendDataAck does
+    var resp_buf: [32]u8 = undefined;
+    const resp_payload = try std.fmt.bufPrint(&resp_buf, "{{\"code\":{d}}}", .{@as(i32, 200)});
+
+    const ack_frame = lark_proto.Frame{
+        .seq_id = orig_frame.seq_id,
+        .log_id = orig_frame.log_id,
+        .service = orig_frame.service,
+        .method = orig_frame.method,
+        .headers = orig_frame.headers,
+        .payload = resp_payload,
+    };
+    var ack_buf: [1024]u8 = undefined;
+    const ack_data = try lark_proto.encodeFrame(&ack_buf, &ack_frame);
+
+    // Decode and verify
+    var decoded = try lark_proto.decodeFrame(allocator, ack_data);
+    defer decoded.deinit();
+
+    try std.testing.expectEqual(@as(u64, 99), decoded.frame.seq_id);
+    try std.testing.expectEqual(@as(u64, 55), decoded.frame.log_id);
+    try std.testing.expectEqual(@as(i32, 33554678), decoded.frame.service);
+    try std.testing.expectEqual(lark_proto.METHOD_DATA, decoded.frame.method);
+    try std.testing.expectEqualStrings("{\"code\":200}", decoded.frame.payload);
+
+    // Verify headers are preserved
+    const msg_type = decoded.frame.getHeader(lark_proto.HEADER_TYPE);
+    try std.testing.expect(msg_type != null);
+    try std.testing.expectEqualStrings(lark_proto.MSG_EVENT, msg_type.?);
+    const msg_id = decoded.frame.getHeader(lark_proto.HEADER_MESSAGE_ID);
+    try std.testing.expect(msg_id != null);
+    try std.testing.expectEqualStrings("msg_001", msg_id.?);
+}
+
+test "sendDataAck builds valid ACK frame with code 500" {
+    // Same as above but with error code 500 (when event parsing fails).
+    const allocator = std.testing.allocator;
+
+    var resp_buf: [32]u8 = undefined;
+    const resp_payload = try std.fmt.bufPrint(&resp_buf, "{{\"code\":{d}}}", .{@as(i32, 500)});
+
+    const ack_frame = lark_proto.Frame{
+        .seq_id = 10,
+        .log_id = 20,
+        .service = 1,
+        .method = lark_proto.METHOD_DATA,
+        .payload = resp_payload,
+    };
+    var ack_buf: [1024]u8 = undefined;
+    const ack_data = try lark_proto.encodeFrame(&ack_buf, &ack_frame);
+
+    var decoded = try lark_proto.decodeFrame(allocator, ack_data);
+    defer decoded.deinit();
+
+    try std.testing.expectEqualStrings("{\"code\":500}", decoded.frame.payload);
+    try std.testing.expectEqual(lark_proto.METHOD_DATA, decoded.frame.method);
 }
