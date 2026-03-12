@@ -29,6 +29,26 @@ fn finalizeStreamResult(
     };
 }
 
+/// Read and log curl's stderr output when the process fails.
+/// Helps diagnose network errors (DNS, TLS, timeout, proxy, etc.).
+fn logCurlStderr(allocator: std.mem.Allocator, stderr_pipe: ?std.fs.File, exit_code: ?u8) void {
+    const stderr_file = stderr_pipe orelse {
+        log.err("curlStream failed (exit_code={?d}) stderr not available", .{exit_code});
+        return;
+    };
+    const stderr_output = stderr_file.readToEndAlloc(allocator, 4096) catch {
+        log.err("curlStream failed (exit_code={?d}) could not read stderr", .{exit_code});
+        return;
+    };
+    defer allocator.free(stderr_output);
+    const trimmed = std.mem.trimRight(u8, stderr_output, " \t\r\n");
+    if (trimmed.len > 0) {
+        log.err("curlStream failed (exit_code={?d}): {s}", .{ exit_code, trimmed });
+    } else {
+        log.err("curlStream failed (exit_code={?d}) stderr empty", .{exit_code});
+    }
+}
+
 const CurlBodyArg = struct {
     arg: []const u8,
     temp_path_buf: [std.fs.max_path_bytes]u8 = undefined,
@@ -275,7 +295,7 @@ pub fn curlStream(
 
     var child = std.process.Child.init(argv_buf[0..argc], allocator);
     child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
+    child.stderr_behavior = .Pipe;
 
     if (log_enabled) {
         debug_log.info("spawning curl process...", .{});
@@ -425,6 +445,7 @@ pub fn curlStream(
                 callback(ctx, root.StreamChunk.finalChunk());
                 return finalizeStreamResult(allocator, accumulated.items, null);
             }
+            logCurlStderr(allocator, child.stderr, code);
             return error.CurlFailed;
         },
         else => {
@@ -433,6 +454,7 @@ pub fn curlStream(
                 callback(ctx, root.StreamChunk.finalChunk());
                 return finalizeStreamResult(allocator, accumulated.items, null);
             }
+            logCurlStderr(allocator, child.stderr, null);
             return error.CurlFailed;
         },
     }
@@ -612,7 +634,7 @@ pub fn curlStreamAnthropic(
 
     var child = std.process.Child.init(argv_buf[0..argc], allocator);
     child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
+    child.stderr_behavior = .Pipe;
 
     try child.spawn();
 
@@ -691,6 +713,7 @@ pub fn curlStreamAnthropic(
                 callback(ctx, root.StreamChunk.finalChunk());
                 return finalizeStreamResult(allocator, accumulated.items, output_tokens);
             }
+            logCurlStderr(allocator, child.stderr, code);
             return error.CurlFailed;
         },
         else => {
@@ -699,6 +722,7 @@ pub fn curlStreamAnthropic(
                 callback(ctx, root.StreamChunk.finalChunk());
                 return finalizeStreamResult(allocator, accumulated.items, output_tokens);
             }
+            logCurlStderr(allocator, child.stderr, null);
             return error.CurlFailed;
         },
     }
@@ -869,4 +893,13 @@ test "extractAnthropicUsage correct JSON returns token count" {
     const json = "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":57}}";
     const result = (try extractAnthropicUsage(json)).?;
     try std.testing.expect(result == 57);
+}
+
+test "logCurlStderr with null pipe does not crash" {
+    // Passing null stderr pipe should log gracefully without crashing
+    logCurlStderr(std.testing.allocator, null, 7);
+}
+
+test "logCurlStderr with null exit code does not crash" {
+    logCurlStderr(std.testing.allocator, null, null);
 }
