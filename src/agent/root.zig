@@ -2114,8 +2114,8 @@ pub const Agent = struct {
                         });
                     }
                     // Free output strings before clearing buffer
-                    for (results_buf.items) |result| {
-                        if (result.output.len > 0) self.allocator.free(@constCast(result.output));
+                    for (results_buf.items) |res| {
+                        if (res.output.len > 0) self.allocator.free(@constCast(res.output));
                     }
                     results_buf.clearRetainingCapacity();
                     // Now checkpoint will add queued user messages AFTER tool results
@@ -2125,8 +2125,31 @@ pub const Agent = struct {
             }
 
             // Format tool results, scrub credentials, add reflection prompt, and add to history
+            const formatted_results = try dispatcher.formatToolResults(arena, results_buf.items);
+            const scrubbed_results = try providers.scrubToolOutput(arena, formatted_results);
+            const with_reflection = try std.fmt.allocPrint(
+                arena,
+                "{s}\n\nReflect on the tool results above and decide your next steps. " ++
+                    "If a tool failed due to policy/permissions, do not repeat the same blocked call; explain the limitation and choose a different available tool or ask the user for permission/config change. " ++
+                    "If a tool failed due to a transient issue (timeout/network/rate-limit), proactively retry up to 2 times with adjusted parameters before giving up.",
+                .{scrubbed_results},
+            );
+            try self.history.append(self.allocator, .{
+                .role = .user,
+                .content = try self.allocator.dupe(u8, with_reflection),
+            });
 
-        // ── Graceful degradation: tool iterations exhausted ──────────
+            // Free output strings in results_buf before clearing
+            for (results_buf.items) |res| {
+                if (res.output.len > 0) self.allocator.free(@constCast(res.output));
+            }
+            results_buf.clearRetainingCapacity();
+
+            self.trimHistory();
+
+            // Free provider response fields now that all borrows are consumed.
+            self.freeResponseFields(&response);
+        }
         // Instead of returning an error, ask the LLM to summarize what it
         // has accomplished so far and return that as the final response.
         const exhausted_event = ObserverEvent{ .tool_iterations_exhausted = .{ .iterations = self.max_tool_iterations } };

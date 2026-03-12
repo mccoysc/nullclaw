@@ -3,7 +3,7 @@ const builtin = @import("builtin");
 const root = @import("root.zig");
 const config_types = @import("../config_types.zig");
 const bus = @import("../bus.zig");
-const websocket = @import("../websocket.zig");
+const ws_util = @import("../ws_util.zig");
 const thread_stacks = @import("../thread_stacks.zig");
 
 const log = std.log.scoped(.lark);
@@ -261,25 +261,12 @@ pub const LarkChannel = struct {
         try fbs.writer().print("{{\"app_id\":\"{s}\",\"app_secret\":\"{s}\"}}", .{ self.app_id, self.app_secret });
         const body = fbs.getWritten();
 
-        var client = std.http.Client{ .allocator = self.allocator };
-        defer client.deinit();
-
-        var aw: std.Io.Writer.Allocating = .init(self.allocator);
-        defer aw.deinit();
-
-        const result = client.fetch(.{
-            .location = .{ .url = url },
-            .method = .POST,
-            .payload = body,
-            .extra_headers = &.{
-                .{ .name = "Content-Type", .value = "application/json; charset=utf-8" },
-            },
-            .response_writer = &aw.writer,
+        // Use curl to avoid Zig 0.15 std.http.Client segfaults
+        const resp_body = root.http_util.curlPost(self.allocator, url, body, &.{
+            "Content-Type: application/json; charset=utf-8",
         }) catch return error.LarkApiError;
+        defer self.allocator.free(resp_body);
 
-        if (result.status != .ok) return error.LarkApiError;
-
-        const resp_body = aw.writer.buffer[0..aw.writer.end];
         if (resp_body.len == 0) return error.LarkApiError;
 
         const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, resp_body, .{}) catch return error.LarkApiError;
@@ -328,56 +315,43 @@ pub const LarkChannel = struct {
         const body = fbs.getWritten();
 
         // Build auth header
-        var auth_buf: [512]u8 = undefined;
-        var auth_fbs = std.io.fixedBufferStream(&auth_buf);
-        try auth_fbs.writer().print("Bearer {s}", .{token});
-        const auth_value = auth_fbs.getWritten();
+        var auth_header_buf: [512]u8 = undefined;
+        const auth_header = try std.fmt.bufPrint(&auth_header_buf, "Bearer {s}", .{token});
 
-        var client = std.http.Client{ .allocator = self.allocator };
-        defer client.deinit();
-
-        const send_result = client.fetch(.{
-            .location = .{ .url = url },
-            .method = .POST,
-            .payload = body,
-            .extra_headers = &.{
-                .{ .name = "Content-Type", .value = "application/json; charset=utf-8" },
-                .{ .name = "Authorization", .value = auth_value },
-            },
+        // Use curl to avoid Zig 0.15 std.http.Client segfaults
+        const resp_body = root.http_util.curlPost(self.allocator, url, body, &.{
+            "Content-Type: application/json; charset=utf-8",
+            auth_header,
         }) catch return error.LarkApiError;
+        defer self.allocator.free(resp_body);
 
-        if (send_result.status == .unauthorized) {
-            // Token expired — invalidate cache and retry once
-            self.invalidateToken();
-            const new_token = self.getTenantAccessToken() catch return error.LarkApiError;
-            defer self.allocator.free(new_token);
+        if (resp_body.len > 0) {
+            const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, resp_body, .{}) catch return;
+            defer parsed.deinit();
+            if (parsed.value == .object) {
+                const code_val = parsed.value.object.get("code");
+                if (code_val) |cv| {
+                    if (cv == .integer and cv.integer == 99991663) {
+                        // Token expired — invalidate cache and retry once
+                        self.invalidateToken();
+                        const new_token = self.getTenantAccessToken() catch return error.LarkApiError;
+                        defer self.allocator.free(new_token);
 
-            var retry_auth_buf: [512]u8 = undefined;
-            var retry_auth_fbs = std.io.fixedBufferStream(&retry_auth_buf);
-            try retry_auth_fbs.writer().print("Bearer {s}", .{new_token});
-            const retry_auth_value = retry_auth_fbs.getWritten();
+                        var retry_auth_buf: [512]u8 = undefined;
+                        var retry_auth_fbs = std.io.fixedBufferStream(&retry_auth_buf);
+                        try retry_auth_fbs.writer().print("Bearer {s}", .{new_token});
+                        const retry_auth_value = retry_auth_fbs.getWritten();
 
-            var retry_client = std.http.Client{ .allocator = self.allocator };
-            defer retry_client.deinit();
+                        const retry_resp = root.http_util.curlPost(self.allocator, url, body, &.{
+                            "Content-Type: application/json; charset=utf-8",
+                            retry_auth_value,
+                        }) catch return error.LarkApiError;
+                        defer self.allocator.free(retry_resp);
 
-            const retry_result = retry_client.fetch(.{
-                .location = .{ .url = url },
-                .method = .POST,
-                .payload = body,
-                .extra_headers = &.{
-                    .{ .name = "Content-Type", .value = "application/json; charset=utf-8" },
-                    .{ .name = "Authorization", .value = retry_auth_value },
-                },
-            }) catch return error.LarkApiError;
-
-            if (retry_result.status != .ok) {
-                return error.LarkApiError;
+                        return;
+                    }
+                }
             }
-            return;
-        }
-
-        if (send_result.status != .ok) {
-            return error.LarkApiError;
         }
     }
 
@@ -437,25 +411,12 @@ pub const LarkChannel = struct {
         try body_fbs.writer().print("{{\"app_id\":\"{s}\",\"app_secret\":\"{s}\"}}", .{ self.app_id, self.app_secret });
         const body = body_fbs.getWritten();
 
-        var client = std.http.Client{ .allocator = self.allocator };
-        defer client.deinit();
-
-        var aw: std.Io.Writer.Allocating = .init(self.allocator);
-        defer aw.deinit();
-
-        const result = client.fetch(.{
-            .location = .{ .url = url },
-            .method = .POST,
-            .payload = body,
-            .extra_headers = &.{
-                .{ .name = "Content-Type", .value = "application/json; charset=utf-8" },
-            },
-            .response_writer = &aw.writer,
+        // Use curl to avoid Zig 0.15 std.http.Client segfaults
+        const resp_body = root.http_util.curlPost(self.allocator, url, body, &.{
+            "Content-Type: application/json; charset=utf-8",
         }) catch return error.LarkApiError;
+        defer self.allocator.free(resp_body);
 
-        if (result.status != .ok) return error.LarkApiError;
-
-        const resp_body = aw.writer.buffer[0..aw.writer.end];
         if (resp_body.len == 0) return error.LarkApiError;
 
         const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, resp_body, .{}) catch return error.LarkApiError;
@@ -507,7 +468,7 @@ pub const LarkChannel = struct {
         }
     }
 
-    fn handleWebsocketPayload(self: *LarkChannel, ws: *websocket.WsClient, payload: []const u8) !void {
+    fn handleWebsocketPayload(self: *LarkChannel, conn: *ws_util.WsConnection, payload: []const u8) !void {
         const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, payload, .{}) catch null;
         if (parsed) |pp| {
             var p = pp;
@@ -521,7 +482,7 @@ pub const LarkChannel = struct {
                             "0";
                         var pong_buf: [128]u8 = undefined;
                         const pong = buildWebsocketPong(&pong_buf, ts) catch return;
-                        ws.writeText(pong) catch |err| {
+                        ws_util.wsSend(conn, pong) catch |err| {
                             log.warn("lark websocket pong failed: {}", .{err});
                         };
                         return;
@@ -532,7 +493,7 @@ pub const LarkChannel = struct {
                     if (uuid_val == .string) {
                         var ack_buf: [160]u8 = undefined;
                         const ack = buildWebsocketAck(&ack_buf, uuid_val.string) catch return;
-                        ws.writeText(ack) catch |err| {
+                        ws_util.wsSend(conn, ack) catch |err| {
                             log.warn("lark websocket ack failed: {}", .{err});
                         };
                     }
@@ -558,34 +519,52 @@ pub const LarkChannel = struct {
         var path_buf: [1024]u8 = undefined;
         const path = try buildWebsocketPath(&path_buf, self.app_id, app_access_token);
 
-        var ws = try websocket.WsClient.connect(
-            self.allocator,
-            self.websocketHost(),
-            443,
-            path,
-            &.{},
-        );
+        // Build full WebSocket URL
+        var url_buf: [1024]u8 = undefined;
+        var url_fbs = std.io.fixedBufferStream(&url_buf);
+        try url_fbs.writer().print("wss://{s}{s}", .{ self.websocketHost(), path });
+        const url = url_fbs.getWritten();
 
-        self.ws_fd.store(ws.stream.handle, .release);
+        log.info("lark connecting to websocket: {s}", .{url});
+
+        // Use ws_util (curl/wscat) to avoid Zig 0.15 TLS crashes
+        const conn = try ws_util.wsConnect(self.allocator, url, &.{});
+        defer ws_util.wsClose(conn);
+
         self.connected.store(true, .release);
-        defer {
-            self.connected.store(false, .release);
-            self.ws_fd.store(invalid_socket, .release);
-            ws.deinit();
-        }
 
+        // Read loop
         while (self.running.load(.acquire)) {
-            const maybe_text = ws.readTextMessage() catch |err| {
-                log.warn("lark websocket read failed: {}", .{err});
+            // Check if child process is still connected before waiting
+            if (!ws_util.wsIsConnected(conn)) {
+                log.warn("lark websocket process exited, reconnecting", .{});
+                break;
+            }
+
+            // Wait for message with timeout
+            const message = ws_util.wsRecv(conn, 5000) catch |err| {
+                log.warn("lark websocket recv failed: {}", .{err});
                 break;
             };
-            const text = maybe_text orelse break;
+
+            const text = message orelse {
+                // Timeout, continue loop
+                continue;
+            };
             defer self.allocator.free(text);
 
-            self.handleWebsocketPayload(&ws, text) catch |err| {
+            // Validate message content before processing
+            if (!ws_util.validateLarkMessage(text)) {
+                log.debug("lark websocket received invalid message, skipping", .{});
+                continue;
+            }
+
+            self.handleWebsocketPayload(conn, text) catch |err| {
                 log.warn("lark websocket payload handling failed: {}", .{err});
             };
         }
+
+        self.connected.store(false, .release);
     }
 
     fn websocketLoop(self: *LarkChannel) void {

@@ -26,6 +26,7 @@ const subagent_runner = @import("subagent_runner.zig");
 const agent_routing = @import("agent_routing.zig");
 const provider_runtime = @import("providers/runtime_bundle.zig");
 
+const streaming = @import("streaming.zig");
 const signal = @import("channels/signal.zig");
 const matrix = @import("channels/matrix.zig");
 const channels_mod = @import("channels/root.zig");
@@ -95,29 +96,61 @@ fn processTelegramMessage(
         .group_id = if (is_group) sender else null,
     };
 
-    const reply = runtime.session_mgr.processMessage(session_key, content, conversation_context) catch |err| {
-        // RegistryDraining: plugin replacement in progress — notify the user
-        // instead of silently dropping the message.
-        if (err == error.RegistryDraining) {
-            log.info("message deferred: tool registry draining (plugin replacement in progress)", .{});
-            tg_ptr.sendMessageWithReply(
-                sender,
-                "Plugin tools are being updated, please resend your message in a moment.",
-                reply_to_id,
-            ) catch |send_err| log.err("failed to send drain notice: {}", .{send_err});
+    // Try to create a streaming sink for Telegram
+    var stream_ctx: telegram.TelegramChannel.StreamCtx = undefined;
+    stream_ctx.tg_ptr = tg_ptr;
+    stream_ctx.chat_id = sender;
+    const stream_sink = tg_ptr.makeSink(&stream_ctx);
+
+    // Process message with streaming (if sink available) or without
+    const reply = if (stream_sink) |sink| blk: {
+        break :blk runtime.session_mgr.processMessageStreaming(session_key, content, conversation_context, sink) catch |err| {
+            // Handle errors same as below
+            if (err == error.RegistryDraining) {
+                log.info("message deferred: tool registry draining (plugin replacement in progress)", .{});
+                tg_ptr.sendMessageWithReply(
+                    sender,
+                    "Plugin tools are being updated, please resend your message in a moment.",
+                    reply_to_id,
+                ) catch |send_err| log.err("failed to send drain notice: {}", .{send_err});
+                return;
+            }
+            log.err("Agent error: {}", .{err});
+            const err_msg: []const u8 = switch (err) {
+                error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError => "Network error. Please try again.",
+                error.ProviderDoesNotSupportVision => "The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.",
+                error.NoResponseContent => "Model returned an empty response. Please retry or /new for a fresh session.",
+                error.AllProvidersFailed => "All configured providers failed for this request. Check model/provider compatibility and credentials.",
+                error.OutOfMemory => "Out of memory.",
+                else => "An error occurred. Try again or /new for a fresh session.",
+            };
+            tg_ptr.sendMessageWithReply(sender, err_msg, reply_to_id) catch |send_err| log.err("failed to send error reply: {}", .{send_err});
             return;
-        }
-        log.err("Agent error: {}", .{err});
-        const err_msg: []const u8 = switch (err) {
-            error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError => "Network error. Please try again.",
-            error.ProviderDoesNotSupportVision => "The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.",
-            error.NoResponseContent => "Model returned an empty response. Please retry or /new for a fresh session.",
-            error.AllProvidersFailed => "All configured providers failed for this request. Check model/provider compatibility and credentials.",
-            error.OutOfMemory => "Out of memory.",
-            else => "An error occurred. Try again or /new for a fresh session.",
         };
-        tg_ptr.sendMessageWithReply(sender, err_msg, reply_to_id) catch |send_err| log.err("failed to send error reply: {}", .{send_err});
-        return;
+    } else blk: {
+        // Fallback to non-streaming if makeSink returns null
+        break :blk runtime.session_mgr.processMessage(session_key, content, conversation_context) catch |err| {
+            if (err == error.RegistryDraining) {
+                log.info("message deferred: tool registry draining (plugin replacement in progress)", .{});
+                tg_ptr.sendMessageWithReply(
+                    sender,
+                    "Plugin tools are being updated, please resend your message in a moment.",
+                    reply_to_id,
+                ) catch |send_err| log.err("failed to send drain notice: {}", .{send_err});
+                return;
+            }
+            log.err("Agent error: {}", .{err});
+            const err_msg: []const u8 = switch (err) {
+                error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError => "Network error. Please try again.",
+                error.ProviderDoesNotSupportVision => "The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.",
+                error.NoResponseContent => "Model returned an empty response. Please retry or /new for a fresh session.",
+                error.AllProvidersFailed => "All configured providers failed for this request. Check model/provider compatibility and credentials.",
+                error.OutOfMemory => "Out of memory.",
+                else => "An error occurred. Try again or /new for a fresh session.",
+            };
+            tg_ptr.sendMessageWithReply(sender, err_msg, reply_to_id) catch |send_err| log.err("failed to send error reply: {}", .{send_err});
+            return;
+        };
     };
     defer allocator.free(reply);
 
@@ -557,10 +590,14 @@ pub const ChannelRuntime = struct {
     /// that sessions still referencing its vtable pointer remain valid until
     /// ChannelRuntime is torn down.
     pub fn rebuildProvider(self: *ChannelRuntime, new_config: *const Config) void {
+        log.info("rebuildProvider: starting rebuild with default_provider='{s}', providers.len={d}", .{ new_config.default_provider, new_config.providers.len });
         var new_bundle = provider_runtime.RuntimeProviderBundle.init(self.allocator, new_config) catch |err| {
+            log.err("rebuildProvider: RuntimeProviderBundle.init failed: {s}", .{@errorName(err)});
             log.warn("Provider rebuild failed — sessions still using previous credentials: {s}", .{@errorName(err)});
             return;
         };
+
+        log.info("rebuildProvider: new bundle created successfully, reliable_ptr={d}", .{@intFromBool(new_bundle.reliable_ptr != null)});
 
         // Stash the old bundle so its memory (and vtable pointers) stay valid.
         self.prev_provider_bundles.append(self.allocator, self.provider_bundle) catch {
@@ -574,6 +611,7 @@ pub const ChannelRuntime = struct {
         self.provider_bundle = new_bundle;
         const new_provider = new_bundle.provider();
 
+        log.info("rebuildProvider: updating session_mgr with new provider", .{});
         // Propagate to session manager + all existing sessions.
         self.session_mgr.updateProvider(new_provider);
 
