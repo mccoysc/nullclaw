@@ -203,7 +203,7 @@ pub fn curlStream(
 
     argv_buf[argc] = "curl";
     argc += 1;
-    argv_buf[argc] = "-s";
+    argv_buf[argc] = "-sS";
     argc += 1;
     argv_buf[argc] = "--no-buffer";
     argc += 1;
@@ -596,7 +596,7 @@ pub fn curlStreamAnthropic(
 
     argv_buf[argc] = "curl";
     argc += 1;
-    argv_buf[argc] = "-s";
+    argv_buf[argc] = "-sS";
     argc += 1;
     argv_buf[argc] = "--no-buffer";
     argc += 1;
