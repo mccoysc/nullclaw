@@ -132,7 +132,9 @@ fn curlRequestWithProxy(
     proxy: ?[]const u8,
     max_time: ?[]const u8,
 ) ![]u8 {
-    if (!useSubprocess()) {
+    // Fall back to subprocess when proxy is configured, since native
+    // std.http.Client does not support proxy or max_time settings.
+    if (!useSubprocess() and proxy == null) {
         return nativeHttpRequest(allocator, method, content_type_header, url, body, headers);
     }
     return curlRequestWithProxySubprocess(allocator, method, content_type_header, url, body, headers, proxy, max_time);
@@ -416,7 +418,10 @@ fn curlGetWithProxyAndResolve(
     proxy: ?[]const u8,
     resolve_entry: ?[]const u8,
 ) ![]u8 {
-    if (!useSubprocess()) {
+    // Fall back to subprocess when proxy or resolve_entry is set.
+    // Native std.http.Client lacks proxy support, and resolve_entry
+    // implements DNS pinning for SSRF protection (curl --resolve).
+    if (!useSubprocess() and proxy == null and resolve_entry == null) {
         return nativeHttpGet(allocator, url, headers);
     }
     return curlGetWithProxyAndResolveSubprocess(allocator, url, headers, timeout_secs, proxy, resolve_entry);
@@ -742,7 +747,7 @@ fn nativeHttpRequest(
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
 
-    _ = client.fetch(.{
+    const result = client.fetch(.{
         .location = .{ .url = url },
         .method = httpMethodFromString(method),
         .payload = body,
@@ -752,6 +757,13 @@ fn nativeHttpRequest(
         log.err("native HTTP {s} to {s} failed: {}", .{ method, url, err });
         return error.CurlFailed;
     };
+
+    // Match curl -sf behavior: fail on 4xx/5xx status codes.
+    const status_int = @intFromEnum(result.status);
+    if (status_int >= 400) {
+        log.err("native HTTP {s} {s} returned status {d}", .{ method, url, status_int });
+        return error.CurlFailed;
+    }
 
     return try allocator.dupe(u8, aw.writer.buffer[0..aw.writer.end]);
 }
@@ -779,7 +791,7 @@ fn nativeHttpGet(
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
 
-    _ = client.fetch(.{
+    const result = client.fetch(.{
         .location = .{ .url = url },
         .method = .GET,
         .extra_headers = extra_headers_buf[0..n_headers],
@@ -788,6 +800,13 @@ fn nativeHttpGet(
         log.err("native HTTP GET {s} failed: {}", .{ url, err });
         return error.CurlFailed;
     };
+
+    // Match curl -sf behavior: fail on 4xx/5xx status codes.
+    const status_int = @intFromEnum(result.status);
+    if (status_int >= 400) {
+        log.err("native HTTP GET {s} returned status {d}", .{ url, status_int });
+        return error.CurlFailed;
+    }
 
     return try allocator.dupe(u8, aw.writer.buffer[0..aw.writer.end]);
 }
