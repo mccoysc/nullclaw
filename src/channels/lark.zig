@@ -44,6 +44,9 @@ pub const LarkChannel = struct {
 
     pub const FEISHU_BASE_URL = "https://open.feishu.cn/open-apis";
     pub const LARK_BASE_URL = "https://open.larksuite.com/open-apis";
+    /// WS endpoint base URLs (no /open-apis prefix)
+    pub const FEISHU_WS_BASE = "https://open.feishu.cn";
+    pub const LARK_WS_BASE = "https://open.larksuite.com";
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -404,11 +407,10 @@ pub const LarkChannel = struct {
     /// POST {apiBase}/callback/ws/endpoint
     /// Returns the dynamic WebSocket URL (caller owns).
     fn fetchWsEndpoint(self: *LarkChannel) ![]const u8 {
-        const base = self.apiBase();
-
         var url_buf: [256]u8 = undefined;
         var url_fbs = std.io.fixedBufferStream(&url_buf);
-        try url_fbs.writer().print("{s}/callback/ws/endpoint", .{base});
+        const ws_base = if (self.use_feishu) FEISHU_WS_BASE else LARK_WS_BASE;
+        try url_fbs.writer().print("{s}/callback/ws/endpoint", .{ws_base});
         const url = url_fbs.getWritten();
 
         var body_buf: [512]u8 = undefined;
@@ -520,7 +522,7 @@ pub const LarkChannel = struct {
             ws_client.writeBinary(pong_data) catch |err| {
                 log.warn("lark: failed to send pong: {}", .{err});
             };
-            log.debug("lark: ping/pong seq={d}", .{frame.seq_id});
+            log.info("lark: ping/pong seq={d}", .{frame.seq_id});
             return;
         }
 
@@ -606,6 +608,8 @@ pub const LarkChannel = struct {
                 log.info("lark: websocket closed by server", .{});
                 break;
             };
+
+            log.info("lark: received ws frame opcode={d} payload_len={d}", .{ @intFromEnum(f.opcode), f.payload.len });
 
             switch (f.opcode) {
                 .binary => {

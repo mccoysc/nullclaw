@@ -393,17 +393,7 @@ pub const WsClient = struct {
                     }
                 },
                 .ping => {}, // auto-handled inside readFrame
-                .binary => {
-                    try message.appendSlice(self.allocator, frame.payload);
-                    if (message.items.len > 4 * 1024 * 1024) {
-                        message.deinit(self.allocator);
-                        return error.MessageTooLarge;
-                    }
-                    if (frame.fin) {
-                        const slice = try message.toOwnedSlice(self.allocator);
-                        return slice;
-                    }
-                },
+                .binary => {}, // binary frames handled by readFrame() directly
                 else => {},
             }
         }
