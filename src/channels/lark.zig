@@ -701,10 +701,13 @@ pub const LarkChannel = struct {
 
         // Spawn background ping thread (sends ping every ~2 minutes)
         const ping_thread: ?std.Thread = std.Thread.spawn(
-            .{},
+            .{ .stack_size = thread_stacks.AUXILIARY_LOOP_STACK_SIZE },
             protobufPingLoop,
             .{ self, &ws_client, service_id },
-        ) catch null;
+        ) catch |err| blk: {
+            log.warn("lark: failed to spawn ping thread: {}", .{err});
+            break :blk null;
+        };
 
         // Step 3: Read loop — handle binary protobuf frames
         while (self.running.load(.acquire)) {
