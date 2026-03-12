@@ -76,7 +76,8 @@ const TOP_LEVEL_USAGE = std.fmt.comptimePrint(
     \\OPTIONS:
     \\  onboard [--interactive] [--api-key KEY] [--provider PROV] [--model MODEL] [--memory MEM]
     \\  agent [-m MESSAGE] [-s SESSION] [--provider PROVIDER] [--model MODEL] [--temperature TEMP]
-    \\  gateway [--port PORT] [--host HOST]
+    \\        [--http-backend native|subprocess]
+    \\  gateway [--port PORT] [--host HOST] [--http-backend native|subprocess]
     \\  version | --version | -V
     \\  service <{s}>
     \\  cron <{s}> [ARGS]
@@ -90,6 +91,10 @@ const TOP_LEVEL_USAGE = std.fmt.comptimePrint(
     \\  models <{s}> [ARGS]
     \\  auth <{s}> <provider> [--import-codex]
     \\  update [--check] [--yes]
+    \\
+    \\GLOBAL OPTIONS:
+    \\  --http-backend native|subprocess
+    \\        HTTP/WebSocket backend. Default: subprocess on macOS, native elsewhere.
     \\
 ,
     .{
@@ -188,6 +193,22 @@ pub fn main() !void {
 
     const sub_args = args[2..];
 
+    // Parse global --http-backend flag from sub_args (applies to all commands).
+    for (sub_args, 0..) |arg, idx| {
+        if (std.mem.eql(u8, arg, "--http-backend") and idx + 1 < sub_args.len) {
+            const val = sub_args[idx + 1];
+            if (std.mem.eql(u8, val, "native")) {
+                yc.http_util.setNetBackend(.native);
+            } else if (std.mem.eql(u8, val, "subprocess")) {
+                yc.http_util.setNetBackend(.subprocess);
+            } else {
+                std.debug.print("Invalid --http-backend value: '{s}'. Use 'native' or 'subprocess'.\n", .{val});
+                std.process.exit(1);
+            }
+            break;
+        }
+    }
+
     switch (cmd) {
         .version => printVersion(),
         .status => try yc.status.run(allocator),
@@ -218,7 +239,7 @@ fn printVersion() void {
     bw.interface.flush() catch return;
 }
 
-const GatewayDaemonOverrideError = error{InvalidPort};
+const GatewayDaemonOverrideError = error{ InvalidPort, InvalidHttpBackend };
 
 fn applyRuntimeProviderOverrides(config: *const yc.config.Config) void {
     yc.http_util.setProxyOverride(config.http_request.proxy) catch |err| {
@@ -252,6 +273,15 @@ fn applyGatewayDaemonOverrides(cfg: *yc.config.Config, sub_args: []const []const
         } else if (std.mem.eql(u8, sub_args[i], "--host") and i + 1 < sub_args.len) {
             i += 1;
             host = sub_args[i];
+        } else if (std.mem.eql(u8, sub_args[i], "--http-backend") and i + 1 < sub_args.len) {
+            i += 1;
+            if (std.mem.eql(u8, sub_args[i], "native")) {
+                yc.http_util.setNetBackend(.native);
+            } else if (std.mem.eql(u8, sub_args[i], "subprocess")) {
+                yc.http_util.setNetBackend(.subprocess);
+            } else {
+                return error.InvalidHttpBackend;
+            }
         }
     }
 
@@ -268,8 +298,11 @@ fn runGateway(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
     };
     defer cfg.deinit();
 
-    applyGatewayDaemonOverrides(&cfg, sub_args) catch {
-        std.debug.print("Invalid port in CLI args.\n", .{});
+    applyGatewayDaemonOverrides(&cfg, sub_args) catch |err| {
+        switch (err) {
+            error.InvalidHttpBackend => std.debug.print("Invalid --http-backend value. Use 'native' or 'subprocess'.\n", .{}),
+            error.InvalidPort => std.debug.print("Invalid port in CLI args.\n", .{}),
+        }
         std.process.exit(1);
     };
 

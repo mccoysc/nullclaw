@@ -1,13 +1,45 @@
-//! Shared HTTP utilities via curl subprocess.
+//! Shared HTTP utilities.
+//!
+//! Backend selection (also used by ws_util):
+//!  - `subprocess` : curl / wscat child processes (default on macOS).
+//!  - `native`     : Zig std.http.Client (default on other platforms).
+//!
+//! Override at startup with `--http-backend native|subprocess`.
 //!
 //! Replaces 9+ local `curlPost` / `curlGet` duplicates across the codebase.
-//! Uses curl to avoid Zig 0.15 std.http.Client segfaults.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const AtomicBool = std.atomic.Value(bool);
 
 const log = std.log.scoped(.http_util);
+
+// ── Backend selection ────────────────────────────────────────────────
+
+pub const NetBackend = enum { native, subprocess };
+
+/// Platform default: macOS -> subprocess (avoids TLS Bus-error on ARM),
+/// everything else -> native std.http.Client.
+const platform_default: NetBackend = if (builtin.os.tag == .macos) .subprocess else .native;
+
+/// CLI override set via `--http-backend`.
+var backend_override: ?NetBackend = null;
+
+/// Called once from CLI arg parsing.
+pub fn setNetBackend(b: NetBackend) void {
+    backend_override = b;
+}
+
+/// Active backend (override wins, then platform default).
+pub fn netBackend() NetBackend {
+    return backend_override orelse platform_default;
+}
+
+/// Convenience: true when subprocess path should be used.
+pub fn useSubprocess() bool {
+    return netBackend() == .subprocess;
+}
 threadlocal var thread_interrupt_flag: ?*const AtomicBool = null;
 
 pub fn setThreadInterruptFlag(flag: ?*const AtomicBool) void {
@@ -91,6 +123,22 @@ pub fn curlPostFormWithProxy(
 }
 
 fn curlRequestWithProxy(
+    allocator: Allocator,
+    method: []const u8,
+    content_type_header: []const u8,
+    url: []const u8,
+    body: []const u8,
+    headers: []const []const u8,
+    proxy: ?[]const u8,
+    max_time: ?[]const u8,
+) ![]u8 {
+    if (!useSubprocess()) {
+        return nativeHttpRequest(allocator, method, content_type_header, url, body, headers);
+    }
+    return curlRequestWithProxySubprocess(allocator, method, content_type_header, url, body, headers, proxy, max_time);
+}
+
+fn curlRequestWithProxySubprocess(
     allocator: Allocator,
     method: []const u8,
     content_type_header: []const u8,
@@ -220,9 +268,22 @@ pub fn curlPostForm(allocator: Allocator, url: []const u8, body: []const u8) ![]
     return curlPostFormWithProxy(allocator, url, body, null, null);
 }
 
-/// HTTP POST via curl subprocess and include HTTP status code in response.
+/// HTTP POST and include HTTP status code in response.
+/// On macOS uses curl subprocess; on other platforms uses native std.http.Client.
 /// Caller owns `response.body`.
 pub fn curlPostWithStatus(
+    allocator: Allocator,
+    url: []const u8,
+    body: []const u8,
+    headers: []const []const u8,
+) !HttpResponse {
+    if (!useSubprocess()) {
+        return nativePostWithStatus(allocator, url, body, headers);
+    }
+    return curlPostWithStatusSubprocess(allocator, url, body, headers);
+}
+
+fn curlPostWithStatusSubprocess(
     allocator: Allocator,
     url: []const u8,
     body: []const u8,
@@ -342,11 +403,26 @@ pub fn curlPut(allocator: Allocator, url: []const u8, body: []const u8, headers:
     );
 }
 
-/// HTTP GET via curl subprocess with optional proxy.
+/// HTTP GET with optional proxy.
 ///
+/// On macOS uses curl subprocess; on other platforms uses native std.http.Client.
 /// `headers` is a slice of header strings (e.g. `"Authorization: Bearer xxx"`).
-/// `timeout_secs` sets --max-time. Returns the response body. Caller owns returned memory.
+/// `timeout_secs` sets --max-time (curl only). Returns the response body. Caller owns returned memory.
 fn curlGetWithProxyAndResolve(
+    allocator: Allocator,
+    url: []const u8,
+    headers: []const []const u8,
+    timeout_secs: []const u8,
+    proxy: ?[]const u8,
+    resolve_entry: ?[]const u8,
+) ![]u8 {
+    if (!useSubprocess()) {
+        return nativeHttpGet(allocator, url, headers);
+    }
+    return curlGetWithProxyAndResolveSubprocess(allocator, url, headers, timeout_secs, proxy, resolve_entry);
+}
+
+fn curlGetWithProxyAndResolveSubprocess(
     allocator: Allocator,
     url: []const u8,
     headers: []const []const u8,
@@ -519,11 +595,22 @@ pub fn getProxyFromEnv(allocator: Allocator) !?[]const u8 {
     return null;
 }
 
-/// HTTP GET via curl for SSE (Server-Sent Events).
+/// HTTP GET for SSE (Server-Sent Events).
 ///
-/// Uses -N (--no-buffer) to disable output buffering, allowing
-/// SSE events to be received in real-time. Also sends Accept: text/event-stream.
+/// On macOS uses curl subprocess; on other platforms uses native std.http.Client.
+/// Uses unbuffered mode to allow SSE events to be received in real-time.
 pub fn curlGetSSE(
+    allocator: Allocator,
+    url: []const u8,
+    timeout_secs: []const u8,
+) ![]u8 {
+    if (!useSubprocess()) {
+        return nativeHttpGet(allocator, url, &.{"Accept: text/event-stream"});
+    }
+    return curlGetSSESubprocess(allocator, url, timeout_secs);
+}
+
+fn curlGetSSESubprocess(
     allocator: Allocator,
     url: []const u8,
     timeout_secs: []const u8,
@@ -604,6 +691,153 @@ pub fn curlGetSSE(
     return stdout;
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// Native HTTP backend (non-macOS)
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Parse a "Name: Value" header string into std.http.Header.
+fn parseHeaderString(header: []const u8) ?std.http.Header {
+    const colon_pos = std.mem.indexOfScalar(u8, header, ':') orelse return null;
+    const name = header[0..colon_pos];
+    const rest = header[colon_pos + 1 ..];
+    const value = if (rest.len > 0 and rest[0] == ' ') rest[1..] else rest;
+    return .{ .name = name, .value = value };
+}
+
+/// Map a method string ("POST", "PUT", "GET") to std.http.Method.
+fn httpMethodFromString(method: []const u8) std.http.Method {
+    if (std.mem.eql(u8, method, "PUT")) return .PUT;
+    if (std.mem.eql(u8, method, "GET")) return .GET;
+    return .POST;
+}
+
+/// Native HTTP POST/PUT via std.http.Client (used on non-macOS).
+fn nativeHttpRequest(
+    allocator: Allocator,
+    method: []const u8,
+    content_type_header: []const u8,
+    url: []const u8,
+    body: []const u8,
+    headers: []const []const u8,
+) ![]u8 {
+    var client: std.http.Client = .{ .allocator = allocator };
+    defer client.deinit();
+
+    var extra_headers_buf: [20]std.http.Header = undefined;
+    var n_headers: usize = 0;
+
+    if (parseHeaderString(content_type_header)) |h| {
+        extra_headers_buf[n_headers] = h;
+        n_headers += 1;
+    }
+
+    for (headers) |hdr| {
+        if (n_headers >= extra_headers_buf.len) break;
+        if (parseHeaderString(hdr)) |h| {
+            extra_headers_buf[n_headers] = h;
+            n_headers += 1;
+        }
+    }
+
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+
+    _ = client.fetch(.{
+        .location = .{ .url = url },
+        .method = httpMethodFromString(method),
+        .payload = body,
+        .extra_headers = extra_headers_buf[0..n_headers],
+        .response_writer = &aw.writer,
+    }) catch |err| {
+        log.err("native HTTP {s} to {s} failed: {}", .{ method, url, err });
+        return error.CurlFailed;
+    };
+
+    return try allocator.dupe(u8, aw.writer.buffer[0..aw.writer.end]);
+}
+
+/// Native HTTP GET via std.http.Client (used on non-macOS).
+fn nativeHttpGet(
+    allocator: Allocator,
+    url: []const u8,
+    headers: []const []const u8,
+) ![]u8 {
+    var client: std.http.Client = .{ .allocator = allocator };
+    defer client.deinit();
+
+    var extra_headers_buf: [20]std.http.Header = undefined;
+    var n_headers: usize = 0;
+
+    for (headers) |hdr| {
+        if (n_headers >= extra_headers_buf.len) break;
+        if (parseHeaderString(hdr)) |h| {
+            extra_headers_buf[n_headers] = h;
+            n_headers += 1;
+        }
+    }
+
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+
+    _ = client.fetch(.{
+        .location = .{ .url = url },
+        .method = .GET,
+        .extra_headers = extra_headers_buf[0..n_headers],
+        .response_writer = &aw.writer,
+    }) catch |err| {
+        log.err("native HTTP GET {s} failed: {}", .{ url, err });
+        return error.CurlFailed;
+    };
+
+    return try allocator.dupe(u8, aw.writer.buffer[0..aw.writer.end]);
+}
+
+/// Native HTTP POST with status code via std.http.Client (used on non-macOS).
+fn nativePostWithStatus(
+    allocator: Allocator,
+    url: []const u8,
+    body: []const u8,
+    headers: []const []const u8,
+) !HttpResponse {
+    var client: std.http.Client = .{ .allocator = allocator };
+    defer client.deinit();
+
+    var extra_headers_buf: [20]std.http.Header = undefined;
+    var n_headers: usize = 0;
+
+    extra_headers_buf[n_headers] = .{ .name = "Content-Type", .value = "application/json" };
+    n_headers += 1;
+
+    for (headers) |hdr| {
+        if (n_headers >= extra_headers_buf.len) break;
+        if (parseHeaderString(hdr)) |h| {
+            extra_headers_buf[n_headers] = h;
+            n_headers += 1;
+        }
+    }
+
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+
+    const result = client.fetch(.{
+        .location = .{ .url = url },
+        .method = .POST,
+        .payload = body,
+        .extra_headers = extra_headers_buf[0..n_headers],
+        .response_writer = &aw.writer,
+    }) catch |err| {
+        log.err("native HTTP POST {s} failed: {}", .{ url, err });
+        return error.CurlFailed;
+    };
+
+    const response_body = try allocator.dupe(u8, aw.writer.buffer[0..aw.writer.end]);
+
+    return .{
+        .status_code = @intFromEnum(result.status),
+        .body = response_body,
+    };
+}
+
 // ── Tests ───────────────────────────────────────────────────────────
 
 test "curlPostWithProxy header guard allows at most (argv_buf_len - base_args) / 2 headers" {
@@ -673,6 +907,29 @@ test "setProxyOverride applies and clears process-wide override" {
         // Environment may define a proxy; only assert our override no longer leaks.
         try std.testing.expect(!std.mem.eql(u8, proxy, normalized_override));
     }
+}
+
+test "netBackend returns platform default when no override set" {
+    // Ensure no leftover override from other tests.
+    const saved = backend_override;
+    backend_override = null;
+    defer backend_override = saved;
+
+    const expected: NetBackend = if (builtin.os.tag == .macos) .subprocess else .native;
+    try std.testing.expectEqual(expected, netBackend());
+}
+
+test "setNetBackend overrides platform default" {
+    const saved = backend_override;
+    defer backend_override = saved;
+
+    setNetBackend(.subprocess);
+    try std.testing.expectEqual(NetBackend.subprocess, netBackend());
+    try std.testing.expect(useSubprocess());
+
+    setNetBackend(.native);
+    try std.testing.expectEqual(NetBackend.native, netBackend());
+    try std.testing.expect(!useSubprocess());
 }
 
 test "setProxyOverride accepts long proxy URLs" {
