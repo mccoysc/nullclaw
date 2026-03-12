@@ -835,6 +835,7 @@ pub const SessionManager = struct {
 
         // Mark session as processing and proceed with normal flow
         session.is_processing = true;
+        errdefer session.is_processing = false;
 
         // Set conversation context for this turn (Signal-specific for now)
         session.agent.conversation_context = conversation_context;
@@ -1357,6 +1358,52 @@ const DeltaCollector = struct {
     fn deinit(self: *DeltaCollector) void {
         self.data.deinit(self.allocator);
     }
+};
+
+/// MockErrorProvider — always returns error.CurlFailed, simulating network failure.
+const MockErrorProvider = struct {
+    const vtable = Provider.VTable{
+        .chatWithSystem = mockChatWithSystem,
+        .chat = mockChat,
+        .supportsNativeTools = mockSupportsNativeTools,
+        .getName = mockGetName,
+        .deinit = mockDeinit,
+    };
+
+    fn provider(self: *MockErrorProvider) Provider {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+    }
+
+    fn mockChatWithSystem(
+        _: *anyopaque,
+        _: Allocator,
+        _: ?[]const u8,
+        _: []const u8,
+        _: []const u8,
+        _: f64,
+    ) anyerror![]const u8 {
+        return error.CurlFailed;
+    }
+
+    fn mockChat(
+        _: *anyopaque,
+        _: Allocator,
+        _: providers.ChatRequest,
+        _: []const u8,
+        _: f64,
+    ) anyerror!providers.ChatResponse {
+        return error.CurlFailed;
+    }
+
+    fn mockSupportsNativeTools(_: *anyopaque) bool {
+        return false;
+    }
+
+    fn mockGetName(_: *anyopaque) []const u8 {
+        return "mock_error";
+    }
+
+    fn mockDeinit(_: *anyopaque) void {}
 };
 
 /// Create a test SessionManager with mock provider.
@@ -3015,4 +3062,36 @@ test "processMessage returns RegistryDraining error when registry is draining" {
 
     const result = sm.processMessage("drain:test", "hello", null);
     try testing.expectError(error.RegistryDraining, result);
+}
+
+test "processMessage resets is_processing on provider error" {
+    var mock_err = MockErrorProvider{};
+    const cfg = testConfig();
+    var noop_obs = observability.NoopObserver{};
+    var sm = SessionManager.init(
+        testing.allocator,
+        &cfg,
+        mock_err.provider(),
+        &.{},
+        null,
+        noop_obs.observer(),
+        null,
+        null,
+    );
+    defer sm.deinit();
+
+    const session = try sm.getOrCreate("err:test");
+    try testing.expect(!session.is_processing);
+
+    // First call should fail with CurlFailed
+    const result = sm.processMessage("err:test", "hello", null);
+    try testing.expectError(error.CurlFailed, result);
+
+    // is_processing must be reset to false so subsequent messages are not queued
+    try testing.expect(!session.is_processing);
+
+    // Verify a second call also returns CurlFailed (not "[message queued]")
+    const result2 = sm.processMessage("err:test", "world", null);
+    try testing.expectError(error.CurlFailed, result2);
+    try testing.expect(!session.is_processing);
 }
