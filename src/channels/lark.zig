@@ -591,6 +591,60 @@ pub const LarkChannel = struct {
         };
     }
 
+    /// Parse the service_id query parameter from a Lark WebSocket URL.
+    /// Returns 0 if the parameter is not found or cannot be parsed.
+    fn parseServiceId(url: []const u8) i32 {
+        const key = "service_id=";
+        const start = std.mem.indexOf(u8, url, key) orelse return 0;
+        const value_start = start + key.len;
+        const remaining = url[value_start..];
+        const value_end = std.mem.indexOfAny(u8, remaining, "&# ") orelse remaining.len;
+        return std.fmt.parseInt(i32, remaining[0..value_end], 10) catch 0;
+    }
+
+    /// Send a binary protobuf ping frame to the Lark server.
+    /// Mirrors the Go SDK's NewPingFrame + writeMessage(BinaryMessage, ...).
+    fn sendProtobufPing(ws_client: *websocket.WsClient, service_id: i32) !void {
+        const ping_headers = [_]lark_proto.Header{
+            .{ .key = lark_proto.HEADER_TYPE, .value = lark_proto.MSG_PING },
+        };
+        const ping_frame = lark_proto.Frame{
+            .seq_id = 0,
+            .log_id = 0,
+            .service = service_id,
+            .method = lark_proto.METHOD_CONTROL,
+            .headers = &ping_headers,
+        };
+        var buf: [512]u8 = undefined;
+        const encoded = try lark_proto.encodeFrame(&buf, &ping_frame);
+        try ws_client.writeBinary(encoded);
+        log.info("lark: sent protobuf ping (service_id={d})", .{service_id});
+    }
+
+    /// Periodic protobuf ping loop for Lark WebSocket.
+    /// The Lark server expects the client to send periodic binary protobuf ping
+    /// frames (type="ping") to keep the connection active and enable event delivery.
+    /// This mirrors the Go SDK's pingLoop goroutine.
+    fn protobufPingLoop(lark_ch: *LarkChannel, ws_client: *websocket.WsClient, service_id: i32) void {
+        const PING_INTERVAL_MS: u64 = 120_000; // 2 minutes (Go SDK default)
+        const SLEEP_STEP_MS: u64 = 500;
+
+        while (lark_ch.running.load(.acquire) and lark_ch.connected.load(.acquire)) {
+            var slept: u64 = 0;
+            while (slept < PING_INTERVAL_MS) {
+                if (!lark_ch.running.load(.acquire) or !lark_ch.connected.load(.acquire)) return;
+                std.Thread.sleep(SLEEP_STEP_MS * std.time.ns_per_ms);
+                slept += SLEEP_STEP_MS;
+            }
+            if (!lark_ch.running.load(.acquire) or !lark_ch.connected.load(.acquire)) return;
+
+            sendProtobufPing(ws_client, service_id) catch |err| {
+                log.warn("lark: periodic protobuf ping failed: {}", .{err});
+                return;
+            };
+        }
+    }
+
     fn runWebsocketOnce(self: *LarkChannel) !void {
         // Step 1: POST to /callback/ws/endpoint to get dynamic WebSocket URL
         const ws_url = self.fetchWsEndpoint() catch |err| {
@@ -632,9 +686,25 @@ pub const LarkChannel = struct {
         defer self.ws_fd.store(invalid_socket, .release);
 
         self.connected.store(true, .release);
-        defer self.connected.store(false, .release);
 
         log.info("lark: websocket connected, entering read loop", .{});
+
+        // Step 2.5: Parse service_id from URL and start periodic ping loop.
+        // The Lark server requires the client to send binary protobuf ping
+        // frames to activate event delivery (mirrors Go SDK's pingLoop).
+        const service_id = parseServiceId(ws_url);
+
+        // Send initial ping immediately (Go SDK sends first ping before sleeping)
+        sendProtobufPing(&ws_client, service_id) catch |err| {
+            log.warn("lark: initial protobuf ping failed: {}", .{err});
+        };
+
+        // Spawn background ping thread (sends ping every ~2 minutes)
+        const ping_thread: ?std.Thread = std.Thread.spawn(
+            .{},
+            protobufPingLoop,
+            .{ self, &ws_client, service_id },
+        ) catch null;
 
         // Step 3: Read loop — handle binary protobuf frames
         while (self.running.load(.acquire)) {
@@ -672,6 +742,10 @@ pub const LarkChannel = struct {
                 },
             }
         }
+
+        // Signal ping thread to stop and wait for it before deinitializing ws_client
+        self.connected.store(false, .release);
+        if (ping_thread) |t| t.join();
     }
 
     fn websocketLoop(self: *LarkChannel) void {
@@ -1763,6 +1837,59 @@ test "sendDataAck builds valid ACK frame with code 200" {
     const msg_id = decoded.frame.getHeader(lark_proto.HEADER_MESSAGE_ID);
     try std.testing.expect(msg_id != null);
     try std.testing.expectEqualStrings("msg_001", msg_id.?);
+}
+
+test "parseServiceId extracts service_id from Lark WS URL" {
+    // Standard Lark WS URL with service_id in the middle
+    const url1 = "wss://msg-frontier-sg.larksuite.com/ws/v2?fpid=493&aid=552564&device_id=123&service_id=33554678&ticket=abc";
+    try std.testing.expectEqual(@as(i32, 33554678), LarkChannel.parseServiceId(url1));
+
+    // service_id at the end of the URL (no trailing &)
+    const url2 = "wss://example.com/ws?foo=bar&service_id=42";
+    try std.testing.expectEqual(@as(i32, 42), LarkChannel.parseServiceId(url2));
+
+    // No service_id parameter
+    const url3 = "wss://example.com/ws?fpid=1&aid=2";
+    try std.testing.expectEqual(@as(i32, 0), LarkChannel.parseServiceId(url3));
+
+    // Empty URL
+    try std.testing.expectEqual(@as(i32, 0), LarkChannel.parseServiceId(""));
+
+    // service_id with invalid value
+    const url4 = "wss://example.com/ws?service_id=notanumber&foo=bar";
+    try std.testing.expectEqual(@as(i32, 0), LarkChannel.parseServiceId(url4));
+}
+
+test "sendProtobufPing builds valid protobuf ping frame" {
+    // Verify that the ping frame we would send matches Go SDK's NewPingFrame structure.
+    const allocator = std.testing.allocator;
+    const service_id: i32 = 33554678;
+
+    const ping_headers = [_]lark_proto.Header{
+        .{ .key = lark_proto.HEADER_TYPE, .value = lark_proto.MSG_PING },
+    };
+    const ping_frame = lark_proto.Frame{
+        .seq_id = 0,
+        .log_id = 0,
+        .service = service_id,
+        .method = lark_proto.METHOD_CONTROL,
+        .headers = &ping_headers,
+    };
+    var buf: [512]u8 = undefined;
+    const encoded = try lark_proto.encodeFrame(&buf, &ping_frame);
+    try std.testing.expect(encoded.len > 0);
+
+    // Decode and verify
+    var decoded = try lark_proto.decodeFrame(allocator, encoded);
+    defer decoded.deinit();
+
+    try std.testing.expectEqual(@as(u64, 0), decoded.frame.seq_id);
+    try std.testing.expectEqual(@as(u64, 0), decoded.frame.log_id);
+    try std.testing.expectEqual(service_id, decoded.frame.service);
+    try std.testing.expectEqual(lark_proto.METHOD_CONTROL, decoded.frame.method);
+    try std.testing.expectEqual(@as(usize, 1), decoded.frame.headers.len);
+    try std.testing.expectEqualStrings(lark_proto.HEADER_TYPE, decoded.frame.headers[0].key);
+    try std.testing.expectEqualStrings(lark_proto.MSG_PING, decoded.frame.headers[0].value);
 }
 
 test "sendDataAck builds valid ACK frame with code 500" {
