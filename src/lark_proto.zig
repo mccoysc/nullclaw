@@ -216,14 +216,14 @@ fn decodeHeaderMsg(data: []const u8) !Header {
 
     while (pos < data.len) {
         const tag = try decodeVarint(data, &pos);
-        const field_num: u32 = @intCast(tag >> 3);
+        const field_num = std.math.cast(u32, tag >> 3) orelse return error.InvalidValue;
         const wire_type: u3 = @intCast(tag & 7);
 
         switch (field_num) {
             1 => { // key: string
                 if (wire_type != 2) return error.InvalidWireType;
                 const len = try decodeVarint(data, &pos);
-                const end = pos + @as(usize, @intCast(len));
+                const end = pos + (std.math.cast(usize, len) orelse return error.InvalidValue);
                 if (end > data.len) return error.UnexpectedEndOfData;
                 key = data[pos..end];
                 pos = end;
@@ -231,7 +231,7 @@ fn decodeHeaderMsg(data: []const u8) !Header {
             2 => { // value: string
                 if (wire_type != 2) return error.InvalidWireType;
                 const len = try decodeVarint(data, &pos);
-                const end = pos + @as(usize, @intCast(len));
+                const end = pos + (std.math.cast(usize, len) orelse return error.InvalidValue);
                 if (end > data.len) return error.UnexpectedEndOfData;
                 value = data[pos..end];
                 pos = end;
@@ -257,7 +257,7 @@ fn skipField(data: []const u8, pos: *usize, wire_type: u3) !void {
         },
         2 => { // length-delimited
             const len = try decodeVarint(data, pos);
-            const skip_len: usize = @intCast(len);
+            const skip_len = std.math.cast(usize, len) orelse return error.InvalidValue;
             if (pos.* + skip_len > data.len) return error.UnexpectedEndOfData;
             pos.* += skip_len;
         },
@@ -278,7 +278,7 @@ pub fn decodeFrame(allocator: std.mem.Allocator, data: []const u8) !DecodedFrame
 
     while (pos < data.len) {
         const tag = try decodeVarint(data, &pos);
-        const field_num: u32 = @intCast(tag >> 3);
+        const field_num = std.math.cast(u32, tag >> 3) orelse return error.InvalidValue;
         const wire_type: u3 = @intCast(tag & 7);
 
         switch (field_num) {
@@ -293,17 +293,17 @@ pub fn decodeFrame(allocator: std.mem.Allocator, data: []const u8) !DecodedFrame
             3 => { // service: int32
                 if (wire_type != 0) return error.InvalidWireType;
                 const v = try decodeVarint(data, &pos);
-                frame.service = @intCast(@as(i64, @bitCast(v)));
+                frame.service = std.math.cast(i32, @as(i64, @bitCast(v))) orelse return error.InvalidValue;
             },
             4 => { // method: int32
                 if (wire_type != 0) return error.InvalidWireType;
                 const v = try decodeVarint(data, &pos);
-                frame.method = @intCast(@as(i64, @bitCast(v)));
+                frame.method = std.math.cast(i32, @as(i64, @bitCast(v))) orelse return error.InvalidValue;
             },
             5 => { // headers: repeated Header (length-delimited sub-message)
                 if (wire_type != 2) return error.InvalidWireType;
                 const len = try decodeVarint(data, &pos);
-                const end = pos + @as(usize, @intCast(len));
+                const end = pos + (std.math.cast(usize, len) orelse return error.InvalidValue);
                 if (end > data.len) return error.UnexpectedEndOfData;
                 const header = try decodeHeaderMsg(data[pos..end]);
                 try headers_list.append(allocator, header);
@@ -312,7 +312,7 @@ pub fn decodeFrame(allocator: std.mem.Allocator, data: []const u8) !DecodedFrame
             6 => { // payloadEncoding: string
                 if (wire_type != 2) return error.InvalidWireType;
                 const len = try decodeVarint(data, &pos);
-                const end = pos + @as(usize, @intCast(len));
+                const end = pos + (std.math.cast(usize, len) orelse return error.InvalidValue);
                 if (end > data.len) return error.UnexpectedEndOfData;
                 frame.payload_encoding = data[pos..end];
                 pos = end;
@@ -320,7 +320,7 @@ pub fn decodeFrame(allocator: std.mem.Allocator, data: []const u8) !DecodedFrame
             7 => { // payloadType: string
                 if (wire_type != 2) return error.InvalidWireType;
                 const len = try decodeVarint(data, &pos);
-                const end = pos + @as(usize, @intCast(len));
+                const end = pos + (std.math.cast(usize, len) orelse return error.InvalidValue);
                 if (end > data.len) return error.UnexpectedEndOfData;
                 frame.payload_type = data[pos..end];
                 pos = end;
@@ -328,7 +328,7 @@ pub fn decodeFrame(allocator: std.mem.Allocator, data: []const u8) !DecodedFrame
             8 => { // payload: bytes
                 if (wire_type != 2) return error.InvalidWireType;
                 const len = try decodeVarint(data, &pos);
-                const end = pos + @as(usize, @intCast(len));
+                const end = pos + (std.math.cast(usize, len) orelse return error.InvalidValue);
                 if (end > data.len) return error.UnexpectedEndOfData;
                 frame.payload = data[pos..end];
                 pos = end;
@@ -336,7 +336,7 @@ pub fn decodeFrame(allocator: std.mem.Allocator, data: []const u8) !DecodedFrame
             9 => { // LogIDNew: string
                 if (wire_type != 2) return error.InvalidWireType;
                 const len = try decodeVarint(data, &pos);
-                const end = pos + @as(usize, @intCast(len));
+                const end = pos + (std.math.cast(usize, len) orelse return error.InvalidValue);
                 if (end > data.len) return error.UnexpectedEndOfData;
                 frame.log_id_new = data[pos..end];
                 pos = end;
@@ -517,4 +517,37 @@ test "encodeFrame with LogIDNew and payloadEncoding" {
     try std.testing.expectEqualStrings("gzip", decoded.frame.payload_encoding);
     try std.testing.expectEqualStrings("application/json", decoded.frame.payload_type);
     try std.testing.expectEqualStrings("new-log-id-999", decoded.frame.log_id_new);
+}
+
+test "decodeFrame rejects out-of-range service value" {
+    // Craft a frame with field 3 (service) carrying a varint that exceeds i32 range.
+    // Field tag = (3 << 3) | 0 = 24 = 0x18, value = 0x80_0000_0000 (2^39).
+    var buf: [20]u8 = undefined;
+    var len: usize = 0;
+    // tag for field 3, wire type 0
+    buf[len] = 0x18;
+    len += 1;
+    // encode varint 0x80_0000_0000 (exceeds i32 max after bitcast)
+    const big_val: u64 = @as(u64, 1) << 39;
+    len += encodeVarint(buf[len..], big_val);
+
+    const allocator = std.testing.allocator;
+    const result = decodeFrame(allocator, buf[0..len]);
+    try std.testing.expectError(error.InvalidValue, result);
+}
+
+test "decodeFrame rejects out-of-range method value" {
+    // Craft a frame with field 4 (method) carrying a varint that exceeds i32 range.
+    var buf: [20]u8 = undefined;
+    var len: usize = 0;
+    // tag for field 4, wire type 0
+    buf[len] = 0x20;
+    len += 1;
+    // encode varint that exceeds i32 max
+    const big_val: u64 = @as(u64, 1) << 40;
+    len += encodeVarint(buf[len..], big_val);
+
+    const allocator = std.testing.allocator;
+    const result = decodeFrame(allocator, buf[0..len]);
+    try std.testing.expectError(error.InvalidValue, result);
 }
