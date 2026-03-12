@@ -132,9 +132,9 @@ fn curlRequestWithProxy(
     proxy: ?[]const u8,
     max_time: ?[]const u8,
 ) ![]u8 {
-    // Fall back to subprocess when proxy is configured, since native
-    // std.http.Client does not support proxy or max_time settings.
-    if (!useSubprocess() and proxy == null) {
+    // Fall back to subprocess when proxy or timeout is configured, since native
+    // std.http.Client does not support proxy or timeout settings.
+    if (!useSubprocess() and proxy == null and max_time == null) {
         return nativeHttpRequest(allocator, method, content_type_header, url, body, headers);
     }
     return curlRequestWithProxySubprocess(allocator, method, content_type_header, url, body, headers, proxy, max_time);
@@ -418,10 +418,11 @@ fn curlGetWithProxyAndResolve(
     proxy: ?[]const u8,
     resolve_entry: ?[]const u8,
 ) ![]u8 {
-    // Fall back to subprocess when proxy or resolve_entry is set.
-    // Native std.http.Client lacks proxy support, and resolve_entry
-    // implements DNS pinning for SSRF protection (curl --resolve).
-    if (!useSubprocess() and proxy == null and resolve_entry == null) {
+    // Fall back to subprocess when proxy, resolve_entry, or timeout is set.
+    // Native std.http.Client lacks proxy, DNS pinning (--resolve), and
+    // request timeout support.
+    const has_timeout = timeout_secs.len > 0 and !std.mem.eql(u8, timeout_secs, "0");
+    if (!useSubprocess() and proxy == null and resolve_entry == null and !has_timeout) {
         return nativeHttpGet(allocator, url, headers);
     }
     return curlGetWithProxyAndResolveSubprocess(allocator, url, headers, timeout_secs, proxy, resolve_entry);
@@ -609,9 +610,8 @@ pub fn curlGetSSE(
     url: []const u8,
     timeout_secs: []const u8,
 ) ![]u8 {
-    if (!useSubprocess()) {
-        return nativeHttpGet(allocator, url, &.{"Accept: text/event-stream"});
-    }
+    // SSE always uses subprocess because native std.http.Client does not
+    // support streaming reads or request timeouts needed for SSE.
     return curlGetSSESubprocess(allocator, url, timeout_secs);
 }
 

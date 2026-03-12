@@ -137,11 +137,11 @@ pub const Client = struct {
 
         try body.appendSlice(allocator, "{\"chat_id\":");
         try body.appendSlice(allocator, chat_id);
-        try body.appendSlice(allocator, "\",\"message_id\":");
+        try body.appendSlice(allocator, ",\"message_id\":");
         var msg_id_buf: [32]u8 = undefined;
         const msg_id_str = try std.fmt.bufPrint(&msg_id_buf, "{d}", .{message_id});
         try body.appendSlice(allocator, msg_id_str);
-        try body.appendSlice(allocator, "\",\"text\":");
+        try body.appendSlice(allocator, ",\"text\":");
         try root.json_util.appendJsonString(&body, allocator, text);
         try body.appendSlice(allocator, "}");
 
@@ -355,4 +355,41 @@ test "telegram api parseSentMessageMeta extracts message id" {
         "{\"ok\":true,\"result\":{\"message_id\":42}}",
     ) orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(?i64, 42), meta.message_id);
+}
+
+test "editMessageText builds valid JSON body" {
+    // Verify that editMessageText produces well-formed JSON (no stray quotes
+    // between fields).  We can't call editMessageText directly because it
+    // invokes curlPostWithProxy, so we replicate the body-building logic and
+    // validate the output.
+    const allocator = std.testing.allocator;
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+    defer body.deinit(allocator);
+
+    const chat_id = "12345678";
+    const message_id: i64 = 42;
+    const text = "hello world";
+
+    try body.appendSlice(allocator, "{\"chat_id\":");
+    try body.appendSlice(allocator, chat_id);
+    try body.appendSlice(allocator, ",\"message_id\":");
+    var msg_id_buf: [32]u8 = undefined;
+    const msg_id_str = try std.fmt.bufPrint(&msg_id_buf, "{d}", .{message_id});
+    try body.appendSlice(allocator, msg_id_str);
+    try body.appendSlice(allocator, ",\"text\":");
+    try root.json_util.appendJsonString(&body, allocator, text);
+    try body.appendSlice(allocator, "}");
+
+    // The body must be valid JSON that std.json can parse.
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body.items, .{});
+    defer parsed.deinit();
+
+    // Verify fields
+    const obj = parsed.value.object;
+    const cid = obj.get("chat_id") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(i64, 12345678), cid.integer);
+    const mid = obj.get("message_id") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(i64, 42), mid.integer);
+    const txt = obj.get("text") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("hello world", txt.string);
 }
