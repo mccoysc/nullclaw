@@ -7,6 +7,7 @@ const DRAFT_TRIM_BYTES = " \t\r\n";
 
 pub const DraftState = struct {
     draft_id: u64,
+    message_id: ?i64 = null,
     buffer: std.ArrayListUnmanaged(u8) = .empty,
     last_flush_len: usize = 0,
     last_flush_time: i64 = 0,
@@ -18,7 +19,9 @@ pub const DraftState = struct {
 
 pub const DraftFlush = struct {
     draft_id: u64,
+    message_id: ?i64,
     text: []u8,
+    is_first: bool,
 
     pub fn deinit(self: *DraftFlush, allocator: std.mem.Allocator) void {
         allocator.free(self.text);
@@ -78,7 +81,9 @@ pub fn appendDraftChunk(
     markDraftFlushed(state, now_ms);
     return .{
         .draft_id = state.draft_id,
+        .message_id = state.message_id,
         .text = text,
+        .is_first = state.message_id == null,
     };
 }
 

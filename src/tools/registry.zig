@@ -855,14 +855,13 @@ pub const ToolRegistry = struct {
             const cfg_path = self.config_path orelse continue;
             const mtime = fileMtime(cfg_path);
             if (mtime == self.last_mtime) continue;
-            self.last_mtime = mtime;
 
             log.info("config changed, hot-reloading tool plugins", .{});
-            self.hotReloadFromFile(cfg_path);
+            self.hotReloadFromFile(cfg_path, mtime);
         }
     }
 
-    fn hotReloadFromFile(self: *ToolRegistry, cfg_path: []const u8) void {
+    fn hotReloadFromFile(self: *ToolRegistry, cfg_path: []const u8, new_mtime: i128) void {
         const data = std.fs.cwd().readFileAlloc(
             self.allocator,
             cfg_path,
@@ -907,9 +906,37 @@ pub const ToolRegistry = struct {
             self.allocator.free(add_arr);
         }
 
+        // Parse and update current_tools_list_path if changed.
+        // Skip update if the path equals config_path (avoids infinite hot-reload loop).
+        if (plugins_v.object.get("current_tools_list_path")) |path_v| {
+            if (path_v == .string) {
+                const new_path = path_v.string;
+                // Guard: prevent infinite loop if user misconfigures path to be the same as config.
+                if (std.mem.eql(u8, new_path, cfg_path)) {
+                    log.warn("hot-reload: current_tools_list_path equals config path; skipping to avoid loop", .{});
+                } else {
+                    const old_path = self.current_tools_list_path;
+                    const needs_update = if (old_path) |old| !std.mem.eql(u8, old, new_path) else true;
+                    if (needs_update) {
+                        self.setCurrentToolsListPath(new_path) catch |err| {
+                            log.warn("hot-reload: setCurrentToolsListPath: {}", .{err});
+                        };
+                    }
+                }
+            } else if (path_v == .null and self.current_tools_list_path != null) {
+                // Explicitly set to null in config — clear the path.
+                if (self.current_tools_list_path) |p| self.allocator.free(p);
+                self.current_tools_list_path = null;
+            }
+        }
+
         self.applyPlugins(.{ .overwrite = overwrite, .add = add_arr }) catch |err| {
             log.err("hot-reload: applyPlugins: {}", .{err});
         };
+
+        // Update mtime AFTER applyPlugins to prevent infinite loop if
+        // writeCurrentToolsList() caused filesystem timestamps to change.
+        self.last_mtime = new_mtime;
     }
 
     fn fileMtime(path: []const u8) i128 {

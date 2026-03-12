@@ -125,8 +125,27 @@ pub const Client = struct {
         return self.post(allocator, "getUpdates", body, timeout);
     }
 
-    pub fn sendMessageDraft(self: Client, allocator: std.mem.Allocator, body: []const u8) ![]u8 {
-        return self.post(allocator, "sendMessageDraft", body, "10");
+    pub fn editMessageText(
+        self: Client,
+        allocator: std.mem.Allocator,
+        chat_id: []const u8,
+        message_id: i64,
+        text: []const u8,
+    ) ![]u8 {
+        var body: std.ArrayListUnmanaged(u8) = .empty;
+        defer body.deinit(allocator);
+
+        try body.appendSlice(allocator, "{\"chat_id\":");
+        try body.appendSlice(allocator, chat_id);
+        try body.appendSlice(allocator, "\",\"message_id\":");
+        var msg_id_buf: [32]u8 = undefined;
+        const msg_id_str = try std.fmt.bufPrint(&msg_id_buf, "{d}", .{message_id});
+        try body.appendSlice(allocator, msg_id_str);
+        try body.appendSlice(allocator, "\",\"text\":");
+        try root.json_util.appendJsonString(&body, allocator, text);
+        try body.appendSlice(allocator, "}");
+
+        return self.post(allocator, "editMessageText", body.items, "10");
     }
 
     pub fn getFilePath(self: Client, allocator: std.mem.Allocator, file_id: []const u8) ![]u8 {

@@ -119,6 +119,13 @@ pub const WebFetchTool = struct {
 
         return ToolResult.ok(try allocator.dupe(u8, extracted));
     }
+
+    /// Update configuration at runtime (for hot-reload support).
+    /// Note: allowed_domains slice is NOT copied - caller must ensure it remains valid.
+    pub fn updateConfig(self: *WebFetchTool, allowed_domains: []const []const u8, default_max_chars: usize) void {
+        self.allowed_domains = allowed_domains;
+        self.default_max_chars = default_max_chars;
+    }
 };
 
 fn parseMaxChars(args: JsonObjectMap) usize {

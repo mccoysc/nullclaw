@@ -8,6 +8,7 @@ const std = @import("std");
 const memory_mod = @import("../memory/root.zig");
 const Memory = memory_mod.Memory;
 const bootstrap_mod = @import("../bootstrap/root.zig");
+const platform = @import("../platform.zig");
 
 // ── JSON arg extraction helpers ─────────────────────────────────
 // Used by all tool implementations to extract typed fields from
@@ -56,6 +57,90 @@ pub fn getStringArray(args: JsonObjectMap, key: []const u8) ?[]const JsonValue {
 /// The caller must `defer parsed.deinit()` and extract `.value.object` for the ObjectMap.
 pub fn parseTestArgs(json_str: []const u8) !std.json.Parsed(JsonValue) {
     return std.json.parseFromSlice(JsonValue, std.testing.allocator, json_str, .{});
+}
+
+/// Check if any web search API key environment variable is set.
+/// This includes keys for brave, firecrawl, tavily, perplexity, exa, jina.
+fn isAnySearchApiKeyPresent(allocator: std.mem.Allocator) bool {
+    const searchApiKeyEnvVars = [_][]const u8{
+        "BRAVE_API_KEY",
+        "FIRECRAWL_API_KEY",
+        "TAVILY_API_KEY",
+        "PERPLEXITY_API_KEY",
+        "EXA_API_KEY",
+        "JINA_API_KEY",
+        "WEB_SEARCH_API_KEY",
+    };
+    for (searchApiKeyEnvVars) |name| {
+        if (std.process.getEnvVarOwned(allocator, name)) |_| {
+            return true;
+        } else |_| {
+            continue;
+        }
+    }
+    return false;
+}
+
+/// Check if a specific provider requires an API key.
+/// Returns true if the provider needs an API key to function.
+fn providerRequiresApiKey(allocator: std.mem.Allocator, provider: []const u8) bool {
+    // These providers require API keys
+    const providers_requiring_key = [_][]const u8{
+        "brave",
+        "firecrawl",
+        "tavily",
+        "perplexity",
+        "exa",
+        "jina",
+    };
+    const lower = std.ascii.allocLowerString(allocator, provider) catch return false;
+    defer allocator.free(lower);
+    for (providers_requiring_key) |p| {
+        if (std.mem.eql(u8, lower, p)) return true;
+    }
+    return false;
+}
+
+/// Check if a provider is available (has API key or is searxng with base URL).
+fn isProviderAvailable(allocator: std.mem.Allocator, provider: []const u8, searxng_base_url: ?[]const u8) bool {
+    // searxng is available if base URL is configured
+    if (std.ascii.eqlIgnoreCase(provider, "searxng")) {
+        return searxng_base_url != null;
+    }
+    // duckduckgo (ddg) doesn't require API key
+    if (std.ascii.eqlIgnoreCase(provider, "duckduckgo") or std.ascii.eqlIgnoreCase(provider, "ddg")) {
+        return true;
+    }
+    // Other providers require API key
+    return isAnySearchApiKeyPresent(allocator);
+}
+
+/// Determine if web_search tool should be available based on config.
+/// Returns true if any search provider is usable:
+/// - searxng base URL is configured
+/// - explicit search_provider is set (not "auto") and is available (has API key or is searxng with URL)
+/// - search_provider is "auto" and at least one provider in the chain is available
+fn isWebSearchAvailable(allocator: std.mem.Allocator, opts: anytype) bool {
+    const provider = opts.web_search_provider;
+    const searxng_url = opts.web_search_base_url;
+
+    // If provider is "auto", check if any provider in the chain is available
+    if (std.ascii.eqlIgnoreCase(provider, "auto")) {
+        // Check if searxng is available (with base URL)
+        if (searxng_url != null) return true;
+        // Check if any API-key-based provider is available
+        if (isAnySearchApiKeyPresent(allocator)) return true;
+        // duckduckgo is always available as fallback (no API key needed)
+        return true;
+    }
+
+    // Explicit provider is set - check if it's available
+    if (provider.len > 0) {
+        return isProviderAvailable(allocator, provider, searxng_url);
+    }
+
+    // Default: available (will use duckduckgo fallback at runtime)
+    return true;
 }
 
 // Sub-modules
@@ -390,33 +475,53 @@ pub fn allTools(
     try list.append(allocator, sp.tool());
 
     if (opts.http_enabled) {
+        // If allowed_domains is empty, effectively disable all web tools.
+        const http_allowed_domains = opts.http_allowed_domains;
+        const has_allowed_domains = http_allowed_domains.len > 0;
+
+        // Only enable web tools if http is enabled AND allowed_domains is not empty.
+        // Note: allowed_domains being empty is equivalent to http_enabled being false.
+        const web_tools_enabled = has_allowed_domains;
+
         // Pushover notification tool (network egress, gated with HTTP tools).
         const pt = try allocator.create(pushover.PushoverTool);
         pt.* = .{ .workspace_dir = workspace_dir };
         try list.append(allocator, pt.tool());
 
-        const ht = try allocator.create(http_request.HttpRequestTool);
-        ht.* = .{
-            .allowed_domains = opts.http_allowed_domains,
-            .max_response_size = opts.http_max_response_size,
-        };
-        try list.append(allocator, ht.tool());
+        // http_request and web_fetch are only available if allowed_domains is set
+        if (web_tools_enabled) {
+            const ht = try allocator.create(http_request.HttpRequestTool);
+            ht.* = .{
+                .allowed_domains = http_allowed_domains,
+                .max_response_size = opts.http_max_response_size,
+            };
+            try list.append(allocator, ht.tool());
 
-        const wst = try allocator.create(web_search.WebSearchTool);
-        wst.* = .{
-            .searxng_base_url = opts.web_search_base_url,
-            .provider = opts.web_search_provider,
-            .fallback_providers = opts.web_search_fallback_providers,
-            .timeout_secs = opts.http_timeout_secs,
-        };
-        try list.append(allocator, wst.tool());
+            const wft = try allocator.create(web_fetch.WebFetchTool);
+            wft.* = .{
+                .default_max_chars = tc.web_fetch_max_chars,
+                .allowed_domains = http_allowed_domains,
+            };
+            try list.append(allocator, wft.tool());
+        }
 
-        const wft = try allocator.create(web_fetch.WebFetchTool);
-        wft.* = .{
-            .default_max_chars = tc.web_fetch_max_chars,
-            .allowed_domains = opts.http_allowed_domains,
-        };
-        try list.append(allocator, wft.tool());
+        // web_search is only included if a search provider is available AND web tools are enabled:
+        // - searxng base URL is configured
+        // - explicit search_provider is set (not "auto") and is available
+        // - any known search API key env var is present
+        // - search_provider is "auto" (duckduckgo fallback is available)
+        // Note: web_search doesn't require allowed_domains (duckduckgo fallback)
+        // but is still gated by http_enabled for consistency.
+        if (web_tools_enabled and isWebSearchAvailable(allocator, opts)) {
+            const wst = try allocator.create(web_search.WebSearchTool);
+            wst.* = .{
+                .searxng_base_url = opts.web_search_base_url,
+                .provider = opts.web_search_provider,
+                .fallback_providers = opts.web_search_fallback_providers,
+                .timeout_secs = opts.http_timeout_secs,
+            };
+            try list.append(allocator, wst.tool());
+        }
     }
 
     if (opts.browser_enabled) {
@@ -863,9 +968,13 @@ test "tool spec generation" {
 }
 
 test "all tools includes extras when enabled" {
+    const domains = [_][]const u8{"example.com"};
     const tools = try allTools(std.testing.allocator, "/tmp/yc_test", .{
         .http_enabled = true,
+        .http_allowed_domains = &domains,
         .browser_enabled = true,
+        // Use "auto" provider - will fallback to duckduckgo (no API key required)
+        .web_search_provider = "auto",
     });
     defer deinitTools(std.testing.allocator, tools);
 
@@ -897,7 +1006,7 @@ test "all tools wires http and web_search config into tool instances" {
         .http_max_response_size = 321_000,
         .http_timeout_secs = 12,
         .web_search_base_url = search_url,
-        .web_search_provider = "brave",
+        .web_search_provider = "auto",
         .web_search_fallback_providers = &search_fallbacks,
     });
     defer deinitTools(std.testing.allocator, tools);
@@ -917,7 +1026,7 @@ test "all tools wires http and web_search config into tool instances" {
         if (std.mem.eql(u8, t.name(), "web_search")) {
             const wst: *web_search.WebSearchTool = @ptrCast(@alignCast(t.ptr));
             try std.testing.expectEqualStrings(search_url, wst.searxng_base_url.?);
-            try std.testing.expectEqualStrings("brave", wst.provider);
+            try std.testing.expectEqualStrings("auto", wst.provider);
             try std.testing.expectEqual(@as(usize, 2), wst.fallback_providers.len);
             try std.testing.expectEqualStrings("jina", wst.fallback_providers[0]);
             try std.testing.expectEqual(@as(u64, 12), wst.timeout_secs);

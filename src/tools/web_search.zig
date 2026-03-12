@@ -14,6 +14,11 @@
 //! 1) `provider = "auto"` (default): tries a built-in chain.
 //! 2) Explicit provider via config (`http_request.search_provider`) or tool arg (`provider`).
 //! 3) Optional fallback chain (`http_request.search_fallback_providers`).
+//!
+//! Hard error handling:
+//! Providers that fail with hard errors (network failure, missing API key, etc.) are
+//! temporarily disabled in-memory until the next config reload. This prevents repeatedly
+//! trying failing providers in the same session.
 
 const std = @import("std");
 const root = @import("root.zig");
@@ -32,6 +37,90 @@ const DEFAULT_COUNT: usize = 5;
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 /// Upper bound for provider chain size (primary + fallbacks + auto expansions).
 const MAX_PROVIDER_CHAIN: usize = 16;
+
+/// Errors that cause a provider to be temporarily disabled.
+/// These are "hard errors" that indicate the provider is unavailable or misconfigured.
+const HardErrors = error{
+    /// Network connectivity issues (timeout, connection refused, DNS failure)
+    RequestFailed,
+    /// Missing or invalid API key
+    MissingApiKey,
+    /// Provider service is unavailable
+    ProviderUnavailable,
+    /// Invalid API key (401/403 responses)
+    InvalidApiKey,
+};
+
+/// Tracks temporarily disabled providers due to hard errors.
+/// This is a process-wide singleton to avoid repeated failures in the same session.
+const ProviderFailureState = struct {
+    /// Bitmap of disabled providers (index matches SearchProvider ordinal).
+    disabled: u16 = 0,
+
+    /// Check if a provider is disabled.
+    fn isDisabled(self: *const @This(), provider: SearchProvider) bool {
+        const index = @intFromEnum(provider);
+        return (self.disabled & (@as(u16, 1) << index)) != 0;
+    }
+
+    /// Mark a provider as disabled.
+    fn disable(self: *@This(), provider: SearchProvider) void {
+        const index = @intFromEnum(provider);
+        self.disabled |= (@as(u16, 1) << index);
+    }
+
+    /// Clear all disabled providers (called on config reload).
+    fn clear(self: *@This()) void {
+        self.disabled = 0;
+    }
+};
+
+/// Global provider failure state (process-wide).
+var failure_state: ProviderFailureState = .{};
+
+/// Check if an error is a "hard error" that should disable the provider.
+fn isHardError(err: anyerror) bool {
+    return switch (err) {
+        error.RequestFailed,
+        error.MissingApiKey,
+        error.ProviderUnavailable,
+        error.InvalidApiKey,
+        => true,
+        else => false,
+    };
+}
+
+/// Clear all provider failure states and removal flag at module level.
+/// Called on config hot-reload to re-enable providers that were temporarily disabled
+/// and to allow web_search to be re-evaluated (like at startup).
+pub fn clearFailureState() void {
+    failure_state.clear();
+    tool_removed_from_registry = false;
+}
+
+/// Check if all providers in the given chain are currently disabled.
+/// Returns true if every provider in the chain has been marked as disabled due to hard errors.
+pub fn allProvidersDisabled(chain: []const SearchProvider) bool {
+    for (chain) |provider| {
+        if (!failure_state.isDisabled(provider)) {
+            return false;
+        }
+    }
+    return chain.len > 0;
+}
+
+/// Global flag to track if web_search was removed from registry due to all providers disabled.
+var tool_removed_from_registry: bool = false;
+
+/// Mark web_search as removed from registry.
+pub fn setToolRemovedFromRegistry(removed: bool) void {
+    tool_removed_from_registry = removed;
+}
+
+/// Check if web_search was removed from registry.
+pub fn isToolRemovedFromRegistry() bool {
+    return tool_removed_from_registry;
+}
 
 const SearchProvider = enum {
     auto,
@@ -72,6 +161,11 @@ pub const WebSearchTool = struct {
         };
     }
 
+    /// Clear all provider failure states. Called on config hot-reload.
+    pub fn clearFailureState() void {
+        failure_state.clear();
+    }
+
     pub fn execute(self: *WebSearchTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
         const query = root.getString(args, "query") orelse
             return ToolResult.fail("Missing required 'query' parameter");
@@ -92,7 +186,21 @@ pub const WebSearchTool = struct {
         defer failures.deinit(allocator);
 
         for (chain) |provider| {
+            // Skip disabled providers
+            if (failure_state.isDisabled(provider)) {
+                if (failures.items.len > 0) {
+                    try failures.appendSlice(allocator, " | ");
+                }
+                try std.fmt.format(failures.writer(allocator), "{s}:disabled", .{providerName(provider)});
+                continue;
+            }
+
             const result = executeWithProvider(self, allocator, provider, query, count) catch |err| {
+                // Mark provider as disabled on hard errors
+                if (isHardError(err)) {
+                    failure_state.disable(provider);
+                }
+
                 if (err == error.InvalidSearchBaseUrl) {
                     return ToolResult.fail("Invalid http_request.search_base_url; expected https://host[/search]");
                 }
@@ -108,6 +216,16 @@ pub const WebSearchTool = struct {
 
         if (failures.items.len == 0) {
             return ToolResult.fail("web_search has no providers configured.");
+        }
+
+        // All providers failed - mark tool for removal from registry if all are disabled
+        const all_disabled = blk: {
+            var check_chain_buf: [MAX_PROVIDER_CHAIN]SearchProvider = undefined;
+            const check_chain = buildProviderChain(self, provider_raw, &check_chain_buf) catch break :blk false;
+            break :blk allProvidersDisabled(check_chain);
+        };
+        if (all_disabled) {
+            setToolRemovedFromRegistry(true);
         }
 
         const msg = try std.fmt.allocPrint(allocator, "All web_search providers failed: {s}", .{failures.items});

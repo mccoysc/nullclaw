@@ -34,20 +34,231 @@ pub fn extractHost(url: []const u8) ?[]const u8 {
     return host;
 }
 
-/// Check if a host matches the allowlist.
-/// Supports exact match and wildcard subdomain patterns ("*.example.com").
-pub fn hostMatchesAllowlist(host: []const u8, allowed: []const []const u8) bool {
-    if (allowed.len == 0) return true; // empty allowlist = allow all
-    for (allowed) |pattern| {
-        // Exact match
-        if (std.mem.eql(u8, host, pattern)) return true;
-        // Wildcard subdomain: "*.example.com" matches "api.example.com"
-        if (std.mem.startsWith(u8, pattern, "*.")) {
-            const domain = pattern[2..]; // strip "*."
-            if (std.mem.endsWith(u8, host, domain)) {
-                const prefix_len = host.len - domain.len;
-                if (prefix_len > 0 and host[prefix_len - 1] == '.') return true;
+/// Pattern types for allowlist matching
+pub const PatternType = enum {
+    exact,
+    wildcard_subdomain,
+    shell_wildcard,
+    regex,
+};
+
+/// Detect the type of pattern based on its content.
+fn detectPatternType(pattern: []const u8) PatternType {
+    if (std.mem.startsWith(u8, pattern, "*.")) {
+        const rest = pattern[2..];
+        for (rest) |c| {
+            if (c == '?' or c == '[' or c == ']' or c == '+' or
+                c == '(' or c == ')' or c == '^' or c == '|' or c == '\\')
+            {
+                return .regex;
             }
+        }
+        return .wildcard_subdomain;
+    }
+    for (pattern, 0..) |c, i| {
+        switch (c) {
+            '[', ']', '+', '(', ')', '^', '|', '\\' => return .regex,
+            '?' => {
+                if (i > 0 and pattern[i - 1] == '[') continue;
+                if (i == pattern.len - 1) continue;
+                const next = pattern[i + 1];
+                if (next == '.' or next == '\\' or next == '+' or next == '*' or
+                    next == '(' or next == ')' or next == '[' or next == ']')
+                {
+                    return .regex;
+                }
+            },
+            else => {},
+        }
+    }
+    for (pattern) |c| {
+        if (c == '*' or c == '?') return .shell_wildcard;
+    }
+    return .exact;
+}
+
+/// Shell-style wildcard matching
+fn hostMatchesShellWildcard(host: []const u8, pattern: []const u8) bool {
+    return matchGlob(host, pattern);
+}
+
+fn matchGlob(host: []const u8, pattern: []const u8) bool {
+    if (pattern.len == 0) return host.len == 0;
+    if (host.len == 0) {
+        for (pattern) |c| if (c != '*') return false;
+        return true;
+    }
+    var hi: usize = 0;
+    var pi: usize = 0;
+    while (hi < host.len and pi < pattern.len) {
+        const pc = pattern[pi];
+        if (pc == '*') {
+            if (matchGlob(host[hi..], pattern[pi + 1 ..])) return true;
+            if (hi < host.len and matchGlob(host[hi + 1 ..], pattern[pi..])) return true;
+            return false;
+        } else if (pc == '?') {
+            hi += 1;
+            pi += 1;
+        } else {
+            if (host[hi] != pc) return false;
+            hi += 1;
+            pi += 1;
+        }
+    }
+    while (pi < pattern.len and pattern[pi] == '*') pi += 1;
+    return hi == host.len and pi == pattern.len;
+}
+
+/// Regex matching (lightweight implementation)
+fn hostMatchesRegex(host: []const u8, pattern: []const u8) bool {
+    return matchRegex(host, pattern, 0, 0);
+}
+
+fn matchRegex(host: []const u8, pattern: []const u8, hi: usize, pi: usize) bool {
+    if (pi >= pattern.len) return hi >= host.len;
+    if (hi >= host.len) {
+        var pi_copy = pi;
+        while (pi_copy < pattern.len) {
+            const pc = pattern[pi_copy];
+            if (pc == '*') {
+                pi_copy += 1;
+                continue;
+            }
+            return pc == '?';
+        }
+        return true;
+    }
+    const pc = pattern[pi];
+    if (pc == '^') return hi == 0 and matchRegex(host, pattern, hi, pi + 1);
+    if (pc == '$') return hi == host.len;
+    if (pc == '.') return matchRegex(host, pattern, hi + 1, pi + 1);
+    if (pc == '*') {
+        if (matchRegex(host, pattern, hi, pi + 1)) return true;
+        return matchRegex(host, pattern, hi + 1, pi);
+    }
+    if (pc == '?') {
+        if (matchRegex(host, pattern, hi, pi + 1)) return true;
+        return matchRegex(host, pattern, hi + 1, pi + 1);
+    }
+    if (pc == '+') return matchRegex(host, pattern, hi + 1, pi + 1);
+    if (pc == '[') {
+        const close = findClosingBracket(pattern[pi..]);
+        if (close) |end| {
+            const class = pattern[pi + 1 .. pi + 1 + end];
+            if (matchesCharClass(host[hi], class)) {
+                return matchRegex(host, pattern, hi + 1, pi + 1 + end + 1);
+            }
+            return false;
+        }
+    }
+    if (pc == '\\' and pi + 1 < pattern.len) {
+        if (host[hi] == pattern[pi + 1]) {
+            return matchRegex(host, pattern, hi + 1, pi + 2);
+        }
+        return false;
+    }
+    if (host[hi] == pc) return matchRegex(host, pattern, hi + 1, pi + 1);
+    return false;
+}
+
+fn findClosingBracket(s: []const u8) ?usize {
+    if (s.len < 2 or s[0] != '[') return null;
+    var i: usize = 1;
+    if (i < s.len and s[i] == '^') i += 1;
+    if (i < s.len and s[i] == ']') i += 1;
+    while (i < s.len) {
+        if (s[i] == ']') return i;
+        if (s[i] == '\\' and i + 1 < s.len) i += 2 else i += 1;
+    }
+    return null;
+}
+
+fn matchesCharClass(c: u8, class: []const u8) bool {
+    if (class.len == 0) return false;
+    var i: usize = 0;
+    const neg = class[0] == '^';
+    if (neg) i += 1;
+    while (i < class.len) {
+        if (i + 2 <= class.len and class[i + 1] == '-') {
+            if (c >= class[i] and c <= class[i + 2]) return !neg;
+            i += 3;
+        } else {
+            if (c == class[i]) return !neg;
+            i += 1;
+        }
+    }
+    return neg;
+}
+
+/// Check if a URL matches the allowlist.
+/// For exact patterns: extracts host from URL and matches exactly.
+/// For wildcard/regex patterns: matches against the full URL without extracting host.
+pub fn urlMatchesAllowlist(url: []const u8, allowed: []const []const u8) bool {
+    // Empty allowlist means allow all - actual tool availability is controlled by allTools()
+    if (allowed.len == 0) return true;
+    for (allowed) |pattern| {
+        const pattern_type = detectPatternType(pattern);
+        switch (pattern_type) {
+            .exact => {
+                // For exact patterns, extract host and do exact match
+                const host = extractHost(url) orelse continue;
+                if (std.mem.eql(u8, host, pattern)) return true;
+            },
+            .wildcard_subdomain => {
+                // For wildcard subdomain patterns, match against full URL
+                if (urlMatchesShellWildcard(url, pattern)) return true;
+            },
+            .shell_wildcard => {
+                // For shell wildcard patterns, match against full URL
+                if (urlMatchesShellWildcard(url, pattern)) return true;
+            },
+            .regex => {
+                // For regex patterns, match against full URL
+                if (urlMatchesRegex(url, pattern)) return true;
+            },
+        }
+    }
+    return false;
+}
+
+/// Shell-style wildcard matching for URLs
+fn urlMatchesShellWildcard(url: []const u8, pattern: []const u8) bool {
+    return matchGlob(url, pattern);
+}
+
+/// Regex matching for URLs (lightweight implementation)
+fn urlMatchesRegex(url: []const u8, pattern: []const u8) bool {
+    return matchRegex(url, pattern, 0, 0);
+}
+
+/// Check if a host matches the allowlist.
+/// Supports:
+/// - Exact match: "example.com"
+/// - Wildcard subdomain: "*.example.com" matches "api.example.com"
+/// - Shell wildcard: "api*.com" matches "apixcom", "api123.com"; "api?.com" matches "api1.com"
+/// - Regex: ".*\\.example\\.com" matches any subdomain; "api[0-9]+\\.example\\.com" matches api1.example.com
+pub fn hostMatchesAllowlist(host: []const u8, allowed: []const []const u8) bool {
+    // Empty allowlist means allow all - actual tool availability is controlled by allTools()
+    if (allowed.len == 0) return true;
+    for (allowed) |pattern| {
+        const pattern_type = detectPatternType(pattern);
+        switch (pattern_type) {
+            .exact => {
+                if (std.mem.eql(u8, host, pattern)) return true;
+            },
+            .wildcard_subdomain => {
+                const domain = pattern[2..];
+                if (std.mem.endsWith(u8, host, domain)) {
+                    const prefix_len = host.len - domain.len;
+                    if (prefix_len > 0 and host[prefix_len - 1] == '.') return true;
+                }
+            },
+            .shell_wildcard => {
+                if (hostMatchesShellWildcard(host, pattern)) return true;
+            },
+            .regex => {
+                if (hostMatchesRegex(host, pattern)) return true;
+            },
         }
     }
     return false;
@@ -91,7 +302,7 @@ pub const ResolveConnectHostError = std.mem.Allocator.Error || error{
 /// Resolve host and return a concrete connect target (IP literal) that is
 /// guaranteed to be globally routable. If any resolved address is local/private,
 /// reject to prevent mixed-record SSRF bypasses.
-/// 
+///
 /// If `fallback_dns` is provided (e.g. "8.8.8.8"), will retry DNS resolution
 /// with that DNS server if the system resolver fails.
 pub fn resolveConnectHost(
@@ -711,6 +922,9 @@ test "hostMatchesAllowlist wildcard does not match wrong domain" {
 
 test "hostMatchesAllowlist empty allowlist allows all" {
     const empty: []const []const u8 = &.{};
+    // Empty allowlist means no domains are configured, but we treat this as "allow all"
+    // at the security layer. The actual tool availability is controlled by whether
+    // http_allowed_domains is empty in the tool factory (root.zig allTools).
     try std.testing.expect(hostMatchesAllowlist("anything.com", empty));
 }
 

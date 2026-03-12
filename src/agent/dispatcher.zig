@@ -326,10 +326,11 @@ pub fn formatToolResults(allocator: std.mem.Allocator, results: []const ToolExec
     try buf.appendSlice(allocator, "[Tool results]\n");
     for (results) |result| {
         const status_str = if (result.success) "ok" else "error";
+        const output = if (result.output.len > 0) result.output else "(empty)";
         try std.fmt.format(buf.writer(allocator), "<tool_result name=\"{s}\" status=\"{s}\">\n{s}\n</tool_result>\n", .{
             result.name,
             status_str,
-            result.output,
+            output,
         });
     }
 

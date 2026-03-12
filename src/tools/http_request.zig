@@ -60,8 +60,8 @@ pub const HttpRequestTool = struct {
 
         // Check domain allowlist before DNS resolution.
         if (self.allowed_domains.len > 0) {
-            if (!net_security.hostMatchesAllowlist(host, self.allowed_domains)) {
-                return ToolResult.fail("Host is not in http_request.allowed_domains");
+            if (!net_security.urlMatchesAllowlist(url, self.allowed_domains)) {
+                return ToolResult.fail("URL is not in http_request.allowed_domains");
             }
         }
 
@@ -154,6 +154,13 @@ pub const HttpRequestTool = struct {
             const err_msg = try std.fmt.allocPrint(allocator, "HTTP {d}", .{status_code});
             return ToolResult{ .success = false, .output = output, .error_msg = err_msg };
         }
+    }
+
+    /// Update configuration at runtime (for hot-reload support).
+    /// Note: allowed_domains slice is NOT copied - caller must ensure it remains valid.
+    pub fn updateConfig(self: *HttpRequestTool, allowed_domains: []const []const u8, max_response_size: u32) void {
+        self.allowed_domains = allowed_domains;
+        self.max_response_size = max_response_size;
     }
 };
 

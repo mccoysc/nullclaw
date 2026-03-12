@@ -476,6 +476,21 @@ pub const ChannelManager = struct {
                     log.info("Subagent manager config updated for sub-agent specific changes", .{});
                 }
             }
+
+            // Update http_request tool config (allowed_domains, max_response_size)
+            if (httpRequestConfigChanged(old_config, new_config)) {
+                rt.updateHttpRequestConfig(
+                    new_config.http_request.enabled,
+                    new_config.http_request.max_response_size,
+                    new_config.http_request.timeout_secs,
+                    new_config.http_request.allowed_domains,
+                    new_config.http_request.proxy,
+                    new_config.http_request.search_base_url,
+                    new_config.http_request.search_provider,
+                    new_config.http_request.search_fallback_providers,
+                );
+                log.info("http_request tool config hot-reloaded", .{});
+            }
         }
 
         log.info("Config reload complete", .{});
@@ -1221,6 +1236,33 @@ fn subagentConfigChanged(old: *const Config, new: *const Config) bool {
     if (!std.mem.eql(u8, old.default_provider, new.default_provider)) return true;
     if (!optionalStrEql(old.default_model, new.default_model)) return true;
 
+    return false;
+}
+
+/// Check if http_request tool config changed between old and new configs.
+fn httpRequestConfigChanged(old: *const Config, new: *const Config) bool {
+    // Check enabled
+    if (old.http_request.enabled != new.http_request.enabled) return true;
+    // Check max_response_size
+    if (old.http_request.max_response_size != new.http_request.max_response_size) return true;
+    // Check timeout_secs
+    if (old.http_request.timeout_secs != new.http_request.timeout_secs) return true;
+    // Check allowed_domains
+    if (old.http_request.allowed_domains.len != new.http_request.allowed_domains.len) return true;
+    for (old.http_request.allowed_domains, new.http_request.allowed_domains) |old_domain, new_domain| {
+        if (!std.mem.eql(u8, old_domain, new_domain)) return true;
+    }
+    // Check proxy (optional string)
+    if (!optionalStrEql(old.http_request.proxy, new.http_request.proxy)) return true;
+    // Check search_base_url (optional string)
+    if (!optionalStrEql(old.http_request.search_base_url, new.http_request.search_base_url)) return true;
+    // Check search_provider
+    if (!std.mem.eql(u8, old.http_request.search_provider, new.http_request.search_provider)) return true;
+    // Check search_fallback_providers
+    if (old.http_request.search_fallback_providers.len != new.http_request.search_fallback_providers.len) return true;
+    for (old.http_request.search_fallback_providers, new.http_request.search_fallback_providers) |old_fp, new_fp| {
+        if (!std.mem.eql(u8, old_fp, new_fp)) return true;
+    }
     return false;
 }
 

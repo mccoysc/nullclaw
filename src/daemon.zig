@@ -715,7 +715,16 @@ fn inboundDispatcherThread(
             typing_recipient,
         );
 
-        const use_streaming_outbound = std.mem.eql(u8, msg.channel, "web") or std.mem.eql(u8, msg.channel, "telegram");
+        // Check if channel supports streaming based on config
+        var use_streaming_outbound = false;
+        if (std.mem.eql(u8, msg.channel, "web")) {
+            use_streaming_outbound = true;
+        } else if (std.mem.eql(u8, msg.channel, "telegram")) {
+            // Check telegram config for streaming setting
+            if (runtime.config.channels.telegramPrimary()) |tg_cfg| {
+                use_streaming_outbound = tg_cfg.streaming;
+            }
+        }
         var streaming_ctx = StreamingOutboundCtx{
             .allocator = allocator,
             .event_bus = event_bus,

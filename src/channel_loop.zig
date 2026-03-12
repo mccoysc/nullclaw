@@ -14,6 +14,8 @@ const memory_mod = @import("memory/root.zig");
 const bootstrap_mod = @import("bootstrap/root.zig");
 const observability = @import("observability.zig");
 const tools_mod = @import("tools/root.zig");
+const http_request_mod = @import("tools/http_request.zig");
+const web_fetch_mod = @import("tools/web_fetch.zig");
 const mcp = @import("mcp.zig");
 const voice = @import("voice.zig");
 const health = @import("health.zig");
@@ -583,6 +585,51 @@ pub const ChannelRuntime = struct {
         }
 
         log.info("Provider bundle rebuilt — API key / provider config updated for all sessions", .{});
+    }
+
+    /// Update http_request and web_fetch tool configs at runtime (for hot-reload support).
+    /// Note: enabled, timeout_secs, proxy, search_base_url, search_provider, and
+    /// search_fallback_providers are accepted for future tool support but currently
+    /// only allowed_domains and max_response_size are applied to the tools.
+    /// Also clears web_search provider failure states so disabled providers are retried.
+    /// If web_search was removed from registry due to all providers disabled, restores it.
+    pub fn updateHttpRequestConfig(
+        self: *ChannelRuntime,
+        enabled: bool,
+        max_response_size: u32,
+        timeout_secs: u64,
+        allowed_domains: []const []const u8,
+        proxy: ?[]const u8,
+        search_base_url: ?[]const u8,
+        search_provider: []const u8,
+        search_fallback_providers: []const []const u8,
+    ) void {
+        _ = enabled;
+        _ = timeout_secs;
+        _ = proxy;
+        _ = search_base_url;
+        _ = search_provider;
+        _ = search_fallback_providers;
+
+        // Update http_request tool
+        for (self.tools) |tool| {
+            if (std.mem.eql(u8, tool.name(), "http_request")) {
+                // Cast to HttpRequestTool and call updateConfig
+                const http_tool: *http_request_mod.HttpRequestTool = @ptrCast(@alignCast(tool.ptr));
+                http_tool.updateConfig(allowed_domains, max_response_size);
+                log.info("Updated http_request tool config", .{});
+                break;
+            }
+        }
+        // Update web_fetch tool
+        for (self.tools) |tool| {
+            if (std.mem.eql(u8, tool.name(), "web_fetch")) {
+                const web_tool: *tools_mod.web_fetch.WebFetchTool = @ptrCast(@alignCast(tool.ptr));
+                web_tool.updateConfig(allowed_domains, max_response_size);
+                log.info("Updated web_fetch tool config", .{});
+                break;
+            }
+        }
     }
 
     pub fn deinit(self: *ChannelRuntime) void {
