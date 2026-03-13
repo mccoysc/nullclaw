@@ -113,6 +113,8 @@ fn processTelegramMessage(
                     "Plugin tools are being updated, please resend your message in a moment.",
                     reply_to_id,
                 ) catch |send_err| log.err("failed to send drain notice: {}", .{send_err});
+                // Clean up any visible draft message left from partial streaming
+                _ = tg_ptr.finalizeDraft(sender, "");
                 return;
             }
             log.err("Agent error: {}", .{err});
@@ -125,6 +127,8 @@ fn processTelegramMessage(
                 else => "An error occurred. Try again or /new for a fresh session.",
             };
             tg_ptr.sendMessageWithReply(sender, err_msg, reply_to_id) catch |send_err| log.err("failed to send error reply: {}", .{send_err});
+            // Clean up any visible draft message left from partial streaming
+            _ = tg_ptr.finalizeDraft(sender, "");
             return;
         };
     } else blk: {

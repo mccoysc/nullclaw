@@ -2388,32 +2388,33 @@ pub const TelegramChannel = struct {
         if (html_text) |h| {
             const resp = self.api().editMessageTextHtml(self.allocator, chat_id, message_id, h) catch {
                 // HTML edit failed — fall back to plain text
-                const plain_resp = self.api().editMessageText(self.allocator, chat_id, message_id, text) catch |err| {
-                    log.warn("editMessageText (plain fallback) for final draft failed: {}", .{err});
-                    return false;
-                };
-                self.allocator.free(plain_resp);
-                return true;
+                return self.editMessageTextChecked(chat_id, message_id, text);
             };
             defer self.allocator.free(resp);
 
             if (telegram_api.responseHasTelegramError(resp)) {
                 // HTML parse error — fall back to plain text
-                const plain_resp = self.api().editMessageText(self.allocator, chat_id, message_id, text) catch |err| {
-                    log.warn("editMessageText (plain fallback) for final draft failed: {}", .{err});
-                    return false;
-                };
-                self.allocator.free(plain_resp);
+                return self.editMessageTextChecked(chat_id, message_id, text);
             }
             return true;
         } else {
-            const resp = self.api().editMessageText(self.allocator, chat_id, message_id, text) catch |err| {
-                log.warn("editMessageText for final draft failed: {}", .{err});
-                return false;
-            };
-            self.allocator.free(resp);
-            return true;
+            return self.editMessageTextChecked(chat_id, message_id, text);
         }
+    }
+
+    /// Send a plain-text editMessageText and check the response for API errors.
+    /// Returns true if the edit succeeded, false otherwise.
+    fn editMessageTextChecked(self: *TelegramChannel, chat_id: []const u8, message_id: i64, text: []const u8) bool {
+        const resp = self.api().editMessageText(self.allocator, chat_id, message_id, text) catch |err| {
+            log.warn("editMessageText for final draft failed: {}", .{err});
+            return false;
+        };
+        defer self.allocator.free(resp);
+        if (telegram_api.responseHasTelegramError(resp)) {
+            log.warn("editMessageText API error for final draft: {s}", .{resp[0..@min(resp.len, 256)]});
+            return false;
+        }
+        return true;
     }
 
     /// Best-effort delete a message (ignores errors).
