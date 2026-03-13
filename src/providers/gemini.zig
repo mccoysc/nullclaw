@@ -871,10 +871,12 @@ pub const GeminiProvider = struct {
         const proxy = http_util.getProxyFromEnv(allocator) catch null;
         defer if (proxy) |p| allocator.free(p);
 
-        // Dispatch to native when --http-backend native, no proxy, and no timeout
-        // (native std.http.Client does not support request timeouts).
-        if (!http_util.useSubprocess() and proxy == null and timeout_secs == 0) {
-            return nativeStreamGemini(allocator, url, body, headers, callback, ctx);
+        // When the user explicitly chose a backend, always honour it.
+        // Otherwise fall back to subprocess when a proxy is configured.
+        if (!http_util.useSubprocess()) {
+            if (http_util.isExplicitOverride() or proxy == null) {
+                return nativeStreamGemini(allocator, url, body, headers, callback, ctx);
+            }
         }
 
         // Build argv on stack (max 32 args)
@@ -887,9 +889,8 @@ pub const GeminiProvider = struct {
         argc += 1;
         argv_buf[argc] = "--no-buffer";
         argc += 1;
-        argv_buf[argc] = "--fail-with-body";
+        argv_buf[argc] = http_util.curlFailFlag();
         argc += 1;
-
         var timeout_buf: [32]u8 = undefined;
         if (timeout_secs > 0) {
             const timeout_str = std.fmt.bufPrint(&timeout_buf, "{d}", .{timeout_secs}) catch return error.GeminiApiError;
