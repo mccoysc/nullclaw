@@ -2,6 +2,22 @@ const std = @import("std");
 const platform = @import("platform.zig");
 pub const config_types = @import("config_types.zig");
 pub const config_parse = @import("config_parse.zig");
+
+/// Expand a leading "~/" (or bare "~") in `path` to the user's home directory.
+/// Returns the original slice unchanged when no expansion is needed.
+/// Caller owns the returned slice when expansion occurs (allocated via `allocator`).
+fn expandTilde(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
+    if (path.len >= 2 and path[0] == '~' and path[1] == '/') {
+        const home = try platform.getHomeDir(allocator);
+        defer allocator.free(home);
+        return std.fs.path.join(allocator, &.{ home, path[2..] });
+    }
+    if (path.len == 1 and path[0] == '~') {
+        return platform.getHomeDir(allocator);
+    }
+    return path;
+}
+
 /// Write a JSON-escaped string (with enclosing quotes) to any writer.
 /// Mirrors json_util.appendJsonString but works with writer-based output.
 fn writeJsonStr(w: anytype, s: []const u8) !void {
@@ -283,9 +299,11 @@ pub const Config = struct {
             // Config file doesn't exist yet — use defaults
         }
 
-        // Use workspace_dir_override if set, otherwise use default
-        if (cfg.workspace_dir_override != null) {
-            cfg.workspace_dir = cfg.workspace_dir_override.?;
+        // Use workspace_dir_override if set, otherwise use default.
+        // Expand leading "~/" to the user's home directory since Zig does
+        // not perform shell-style tilde expansion.
+        if (cfg.workspace_dir_override) |ws_override| {
+            cfg.workspace_dir = expandTilde(allocator, ws_override) catch ws_override;
         }
 
         // Backfill runtime-derived fields not present in JSON
@@ -4568,4 +4586,29 @@ test "parseJson partial sub_agent fields" {
     try std.testing.expectEqualStrings("my-model", cfg.sub_agent_model.?);
     try std.testing.expect(cfg.tools_reviewer_provider == null);
     try std.testing.expect(cfg.tools_reviewer_model == null);
+}
+
+test "expandTilde expands ~/ prefix" {
+    const allocator = std.testing.allocator;
+    const result = try expandTilde(allocator, "~/.nullclaw/workspace");
+    defer allocator.free(result);
+    // Should NOT start with ~
+    try std.testing.expect(result[0] != '~');
+    // Should end with the path after ~/
+    try std.testing.expect(std.mem.endsWith(u8, result, "/.nullclaw/workspace"));
+}
+
+test "expandTilde expands bare ~" {
+    const allocator = std.testing.allocator;
+    const result = try expandTilde(allocator, "~");
+    defer allocator.free(result);
+    try std.testing.expect(result.len > 0);
+    try std.testing.expect(result[0] != '~');
+}
+
+test "expandTilde returns absolute path unchanged" {
+    const allocator = std.testing.allocator;
+    const result = try expandTilde(allocator, "/home/user/.nullclaw/workspace");
+    // Should return the same slice (no allocation)
+    try std.testing.expectEqualStrings("/home/user/.nullclaw/workspace", result);
 }

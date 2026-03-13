@@ -36,9 +36,48 @@ pub fn netBackend() NetBackend {
     return backend_override orelse platform_default;
 }
 
+/// True when the user explicitly set `--http-backend`.
+pub fn isExplicitOverride() bool {
+    return backend_override != null;
+}
+
 /// Convenience: true when subprocess path should be used.
 pub fn useSubprocess() bool {
     return netBackend() == .subprocess;
+}
+
+// ── Curl capability detection ──────────────────────────────────────
+
+/// Cached result of probing curl for `--fail-with-body` support (added in 7.76.0).
+/// null = not yet probed, true = supported, false = unsupported.
+var curl_fail_with_body_supported: ?bool = null;
+
+/// Probe curl once for `--fail-with-body` support and cache the result.
+/// Returns `"--fail-with-body"` when supported, `"--fail"` otherwise.
+pub fn curlFailFlag() []const u8 {
+    if (curl_fail_with_body_supported) |supported| {
+        return if (supported) "--fail-with-body" else "--fail";
+    }
+    // Probe: `curl --fail-with-body -V` exits 0 if the flag is recognised.
+    const argv = [_][]const u8{ "curl", "--fail-with-body", "-V" };
+    var child = std.process.Child.init(&argv, std.heap.page_allocator);
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+    child.stdin_behavior = .Close;
+    child.spawn() catch {
+        curl_fail_with_body_supported = false;
+        return "--fail";
+    };
+    const term = child.wait() catch {
+        curl_fail_with_body_supported = false;
+        return "--fail";
+    };
+    const supported = switch (term) {
+        .Exited => |code| code == 0,
+        else => false,
+    };
+    curl_fail_with_body_supported = supported;
+    return if (supported) "--fail-with-body" else "--fail";
 }
 threadlocal var thread_interrupt_flag: ?*const AtomicBool = null;
 
@@ -132,10 +171,13 @@ fn curlRequestWithProxy(
     proxy: ?[]const u8,
     max_time: ?[]const u8,
 ) ![]u8 {
-    // Fall back to subprocess when proxy or timeout is configured, since native
-    // std.http.Client does not support proxy or timeout settings.
-    if (!useSubprocess() and proxy == null and max_time == null) {
-        return nativeHttpRequest(allocator, method, content_type_header, url, body, headers);
+    // When the user explicitly chose a backend, always honour it.
+    // Otherwise fall back to subprocess when proxy or timeout is configured,
+    // since native std.http.Client does not support proxy or timeout settings.
+    if (!useSubprocess()) {
+        if (isExplicitOverride() or (proxy == null and max_time == null)) {
+            return nativeHttpRequest(allocator, method, content_type_header, url, body, headers);
+        }
     }
     return curlRequestWithProxySubprocess(allocator, method, content_type_header, url, body, headers, proxy, max_time);
 }
@@ -418,12 +460,14 @@ fn curlGetWithProxyAndResolve(
     proxy: ?[]const u8,
     resolve_entry: ?[]const u8,
 ) ![]u8 {
-    // Fall back to subprocess when proxy, resolve_entry, or timeout is set.
-    // Native std.http.Client lacks proxy, DNS pinning (--resolve), and
-    // request timeout support.
-    const has_timeout = timeout_secs.len > 0 and !std.mem.eql(u8, timeout_secs, "0");
-    if (!useSubprocess() and proxy == null and resolve_entry == null and !has_timeout) {
-        return nativeHttpGet(allocator, url, headers);
+    // When the user explicitly chose a backend, always honour it.
+    // Otherwise fall back to subprocess when proxy, resolve_entry, or timeout
+    // is set — native std.http.Client lacks proxy, DNS pinning, and timeout.
+    if (!useSubprocess()) {
+        const has_timeout = timeout_secs.len > 0 and !std.mem.eql(u8, timeout_secs, "0");
+        if (isExplicitOverride() or (proxy == null and resolve_entry == null and !has_timeout)) {
+            return nativeHttpGet(allocator, url, headers);
+        }
     }
     return curlGetWithProxyAndResolveSubprocess(allocator, url, headers, timeout_secs, proxy, resolve_entry);
 }
