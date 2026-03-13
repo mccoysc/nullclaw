@@ -3,10 +3,37 @@ name: Release
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
 
 jobs:
+  generate-tag:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.calver.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate CalVer tag
+        id: calver
+        run: |
+          PREFIX="v$(date -u +%Y.%-m.%-d)"
+          LAST=$(git tag -l "${PREFIX}.*" | sort -t. -k4 -n | tail -1)
+          if [ -z "$LAST" ]; then
+            TAG="${PREFIX}.0"
+          else
+            N="${LAST##*.}"
+            TAG="${PREFIX}.$((N + 1))"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Generated tag: $TAG"
+
   build:
     name: Build (${{ matrix.target }})
+    needs: [generate-tag]
+    if: always() && (needs.generate-tag.result == 'success' || (needs.generate-tag.result == 'skipped' && github.event_name != 'workflow_dispatch'))
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -54,7 +81,9 @@ jobs:
           version: 0.15.2
 
       - name: Build ReleaseSmall
-        run: zig build -Doptimize=ReleaseSmall -Dversion=${{ github.ref_name }} ${{ matrix.zig_target && format('-Dtarget={0}', matrix.zig_target) || '' }}
+        env:
+          VERSION: ${{ needs.generate-tag.outputs.tag || github.ref_name }}
+        run: zig build -Doptimize=ReleaseSmall -Dversion="$VERSION" ${{ matrix.zig_target && format('-Dtarget={0}', matrix.zig_target) || '' }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -63,7 +92,8 @@ jobs:
           path: zig-out/bin/nullclaw${{ matrix.ext }}
 
   release:
-    needs: build
+    needs: [generate-tag, build]
+    if: always() && needs.build.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -72,31 +102,34 @@ jobs:
       - uses: actions/download-artifact@v4
 
       - name: Rename binaries
+        env:
+          VERSION: ${{ needs.generate-tag.outputs.tag || github.ref_name }}
         run: |
-          VERSION="${{ github.ref_name }}"
-          mv nullclaw-linux-x86_64/nullclaw   nullclaw-${VERSION}-linux-x86_64.bin
-          mv nullclaw-linux-aarch64/nullclaw  nullclaw-${VERSION}-linux-aarch64.bin
-          mv nullclaw-linux-riscv64/nullclaw  nullclaw-${VERSION}-linux-riscv64.bin
-          mv nullclaw-macos-aarch64/nullclaw  nullclaw-${VERSION}-macos-aarch64.bin
-          mv nullclaw-macos-x86_64/nullclaw   nullclaw-${VERSION}-macos-x86_64.bin
-          mv nullclaw-windows-x86_64/nullclaw.exe  nullclaw-${VERSION}-windows-x86_64.exe
-          mv nullclaw-windows-aarch64/nullclaw.exe nullclaw-${VERSION}-windows-aarch64.exe
+          mv nullclaw-linux-x86_64/nullclaw   "nullclaw-${VERSION}-linux-x86_64.bin"
+          mv nullclaw-linux-aarch64/nullclaw  "nullclaw-${VERSION}-linux-aarch64.bin"
+          mv nullclaw-linux-riscv64/nullclaw  "nullclaw-${VERSION}-linux-riscv64.bin"
+          mv nullclaw-macos-aarch64/nullclaw  "nullclaw-${VERSION}-macos-aarch64.bin"
+          mv nullclaw-macos-x86_64/nullclaw   "nullclaw-${VERSION}-macos-x86_64.bin"
+          mv nullclaw-windows-x86_64/nullclaw.exe  "nullclaw-${VERSION}-windows-x86_64.exe"
+          mv nullclaw-windows-aarch64/nullclaw.exe "nullclaw-${VERSION}-windows-aarch64.exe"
 
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ needs.generate-tag.outputs.tag || github.ref_name }}
           files: |
-            nullclaw-${{ github.ref_name }}-linux-x86_64.bin
-            nullclaw-${{ github.ref_name }}-linux-aarch64.bin
-            nullclaw-${{ github.ref_name }}-linux-riscv64.bin
-            nullclaw-${{ github.ref_name }}-macos-aarch64.bin
-            nullclaw-${{ github.ref_name }}-macos-x86_64.bin
-            nullclaw-${{ github.ref_name }}-windows-x86_64.exe
-            nullclaw-${{ github.ref_name }}-windows-aarch64.exe
+            nullclaw-${{ needs.generate-tag.outputs.tag || github.ref_name }}-linux-x86_64.bin
+            nullclaw-${{ needs.generate-tag.outputs.tag || github.ref_name }}-linux-aarch64.bin
+            nullclaw-${{ needs.generate-tag.outputs.tag || github.ref_name }}-linux-riscv64.bin
+            nullclaw-${{ needs.generate-tag.outputs.tag || github.ref_name }}-macos-aarch64.bin
+            nullclaw-${{ needs.generate-tag.outputs.tag || github.ref_name }}-macos-x86_64.bin
+            nullclaw-${{ needs.generate-tag.outputs.tag || github.ref_name }}-windows-x86_64.exe
+            nullclaw-${{ needs.generate-tag.outputs.tag || github.ref_name }}-windows-aarch64.exe
           generate_release_notes: true
 
   docker:
-    needs: release
+    needs: [generate-tag, release]
+    if: always() && needs.release.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -124,7 +157,7 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
-            type=semver,pattern={{raw}}
+            type=raw,value=${{ needs.generate-tag.outputs.tag || github.ref_name }}
             type=raw,value=latest
 
       - name: Verify build context
