@@ -3,11 +3,13 @@ const platform = @import("platform.zig");
 pub const config_types = @import("config_types.zig");
 pub const config_parse = @import("config_parse.zig");
 
-/// Expand a leading "~/" (or bare "~") in `path` to the user's home directory.
+/// Expand a leading "~/" or "~\" (or bare "~") in `path` to the user's home
+/// directory. Accepts both forward and back-slash after the tilde so that
+/// config values written with Unix conventions also work on Windows.
 /// Returns the original slice unchanged when no expansion is needed.
 /// Caller owns the returned slice when expansion occurs (allocated via `allocator`).
 fn expandTilde(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
-    if (path.len >= 2 and path[0] == '~' and path[1] == '/') {
+    if (path.len >= 2 and path[0] == '~' and (path[1] == '/' or path[1] == '\\')) {
         const home = try platform.getHomeDir(allocator);
         defer allocator.free(home);
         return std.fs.path.join(allocator, &.{ home, path[2..] });
@@ -4594,8 +4596,10 @@ test "expandTilde expands ~/ prefix" {
     defer allocator.free(result);
     // Should NOT start with ~
     try std.testing.expect(result[0] != '~');
-    // Should end with the path after ~/
-    try std.testing.expect(std.mem.endsWith(u8, result, "/.nullclaw/workspace"));
+    // Should contain the path components (separator between home and rest
+    // is platform-native, but join preserves separators within components).
+    try std.testing.expect(std.mem.indexOf(u8, result, ".nullclaw") != null);
+    try std.testing.expect(std.mem.endsWith(u8, result, "workspace"));
 }
 
 test "expandTilde expands bare ~" {
