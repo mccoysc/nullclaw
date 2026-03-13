@@ -59,7 +59,9 @@ jobs:
           version: 0.15.2
 
       - name: Build ReleaseSmall
-        run: zig build -Doptimize=ReleaseSmall -Dversion=${{ inputs.tag || github.ref_name }} ${{ matrix.zig_target && format('-Dtarget={0}', matrix.zig_target) || '' }}
+        env:
+          VERSION: ${{ inputs.tag || github.ref_name }}
+        run: zig build -Doptimize=ReleaseSmall -Dversion="$VERSION" ${{ matrix.zig_target && format('-Dtarget={0}', matrix.zig_target) || '' }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -77,8 +79,9 @@ jobs:
       - uses: actions/download-artifact@v4
 
       - name: Rename binaries
+        env:
+          VERSION: ${{ inputs.tag || github.ref_name }}
         run: |
-          VERSION="${{ inputs.tag || github.ref_name }}"
           mv nullclaw-linux-x86_64/nullclaw   nullclaw-${VERSION}-linux-x86_64.bin
           mv nullclaw-linux-aarch64/nullclaw  nullclaw-${VERSION}-linux-aarch64.bin
           mv nullclaw-linux-riscv64/nullclaw  nullclaw-${VERSION}-linux-riscv64.bin
