@@ -5,6 +5,7 @@ zig-cache
 .zig-cache
 reference
 *.md
+!vendor/**/*.md
 *.png
 *.svg
 *.jpg
