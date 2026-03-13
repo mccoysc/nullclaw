@@ -2350,7 +2350,12 @@ pub const TelegramChannel = struct {
         }
 
         const msg_id = draft_message_id orelse return false;
-        if (final_text.len == 0) return false;
+        if (final_text.len == 0) {
+            // Empty final text (e.g. suppressed group reply) — delete the
+            // visible draft message so it doesn't linger in the chat.
+            self.bestEffortDeleteMessage(chat_id, msg_id);
+            return false;
+        }
 
         // Check if text is suitable for editing (simple text, fits in one message)
         if (final_text.len > MAX_MESSAGE_LEN or isAttachmentMarkerCandidate(final_text)) {
@@ -2365,13 +2370,18 @@ pub const TelegramChannel = struct {
             return false;
         }
 
-        // Edit the draft message with the final text (try HTML, fall back to plain)
-        self.editDraftFinal(chat_id, msg_id, final_text);
+        // Edit the draft message with the final text (try HTML, fall back to plain).
+        // If editing fails, delete the stale draft so the caller can resend.
+        if (!self.editDraftFinal(chat_id, msg_id, final_text)) {
+            self.bestEffortDeleteMessage(chat_id, msg_id);
+            return false;
+        }
         return true;
     }
 
     /// Edit the draft message with the final complete text, trying HTML first.
-    fn editDraftFinal(self: *TelegramChannel, chat_id: []const u8, message_id: i64, text: []const u8) void {
+    /// Returns true if the edit succeeded, false if all attempts failed.
+    fn editDraftFinal(self: *TelegramChannel, chat_id: []const u8, message_id: i64, text: []const u8) bool {
         const html_text = markdownToTelegramHtml(self.allocator, text) catch null;
         defer if (html_text) |h| self.allocator.free(h);
 
@@ -2380,10 +2390,10 @@ pub const TelegramChannel = struct {
                 // HTML edit failed — fall back to plain text
                 const plain_resp = self.api().editMessageText(self.allocator, chat_id, message_id, text) catch |err| {
                     log.warn("editMessageText (plain fallback) for final draft failed: {}", .{err});
-                    return;
+                    return false;
                 };
                 self.allocator.free(plain_resp);
-                return;
+                return true;
             };
             defer self.allocator.free(resp);
 
@@ -2391,16 +2401,18 @@ pub const TelegramChannel = struct {
                 // HTML parse error — fall back to plain text
                 const plain_resp = self.api().editMessageText(self.allocator, chat_id, message_id, text) catch |err| {
                     log.warn("editMessageText (plain fallback) for final draft failed: {}", .{err});
-                    return;
+                    return false;
                 };
                 self.allocator.free(plain_resp);
             }
+            return true;
         } else {
             const resp = self.api().editMessageText(self.allocator, chat_id, message_id, text) catch |err| {
                 log.warn("editMessageText for final draft failed: {}", .{err});
-                return;
+                return false;
             };
             self.allocator.free(resp);
+            return true;
         }
     }
 
