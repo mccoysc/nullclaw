@@ -7,10 +7,8 @@ on:
 
 jobs:
   generate-tag:
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     outputs:
       tag: ${{ steps.calver.outputs.tag }}
     steps:
@@ -31,13 +29,6 @@ jobs:
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "Generated tag: $TAG"
-
-      - name: Create and push tag
-        env:
-          TAG: ${{ steps.calver.outputs.tag }}
-        run: |
-          git tag "$TAG"
-          git push origin "$TAG"
 
   build:
     name: Build (${{ matrix.target }})
