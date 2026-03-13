@@ -4,6 +4,10 @@ on:
   push:
     tags: ['v*']
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v2026.3.13.1)'
+        required: true
 
 jobs:
   build:
@@ -55,7 +59,7 @@ jobs:
           version: 0.15.2
 
       - name: Build ReleaseSmall
-        run: zig build -Doptimize=ReleaseSmall -Dversion=${{ github.ref_name }} ${{ matrix.zig_target && format('-Dtarget={0}', matrix.zig_target) || '' }}
+        run: zig build -Doptimize=ReleaseSmall -Dversion=${{ inputs.tag || github.ref_name }} ${{ matrix.zig_target && format('-Dtarget={0}', matrix.zig_target) || '' }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -74,7 +78,7 @@ jobs:
 
       - name: Rename binaries
         run: |
-          VERSION="${{ github.ref_name }}"
+          VERSION="${{ inputs.tag || github.ref_name }}"
           mv nullclaw-linux-x86_64/nullclaw   nullclaw-${VERSION}-linux-x86_64.bin
           mv nullclaw-linux-aarch64/nullclaw  nullclaw-${VERSION}-linux-aarch64.bin
           mv nullclaw-linux-riscv64/nullclaw  nullclaw-${VERSION}-linux-riscv64.bin
@@ -86,14 +90,15 @@ jobs:
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
           files: |
-            nullclaw-${{ github.ref_name }}-linux-x86_64.bin
-            nullclaw-${{ github.ref_name }}-linux-aarch64.bin
-            nullclaw-${{ github.ref_name }}-linux-riscv64.bin
-            nullclaw-${{ github.ref_name }}-macos-aarch64.bin
-            nullclaw-${{ github.ref_name }}-macos-x86_64.bin
-            nullclaw-${{ github.ref_name }}-windows-x86_64.exe
-            nullclaw-${{ github.ref_name }}-windows-aarch64.exe
+            nullclaw-${{ inputs.tag || github.ref_name }}-linux-x86_64.bin
+            nullclaw-${{ inputs.tag || github.ref_name }}-linux-aarch64.bin
+            nullclaw-${{ inputs.tag || github.ref_name }}-linux-riscv64.bin
+            nullclaw-${{ inputs.tag || github.ref_name }}-macos-aarch64.bin
+            nullclaw-${{ inputs.tag || github.ref_name }}-macos-x86_64.bin
+            nullclaw-${{ inputs.tag || github.ref_name }}-windows-x86_64.exe
+            nullclaw-${{ inputs.tag || github.ref_name }}-windows-aarch64.exe
           generate_release_notes: true
 
   docker:
@@ -125,7 +130,8 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
-            type=semver,pattern={{raw}}
+            type=semver,pattern={{raw}},enable=${{ !inputs.tag }}
+            type=raw,value=${{ inputs.tag }},enable=${{ !!inputs.tag }}
             type=raw,value=latest
 
       - name: Verify build context
