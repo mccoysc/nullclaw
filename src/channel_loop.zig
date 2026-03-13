@@ -113,6 +113,8 @@ fn processTelegramMessage(
                     "Plugin tools are being updated, please resend your message in a moment.",
                     reply_to_id,
                 ) catch |send_err| log.err("failed to send drain notice: {}", .{send_err});
+                // Clean up any visible draft message left from partial streaming
+                _ = tg_ptr.finalizeDraft(sender, "");
                 return;
             }
             log.err("Agent error: {}", .{err});
@@ -125,6 +127,8 @@ fn processTelegramMessage(
                 else => "An error occurred. Try again or /new for a fresh session.",
             };
             tg_ptr.sendMessageWithReply(sender, err_msg, reply_to_id) catch |send_err| log.err("failed to send error reply: {}", .{send_err});
+            // Clean up any visible draft message left from partial streaming
+            _ = tg_ptr.finalizeDraft(sender, "");
             return;
         };
     } else blk: {
@@ -156,7 +160,23 @@ fn processTelegramMessage(
 
     if (shouldSuppressGroupReply(is_group, reply)) {
         log.info("Smart reply: skipping non-essential message", .{});
+        // Still clean up draft state even for suppressed replies
+        if (stream_sink != null) {
+            _ = tg_ptr.finalizeDraft(sender, "");
+        }
         return;
+    }
+
+    // When streaming was active, try to finalize by editing the draft message
+    // in-place with the complete response. This avoids sending a duplicate
+    // new message after the user has already seen the streamed draft.
+    // Falls back to normal send if the draft cannot be edited (e.g. the
+    // response has attachments, interactive buttons, or exceeds 4096 chars).
+    if (stream_sink != null) {
+        if (tg_ptr.finalizeDraft(sender, reply)) {
+            return;
+        }
+        // Draft editing not possible — fall through to normal send
     }
 
     tg_ptr.sendAssistantMessageWithReply(sender, message_sender_id, is_group, reply, reply_to_id) catch |err| {

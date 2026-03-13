@@ -2310,6 +2310,119 @@ pub const TelegramChannel = struct {
         }
     }
 
+    /// Finalize the streaming draft for a chat after the LLM response is complete.
+    ///
+    /// Extracts and clears the draft state. If a draft message exists and the
+    /// final text is suitable for in-place editing (fits in one Telegram message,
+    /// no attachment markers, no interaction choices), edits the draft message
+    /// with the final text. Returns true if the message was delivered via draft
+    /// editing; false if the caller must deliver it through the normal send path.
+    pub fn finalizeDraft(self: *TelegramChannel, chat_id: []const u8, final_text: []const u8) bool {
+        if (builtin.is_test) {
+            // In tests, simulate the draft extraction and clearing without
+            // making API calls. Return true if a draft with message_id existed.
+            var draft_message_id: ?i64 = null;
+            {
+                self.draft_mu.lock();
+                defer self.draft_mu.unlock();
+                if (self.draft_buffers.getPtr(chat_id)) |state| {
+                    draft_message_id = state.message_id;
+                }
+                telegram_draft_presenter.clearDraftForTarget(self.allocator, &self.draft_buffers, chat_id);
+            }
+            if (draft_message_id == null) return false;
+            if (final_text.len == 0) return false;
+            if (final_text.len > MAX_MESSAGE_LEN) return false;
+            if (isAttachmentMarkerCandidate(final_text)) return false;
+            if (std.mem.indexOf(u8, final_text, interaction_choices.START_TAG) != null) return false;
+            return true;
+        }
+
+        // Extract draft message_id and clear state
+        var draft_message_id: ?i64 = null;
+        {
+            self.draft_mu.lock();
+            defer self.draft_mu.unlock();
+            if (self.draft_buffers.getPtr(chat_id)) |state| {
+                draft_message_id = state.message_id;
+            }
+            telegram_draft_presenter.clearDraftForTarget(self.allocator, &self.draft_buffers, chat_id);
+        }
+
+        const msg_id = draft_message_id orelse return false;
+        if (final_text.len == 0) {
+            // Empty final text (e.g. suppressed group reply) — delete the
+            // visible draft message so it doesn't linger in the chat.
+            self.bestEffortDeleteMessage(chat_id, msg_id);
+            return false;
+        }
+
+        // Check if text is suitable for editing (simple text, fits in one message)
+        if (final_text.len > MAX_MESSAGE_LEN or isAttachmentMarkerCandidate(final_text)) {
+            // Too complex for edit — delete draft and let caller handle
+            self.bestEffortDeleteMessage(chat_id, msg_id);
+            return false;
+        }
+
+        // Check for interaction choices
+        if (std.mem.indexOf(u8, final_text, interaction_choices.START_TAG) != null) {
+            self.bestEffortDeleteMessage(chat_id, msg_id);
+            return false;
+        }
+
+        // Edit the draft message with the final text (try HTML, fall back to plain).
+        // If editing fails, delete the stale draft so the caller can resend.
+        if (!self.editDraftFinal(chat_id, msg_id, final_text)) {
+            self.bestEffortDeleteMessage(chat_id, msg_id);
+            return false;
+        }
+        return true;
+    }
+
+    /// Edit the draft message with the final complete text, trying HTML first.
+    /// Returns true if the edit succeeded, false if all attempts failed.
+    fn editDraftFinal(self: *TelegramChannel, chat_id: []const u8, message_id: i64, text: []const u8) bool {
+        const html_text = markdownToTelegramHtml(self.allocator, text) catch null;
+        defer if (html_text) |h| self.allocator.free(h);
+
+        if (html_text) |h| {
+            const resp = self.api().editMessageTextHtml(self.allocator, chat_id, message_id, h) catch {
+                // HTML edit failed — fall back to plain text
+                return self.editMessageTextChecked(chat_id, message_id, text);
+            };
+            defer self.allocator.free(resp);
+
+            if (telegram_api.responseHasTelegramError(resp)) {
+                // HTML parse error — fall back to plain text
+                return self.editMessageTextChecked(chat_id, message_id, text);
+            }
+            return true;
+        } else {
+            return self.editMessageTextChecked(chat_id, message_id, text);
+        }
+    }
+
+    /// Send a plain-text editMessageText and check the response for API errors.
+    /// Returns true if the edit succeeded, false otherwise.
+    fn editMessageTextChecked(self: *TelegramChannel, chat_id: []const u8, message_id: i64, text: []const u8) bool {
+        const resp = self.api().editMessageText(self.allocator, chat_id, message_id, text) catch |err| {
+            log.warn("editMessageText for final draft failed: {}", .{err});
+            return false;
+        };
+        defer self.allocator.free(resp);
+        if (telegram_api.responseHasTelegramError(resp)) {
+            log.warn("editMessageText API error for final draft: {s}", .{resp[0..@min(resp.len, 256)]});
+            return false;
+        }
+        return true;
+    }
+
+    /// Best-effort delete a message (ignores errors).
+    fn bestEffortDeleteMessage(self: *TelegramChannel, chat_id: []const u8, message_id: i64) void {
+        const resp = self.api().deleteMessage(self.allocator, chat_id, message_id) catch return;
+        self.allocator.free(resp);
+    }
+
     fn vtableSend(ptr: *anyopaque, target: []const u8, message: []const u8, _: []const []const u8) anyerror!void {
         const self: *TelegramChannel = @ptrCast(@alignCast(ptr));
         // Outbound dispatcher (cron/gateway) uses the generic channel vtable path.
@@ -4154,4 +4267,175 @@ test "vtableSendEvent final on nonexistent chat is safe" {
 
     // Should not panic or error
     try ch.channel().sendEvent("nonexistent", "", &.{}, .final);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// finalizeDraft Tests
+// ════════════════════════════════════════════════════════════════════════════
+
+test "finalizeDraft returns false when no draft exists" {
+    const allocator = std.testing.allocator;
+    var ch = TelegramChannel.init(allocator, "test-token", &.{}, &.{}, "allowlist");
+    defer ch.deinitDraftBuffers();
+
+    try std.testing.expect(!ch.finalizeDraft("12345", "hello"));
+}
+
+test "finalizeDraft returns false when draft has no message_id" {
+    const allocator = std.testing.allocator;
+    var ch = TelegramChannel.init(allocator, "test-token", &.{}, &.{}, "allowlist");
+    defer ch.deinitDraftBuffers();
+
+    // Create a draft without message_id (simulating first chunk never flushed)
+    try ch.channel().sendEvent("12345", "partial", &.{}, .chunk);
+
+    // Draft exists but message_id is null (no API call was made in test mode)
+    try std.testing.expect(!ch.finalizeDraft("12345", "hello"));
+
+    // Draft should be cleaned up
+    ch.draft_mu.lock();
+    defer ch.draft_mu.unlock();
+    try std.testing.expect(ch.draft_buffers.get("12345") == null);
+}
+
+test "finalizeDraft returns true when draft has message_id and text is simple" {
+    const allocator = std.testing.allocator;
+    var ch = TelegramChannel.init(allocator, "test-token", &.{}, &.{}, "allowlist");
+    defer ch.deinitDraftBuffers();
+
+    // Manually insert a draft with message_id to simulate a flushed draft
+    {
+        ch.draft_mu.lock();
+        defer ch.draft_mu.unlock();
+        const key = try allocator.dupe(u8, "12345");
+        try ch.draft_buffers.put(allocator, key, .{
+            .draft_id = 1,
+            .message_id = 42,
+        });
+    }
+
+    try std.testing.expect(ch.finalizeDraft("12345", "Final response text"));
+
+    // Draft should be cleaned up
+    ch.draft_mu.lock();
+    defer ch.draft_mu.unlock();
+    try std.testing.expect(ch.draft_buffers.get("12345") == null);
+}
+
+test "finalizeDraft returns false for empty final text" {
+    const allocator = std.testing.allocator;
+    var ch = TelegramChannel.init(allocator, "test-token", &.{}, &.{}, "allowlist");
+    defer ch.deinitDraftBuffers();
+
+    {
+        ch.draft_mu.lock();
+        defer ch.draft_mu.unlock();
+        const key = try allocator.dupe(u8, "12345");
+        try ch.draft_buffers.put(allocator, key, .{
+            .draft_id = 1,
+            .message_id = 42,
+        });
+    }
+
+    try std.testing.expect(!ch.finalizeDraft("12345", ""));
+
+    // Draft should still be cleaned up
+    ch.draft_mu.lock();
+    defer ch.draft_mu.unlock();
+    try std.testing.expect(ch.draft_buffers.get("12345") == null);
+}
+
+test "finalizeDraft returns false for text with attachment markers" {
+    const allocator = std.testing.allocator;
+    var ch = TelegramChannel.init(allocator, "test-token", &.{}, &.{}, "allowlist");
+    defer ch.deinitDraftBuffers();
+
+    {
+        ch.draft_mu.lock();
+        defer ch.draft_mu.unlock();
+        const key = try allocator.dupe(u8, "12345");
+        try ch.draft_buffers.put(allocator, key, .{
+            .draft_id = 1,
+            .message_id = 42,
+        });
+    }
+
+    try std.testing.expect(!ch.finalizeDraft("12345", "Here is the file [IMAGE:photo.png]"));
+}
+
+test "finalizeDraft returns false for text exceeding MAX_MESSAGE_LEN" {
+    const allocator = std.testing.allocator;
+    var ch = TelegramChannel.init(allocator, "test-token", &.{}, &.{}, "allowlist");
+    defer ch.deinitDraftBuffers();
+
+    {
+        ch.draft_mu.lock();
+        defer ch.draft_mu.unlock();
+        const key = try allocator.dupe(u8, "12345");
+        try ch.draft_buffers.put(allocator, key, .{
+            .draft_id = 1,
+            .message_id = 42,
+        });
+    }
+
+    // Create text longer than MAX_MESSAGE_LEN (4096)
+    var long_text: [4200]u8 = undefined;
+    @memset(&long_text, 'A');
+
+    try std.testing.expect(!ch.finalizeDraft("12345", &long_text));
+}
+
+test "finalizeDraft cleans up draft state even on fallback" {
+    const allocator = std.testing.allocator;
+    var ch = TelegramChannel.init(allocator, "test-token", &.{}, &.{}, "allowlist");
+    defer ch.deinitDraftBuffers();
+
+    {
+        ch.draft_mu.lock();
+        defer ch.draft_mu.unlock();
+        const key = try allocator.dupe(u8, "12345");
+        try ch.draft_buffers.put(allocator, key, .{
+            .draft_id = 1,
+            .message_id = 42,
+        });
+    }
+
+    // Trigger fallback (attachment marker)
+    _ = ch.finalizeDraft("12345", "text [FILE:doc.pdf]");
+
+    // Draft should be cleaned up regardless
+    ch.draft_mu.lock();
+    defer ch.draft_mu.unlock();
+    try std.testing.expect(ch.draft_buffers.get("12345") == null);
+}
+
+test "finalizeDraft isolates drafts per chat_id" {
+    const allocator = std.testing.allocator;
+    var ch = TelegramChannel.init(allocator, "test-token", &.{}, &.{}, "allowlist");
+    defer ch.deinitDraftBuffers();
+
+    // Create drafts for two different chats
+    {
+        ch.draft_mu.lock();
+        defer ch.draft_mu.unlock();
+        const key1 = try allocator.dupe(u8, "chat_a");
+        try ch.draft_buffers.put(allocator, key1, .{
+            .draft_id = 1,
+            .message_id = 10,
+        });
+        const key2 = try allocator.dupe(u8, "chat_b");
+        try ch.draft_buffers.put(allocator, key2, .{
+            .draft_id = 2,
+            .message_id = 20,
+        });
+    }
+
+    // Finalize only chat_a
+    try std.testing.expect(ch.finalizeDraft("chat_a", "response"));
+
+    // chat_a cleaned up, chat_b still exists
+    ch.draft_mu.lock();
+    defer ch.draft_mu.unlock();
+    try std.testing.expect(ch.draft_buffers.get("chat_a") == null);
+    try std.testing.expect(ch.draft_buffers.get("chat_b") != null);
 }
