@@ -156,7 +156,23 @@ fn processTelegramMessage(
 
     if (shouldSuppressGroupReply(is_group, reply)) {
         log.info("Smart reply: skipping non-essential message", .{});
+        // Still clean up draft state even for suppressed replies
+        if (stream_sink != null) {
+            _ = tg_ptr.finalizeDraft(sender, "");
+        }
         return;
+    }
+
+    // When streaming was active, try to finalize by editing the draft message
+    // in-place with the complete response. This avoids sending a duplicate
+    // new message after the user has already seen the streamed draft.
+    // Falls back to normal send if the draft cannot be edited (e.g. the
+    // response has attachments, interactive buttons, or exceeds 4096 chars).
+    if (stream_sink != null) {
+        if (tg_ptr.finalizeDraft(sender, reply)) {
+            return;
+        }
+        // Draft editing not possible — fall through to normal send
     }
 
     tg_ptr.sendAssistantMessageWithReply(sender, message_sender_id, is_group, reply, reply_to_id) catch |err| {
