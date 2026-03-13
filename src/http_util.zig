@@ -754,14 +754,14 @@ fn nativeHttpRequest(
         .extra_headers = extra_headers_buf[0..n_headers],
         .response_writer = &aw.writer,
     }) catch |err| {
-        log.err("native HTTP {s} to {s} failed: {}", .{ method, url, err });
+        log.warn("native HTTP {s} to {s} failed: {}", .{ method, url, err });
         return error.CurlFailed;
     };
 
     // Match curl -sf behavior: fail on 4xx/5xx status codes.
     const status_int = @intFromEnum(result.status);
     if (status_int >= 400) {
-        log.err("native HTTP {s} {s} returned status {d}", .{ method, url, status_int });
+        log.warn("native HTTP {s} {s} returned status {d}", .{ method, url, status_int });
         return error.CurlFailed;
     }
 
@@ -797,14 +797,14 @@ fn nativeHttpGet(
         .extra_headers = extra_headers_buf[0..n_headers],
         .response_writer = &aw.writer,
     }) catch |err| {
-        log.err("native HTTP GET {s} failed: {}", .{ url, err });
+        log.warn("native HTTP GET {s} failed: {}", .{ url, err });
         return error.CurlFailed;
     };
 
     // Match curl -sf behavior: fail on 4xx/5xx status codes.
     const status_int = @intFromEnum(result.status);
     if (status_int >= 400) {
-        log.err("native HTTP GET {s} returned status {d}", .{ url, status_int });
+        log.warn("native HTTP GET {s} returned status {d}", .{ url, status_int });
         return error.CurlFailed;
     }
 
@@ -845,7 +845,7 @@ fn nativePostWithStatus(
         .extra_headers = extra_headers_buf[0..n_headers],
         .response_writer = &aw.writer,
     }) catch |err| {
-        log.err("native HTTP POST {s} failed: {}", .{ url, err });
+        log.warn("native HTTP POST {s} failed: {}", .{ url, err });
         return error.CurlFailed;
     };
 

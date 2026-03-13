@@ -662,16 +662,19 @@ pub const OtelObserver = struct {
     fn flushLocked(self: *OtelObserver) void {
         if (self.spans.items.len == 0) return;
 
-        const payload = self.serializeSpans() catch return;
-        defer self.allocator.free(payload);
+        // Skip HTTP delivery when no endpoint is configured (e.g. in tests).
+        if (self.endpoint.len > 0) {
+            const payload = self.serializeSpans() catch return;
+            defer self.allocator.free(payload);
 
-        const url_buf = std.fmt.allocPrint(self.allocator, "{s}/v1/traces", .{self.endpoint}) catch return;
-        defer self.allocator.free(url_buf);
+            const url_buf = std.fmt.allocPrint(self.allocator, "{s}/v1/traces", .{self.endpoint}) catch return;
+            defer self.allocator.free(url_buf);
 
-        // Best-effort send; free response if successful
-        if (http_util.curlPost(self.allocator, url_buf, payload, &.{})) |curl_resp| {
-            self.allocator.free(curl_resp);
-        } else |_| {}
+            // Best-effort send; free response if successful
+            if (http_util.curlPost(self.allocator, url_buf, payload, &.{})) |curl_resp| {
+                self.allocator.free(curl_resp);
+            } else |_| {}
+        }
 
         // Clear spans regardless of delivery success to prevent unbounded growth
         for (self.spans.items) |*span| {
@@ -1105,7 +1108,7 @@ test "OtelObserver span building on agent_start" {
 }
 
 test "OtelObserver span building on all event types" {
-    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    var otel = OtelObserver.init(std.testing.allocator, "", null);
     defer otel.deinit();
     const obs = otel.observer();
 
@@ -1302,7 +1305,7 @@ test "OtelObserver JSON multiple spans" {
 }
 
 test "OtelObserver batch flush at 10 spans" {
-    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    var otel = OtelObserver.init(std.testing.allocator, "", null);
     defer otel.deinit();
     const obs = otel.observer();
 
@@ -1391,7 +1394,7 @@ test "OtelObserver llm_response has duration-adjusted start" {
 }
 
 test "OtelObserver vtable through Observer interface" {
-    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    var otel = OtelObserver.init(std.testing.allocator, "", null);
     defer otel.deinit();
     const obs = otel.observer();
 
