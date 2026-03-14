@@ -1757,7 +1757,8 @@ pub const Agent = struct {
                 // ── Recovery: try to detect and repair malformed tool calls ──
                 // If parsing yielded no calls but the response looks like a malformed
                 // tool call (e.g., model output broken JSON), attempt LLM repair.
-                if (!is_streaming and response_text.len > 0 and iteration + 1 < self.max_tool_iterations) {
+                // NOTE: This repair logic now works for both streaming and non-streaming modes.
+                if (response_text.len > 0 and iteration + 1 < self.max_tool_iterations) {
                     if (looksLikeMalformedToolCall(response_text)) {
                         log.info("detected malformed tool call, attempting LLM repair", .{});
                         // Build repair prompt with available tools
@@ -1824,8 +1825,7 @@ pub const Agent = struct {
                 // Guardrail: if the model promises "I'll try/check now" but emits no
                 // tool call, force one follow-up completion to either act now or
                 // explicitly state the limitation without deferred promises.
-                if (!is_streaming and
-                    forced_follow_through_count < 2 and
+                if (forced_follow_through_count < 2 and
                     iteration + 1 < self.max_tool_iterations and
                     shouldForceActionFollowThrough(display_text))
                 {
