@@ -77,8 +77,19 @@ fn prepareCurlBodyArg(
         return error.TempDirNotFound;
     defer allocator.free(tmp_dir_path);
 
-    var tmp_dir = std.fs.openDirAbsolute(tmp_dir_path, .{}) catch
-        return error.TempDirNotFound;
+    // Try to open existing temp directory, create if it doesn't exist
+    var tmp_dir: std.fs.Dir = undefined;
+    tmp_dir = std.fs.openDirAbsolute(tmp_dir_path) catch |err| {
+        if (err == error.FileNotFound) {
+            // Directory doesn't exist, try to create it
+            std.fs.makeDirAbsolute(tmp_dir_path) catch
+                return error.TempDirNotFound;
+            tmp_dir = std.fs.openDirAbsolute(tmp_dir_path) catch
+                return error.TempDirNotFound;
+        } else {
+            return error.TempDirNotFound;
+        }
+    };
     defer tmp_dir.close();
 
     const body_path = std.fmt.bufPrint(
@@ -434,7 +445,9 @@ pub fn curlStream(
         debug_log.info("curl command: {s}", .{cmd_buf.items});
     }
 
+    // Spawn the curl subprocess
     var child = std.process.Child.init(argv_buf[0..argc], allocator);
+    child.stdin_behavior = .Close;
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
 
@@ -901,6 +914,7 @@ pub fn curlStreamAnthropic(
     argc += 1;
 
     var child = std.process.Child.init(argv_buf[0..argc], allocator);
+    child.stdin_behavior = .Close;
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
 
