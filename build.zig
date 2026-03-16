@@ -788,14 +788,16 @@ pub fn build(b: *std.Build) void {
             // Link libcurl - use library path to find our static build
             exe.addLibraryPath(b.path(CUR_INSTALL_DIR ++ "/lib"));
             exe.linkSystemLibrary("curl");
-            // Link TLS libraries based on platform
-            if (builtin.os.tag == .macos) {
+            // Link TLS libraries based on target platform
+            if (target.result.os.tag == .macos) {
                 // Link frameworks required by SecureTransport on macOS
                 exe.linkFramework("CoreFoundation");
                 exe.linkFramework("Security");
                 exe.linkFramework("SystemConfiguration");
+            } else if (target.result.os.tag == .windows) {
+                // Windows uses system libraries via linkSystemLibrary above
             } else {
-                // Link OpenSSL on Linux and other platforms
+                // Linux and other POSIX: link OpenSSL
                 exe.linkSystemLibrary("ssl");
                 exe.linkSystemLibrary("crypto");
             }
@@ -850,12 +852,15 @@ pub fn build(b: *std.Build) void {
             lib_tests.linkSystemLibrary("z");
             lib_tests.addLibraryPath(b.path(CUR_INSTALL_DIR ++ "/lib"));
             lib_tests.linkSystemLibrary("curl");
-            // Link TLS libraries based on platform
-            if (builtin.os.tag == .macos) {
+            // Link TLS libraries based on target platform
+            if (target.result.os.tag == .macos) {
                 lib_tests.linkFramework("CoreFoundation");
                 lib_tests.linkFramework("Security");
                 lib_tests.linkFramework("SystemConfiguration");
+            } else if (target.result.os.tag == .windows) {
+                // Windows uses system libraries
             } else {
+                // Linux and other POSIX: link OpenSSL
                 lib_tests.linkSystemLibrary("ssl");
                 lib_tests.linkSystemLibrary("crypto");
             }
@@ -871,12 +876,15 @@ pub fn build(b: *std.Build) void {
             exe_tests.linkSystemLibrary("z");
             exe_tests.addLibraryPath(b.path(CUR_INSTALL_DIR ++ "/lib"));
             exe_tests.linkSystemLibrary("curl");
-            // Link TLS libraries based on platform
-            if (builtin.os.tag == .macos) {
+            // Link TLS libraries based on target platform
+            if (target.result.os.tag == .macos) {
                 exe_tests.linkFramework("CoreFoundation");
                 exe_tests.linkFramework("Security");
                 exe_tests.linkFramework("SystemConfiguration");
+            } else if (target.result.os.tag == .windows) {
+                // Windows uses system libraries
             } else {
+                // Linux and other POSIX: link OpenSSL
                 exe_tests.linkSystemLibrary("ssl");
                 exe_tests.linkSystemLibrary("crypto");
             }
