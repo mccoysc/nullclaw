@@ -52,7 +52,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libssl-dev
+          sudo apt-get install -y libssl-dev zlib1g-dev
 
       - name: Install Zig 0.15.2
         uses: mlugg/setup-zig@v2
@@ -60,7 +60,16 @@ jobs:
           version: 0.15.2
 
       - name: Build ReleaseSmall
-        run: zig build -Doptimize=ReleaseSmall -Dversion=${{ github.ref_name }} ${{ matrix.zig_target && format('-Dtarget={0}', matrix.zig_target) || '' }}
+        run: |
+          # For musl targets, delete pre-existing vendor curl installs to force rebuild from source
+          # This ensures curl is built with the correct TLS/zlib dependencies for the target
+          if [[ "${{ matrix.zig_target }}" == *"musl"* ]]; then
+            rm -rf vendor/curl/install-linux-x86_64
+            rm -rf vendor/curl/install-linux-arm64
+            rm -rf vendor/curl/install-linux-arm
+            rm -rf vendor/curl/install-linux-riscv64
+          fi
+          zig build -Doptimize=ReleaseSmall -Dversion=${{ github.ref_name }} ${{ matrix.zig_target && format('-Dtarget={0}', matrix.zig_target) || '' }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

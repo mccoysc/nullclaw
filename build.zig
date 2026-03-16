@@ -785,8 +785,11 @@ pub fn build(b: *std.Build) void {
             exe.addIncludePath(b.path(CUR_INSTALL_DIR ++ "/include"));
             // Link zlib (required by libcurl)
             exe.linkSystemLibrary("z");
-            // Link libcurl - use library path to find our static build
-            exe.addLibraryPath(b.path(CUR_INSTALL_DIR ++ "/lib"));
+            // Link libcurl - use library path to find our static build (only for non-musl targets)
+            const is_musl_target = target.result.os.tag == .linux and target.result.abi == .musl;
+            if (!is_musl_target) {
+                exe.addLibraryPath(b.path(CUR_INSTALL_DIR ++ "/lib"));
+            }
             exe.linkSystemLibrary("curl");
             // Link TLS libraries based on target platform
             if (target.result.os.tag == .macos) {
@@ -843,15 +846,19 @@ pub fn build(b: *std.Build) void {
             lib_tests.root_module.linkSystemLibrary("pq", .{});
         }
         // Link libcurl for tests
-        if (is_windows) {
-            lib_tests.addIncludePath(b.path(CUR_INSTALL_DIR ++ "/include"));
-            lib_tests.linkSystemLibrary("curl");
-        } else {
-            lib_tests.addIncludePath(b.path(CUR_INSTALL_DIR ++ "/include"));
-            lib_tests.linkLibC();
-            lib_tests.linkSystemLibrary("z");
-            lib_tests.addLibraryPath(b.path(CUR_INSTALL_DIR ++ "/lib"));
-            lib_tests.linkSystemLibrary("curl");
+            if (is_windows) {
+                lib_tests.addIncludePath(b.path(CUR_INSTALL_DIR ++ "/include"));
+                lib_tests.linkSystemLibrary("curl");
+            } else {
+                lib_tests.addIncludePath(b.path(CUR_INSTALL_DIR ++ "/include"));
+                lib_tests.linkLibC();
+                lib_tests.linkSystemLibrary("z");
+                // Only add vendor library path for non-musl targets (tests run on native)
+                const is_musl_target_lib = target.result.os.tag == .linux and target.result.abi == .musl;
+                if (!is_musl_target_lib) {
+                    lib_tests.addLibraryPath(b.path(CUR_INSTALL_DIR ++ "/lib"));
+                }
+                lib_tests.linkSystemLibrary("curl");
             // Link TLS libraries based on target platform
             if (target.result.os.tag == .macos) {
                 lib_tests.linkFramework("CoreFoundation");
@@ -874,7 +881,11 @@ pub fn build(b: *std.Build) void {
             exe_tests.addIncludePath(b.path(CUR_INSTALL_DIR ++ "/include"));
             exe_tests.linkLibC();
             exe_tests.linkSystemLibrary("z");
-            exe_tests.addLibraryPath(b.path(CUR_INSTALL_DIR ++ "/lib"));
+            // Only add vendor library path for non-musl targets
+            const is_musl_target_exe = target.result.os.tag == .linux and target.result.abi == .musl;
+            if (!is_musl_target_exe) {
+                exe_tests.addLibraryPath(b.path(CUR_INSTALL_DIR ++ "/lib"));
+            }
             exe_tests.linkSystemLibrary("curl");
             // Link TLS libraries based on target platform
             if (target.result.os.tag == .macos) {
