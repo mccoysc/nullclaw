@@ -31,11 +31,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install system dependencies
+      - name: Install system dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y libssl-dev zlib1g-dev
+
+      - name: Install system dependencies (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          "$VCPKG_INSTALLATION_ROOT/vcpkg" install curl:x64-windows
+          echo "Setting VCPKG library paths for Zig..."
 
       - name: Install Zig 0.15.2
         uses: mlugg/setup-zig@v2
