@@ -112,7 +112,10 @@ fn buildLibcurlFromSource(
 
     // Use out-of-tree build directory in /tmp to allow concurrent target builds.
     const build_dir = try std.fmt.allocPrint(allocator, "/tmp/curl-build-{s}", .{target_name});
-    std.fs.cwd().makePath(build_dir) catch {};
+    std.fs.cwd().makePath(build_dir) catch |err| {
+        std.log.err("failed to create curl build dir {s}: {s}", .{ build_dir, @errorName(err) });
+        return err;
+    };
 
     // ── configure ──
     var configure_args: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -165,7 +168,7 @@ fn buildLibcurlFromSource(
     }
 
     // ── make ──
-    const make_argv = [_][]const u8{ "make", "-j" };
+    const make_argv = [_][]const u8{ "make", "-j4" };
     var make_proc = std.process.Child.init(&make_argv, allocator);
     make_proc.cwd = build_dir;
     try make_proc.spawn();
