@@ -77,7 +77,10 @@ fn findCurlSourceDir(b: *std.Build) ?[]const u8 {
 
 /// Copy files from one directory to another (used for installing curl headers).
 fn copyDirFiles(src_path: []const u8, dst_path: []const u8) !void {
-    std.fs.cwd().makePath(dst_path) catch {};
+    std.fs.cwd().makePath(dst_path) catch |err| {
+        std.log.err("failed to create directory {s}: {s}", .{ dst_path, @errorName(err) });
+        return err;
+    };
     var src_dir = try std.fs.cwd().openDir(src_path, .{ .iterate = true });
     defer src_dir.close();
     var dst_dir = try std.fs.cwd().openDir(dst_path, .{});
@@ -186,7 +189,9 @@ fn ensureCurlHeaders(b: *std.Build) void {
     defer b.allocator.free(src_include);
 
     const dst_include = b.pathFromRoot(CURL_INSTALL_DIR ++ "/include/curl");
-    copyDirFiles(src_include, dst_include) catch {};
+    copyDirFiles(src_include, dst_include) catch |err| {
+        std.log.warn("failed to copy curl headers: {s}", .{@errorName(err)});
+    };
 }
 
 /// Ensure libcurl is built from source (Linux, macOS, FreeBSD).
