@@ -1,6 +1,259 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Vendored libcurl
+// ═══════════════════════════════════════════════════════════════════════════
+
+const CURL_VENDOR_DIR = "vendor/curl";
+
+/// Host platform install directory name (resolved at comptime).
+fn getPlatformInstallDirName() []const u8 {
+    @setRuntimeSafety(false);
+    const os_tag = builtin.os.tag;
+    const arch_tag = builtin.cpu.arch;
+
+    if (os_tag == .macos) {
+        if (arch_tag == .aarch64) return "install-macos-arm64";
+        if (arch_tag == .x86_64) return "install-macos-x86_64";
+    } else if (os_tag == .linux) {
+        if (arch_tag == .x86_64) return "install-linux-x86_64";
+        if (arch_tag == .aarch64) return "install-linux-arm64";
+        if (arch_tag == .arm) return "install-linux-arm";
+        if (arch_tag == .riscv64) return "install-linux-riscv64";
+    } else if (os_tag == .windows) {
+        if (arch_tag == .x86_64) return "install-windows-x86_64";
+        if (arch_tag == .aarch64) return "install-windows-arm64";
+    } else if (os_tag == .freebsd) {
+        if (arch_tag == .x86_64) return "install-freebsd-x86_64";
+        if (arch_tag == .aarch64) return "install-freebsd-arm64";
+    }
+
+    return "install";
+}
+
+const CURL_INSTALL_DIR = CURL_VENDOR_DIR ++ "/" ++ getPlatformInstallDirName();
+
+/// Check if libcurl.a is already built in the install directory.
+fn isLibcurlBuilt(b: *std.Build) bool {
+    const lib_path = b.pathFromRoot(CURL_INSTALL_DIR ++ "/lib/libcurl.a");
+    const file = std.fs.cwd().openFile(lib_path, .{}) catch return false;
+    file.close();
+    return true;
+}
+
+/// Check if vendored curl source or prebuilt library is available.
+fn hasCurlVendor(b: *std.Build) bool {
+    if (isLibcurlBuilt(b)) return true;
+    if (findCurlSourceDir(b)) |d| {
+        b.allocator.free(d);
+        return true;
+    }
+    return false;
+}
+
+/// Find the best available curl source directory (e.g. "curl-8.12.1").
+fn findCurlSourceDir(b: *std.Build) ?[]const u8 {
+    const vendor_dir = b.pathFromRoot(CURL_VENDOR_DIR);
+    var dir = std.fs.cwd().openDir(vendor_dir, .{ .iterate = true }) catch return null;
+    defer dir.close();
+
+    var best_version: ?[]const u8 = null;
+    var iter = dir.iterate();
+    while (iter.next() catch null) |entry| {
+        if (entry.kind == .directory and std.mem.startsWith(u8, entry.name, "curl-")) {
+            const version = entry.name[5..];
+            if (best_version == null or std.mem.order(u8, version, best_version.?) == .gt) {
+                best_version = b.allocator.dupe(u8, version) catch null;
+            }
+        }
+    }
+
+    if (best_version) |v| {
+        return std.fmt.allocPrint(b.allocator, "curl-{s}", .{v}) catch null;
+    }
+    return null;
+}
+
+/// Copy files from one directory to another (used for installing curl headers).
+fn copyDirFiles(src_path: []const u8, dst_path: []const u8) !void {
+    std.fs.cwd().makePath(dst_path) catch {};
+    var src_dir = try std.fs.cwd().openDir(src_path, .{ .iterate = true });
+    defer src_dir.close();
+    var dst_dir = try std.fs.cwd().openDir(dst_path, .{});
+    defer dst_dir.close();
+
+    var iter = src_dir.iterate();
+    while (try iter.next()) |entry| {
+        if (entry.kind == .file) {
+            src_dir.copyFile(entry.name, dst_dir, entry.name, .{}) catch |err| {
+                std.log.err("failed to copy {s}: {s}", .{ entry.name, @errorName(err) });
+                return err;
+            };
+        }
+    }
+}
+
+/// Build libcurl from vendored source using autotools.
+fn buildLibcurlFromSource(b: *std.Build, source_dir_name: []const u8) !void {
+    const allocator = b.allocator;
+    const full_source_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ CURL_VENDOR_DIR, source_dir_name });
+    const source_dir = b.pathFromRoot(full_source_path);
+    defer allocator.free(full_source_path);
+
+    const libs_path = try std.fmt.allocPrint(allocator, "{s}/lib/.libs/libcurl.a", .{full_source_path});
+    defer allocator.free(libs_path);
+
+    const already_built = blk: {
+        const f = std.fs.cwd().openFile(libs_path, .{}) catch break :blk false;
+        f.close();
+        break :blk true;
+    };
+
+    if (!already_built) {
+        std.log.info("building libcurl from source ({s})...", .{source_dir_name});
+
+        // Configure with platform-appropriate TLS and minimal deps.
+        // --without-libidn2 avoids pulling in libidn2 (not always present on CI).
+        const configure_argv = [_][]const u8{
+            "./configure",
+            "--prefix=/tmp/curl-build",
+            "--enable-static",
+            "--disable-shared",
+            "--disable-ldap",
+            "--disable-ldaps",
+            "--without-brotli",
+            "--without-nghttp2",
+            "--without-zstd",
+            "--without-libpsl",
+            "--without-libidn2",
+            if (builtin.os.tag == .macos) "--with-secure-transport" else "--with-openssl",
+        };
+        var configure_proc = std.process.Child.init(&configure_argv, allocator);
+        configure_proc.cwd = source_dir;
+        try configure_proc.spawn();
+        const configure_term = try configure_proc.wait();
+        if (configure_term != .Exited or configure_term.Exited != 0) {
+            std.log.err("curl configure failed", .{});
+            return error.ConfigureFailed;
+        }
+
+        const make_argv = [_][]const u8{ "make", "-j" };
+        var make_proc = std.process.Child.init(&make_argv, allocator);
+        make_proc.cwd = source_dir;
+        try make_proc.spawn();
+        const make_term = try make_proc.wait();
+        if (make_term != .Exited or make_term.Exited != 0) {
+            std.log.err("curl make failed", .{});
+            return error.MakeFailed;
+        }
+    }
+
+    // Install headers and library to CURL_INSTALL_DIR.
+    const install_include_curl = b.pathFromRoot(CURL_INSTALL_DIR ++ "/include/curl");
+    const install_lib = b.pathFromRoot(CURL_INSTALL_DIR ++ "/lib");
+
+    const src_include = try std.fmt.allocPrint(allocator, "{s}/include/curl", .{source_dir});
+    defer allocator.free(src_include);
+
+    try copyDirFiles(src_include, install_include_curl);
+    try std.fs.cwd().makePath(install_lib);
+
+    // Copy libcurl.a
+    const src_lib = b.pathFromRoot(libs_path);
+    const dst_lib = try std.fmt.allocPrint(allocator, "{s}/libcurl.a", .{install_lib});
+    defer allocator.free(dst_lib);
+    try std.fs.cwd().copyFile(src_lib, std.fs.cwd(), dst_lib, .{});
+
+    std.log.info("libcurl built and installed successfully", .{});
+}
+
+/// Ensure curl headers are available in the install directory.
+/// For native builds this is handled by buildLibcurlFromSource.
+/// For cross-compile / Windows, just copy headers from the vendored source.
+fn ensureCurlHeaders(b: *std.Build) void {
+    // Already installed?
+    const header_check = b.pathFromRoot(CURL_INSTALL_DIR ++ "/include/curl/curl.h");
+    if (std.fs.cwd().access(header_check, .{})) |_| return else |_| {}
+
+    // Try to copy from vendored source.
+    const source_dir = findCurlSourceDir(b) orelse return;
+    defer b.allocator.free(source_dir);
+
+    const src_include = std.fmt.allocPrint(b.allocator, "{s}/{s}/include/curl", .{
+        b.pathFromRoot(CURL_VENDOR_DIR), source_dir,
+    }) catch return;
+    defer b.allocator.free(src_include);
+
+    const dst_include = b.pathFromRoot(CURL_INSTALL_DIR ++ "/include/curl");
+    copyDirFiles(src_include, dst_include) catch {};
+}
+
+/// Ensure libcurl is built from source (Linux, macOS, FreeBSD).
+fn ensureLibcurlBuilt(b: *std.Build) !void {
+    if (isLibcurlBuilt(b)) {
+        std.log.info("libcurl already built in {s}, skipping", .{CURL_INSTALL_DIR});
+        return;
+    }
+
+    const source_dir = findCurlSourceDir(b);
+    if (source_dir) |dir_name| {
+        defer b.allocator.free(dir_name);
+        try buildLibcurlFromSource(b, dir_name);
+        return;
+    }
+
+    std.log.err("libcurl not found. Place curl source in vendor/curl/curl-<version>/", .{});
+    return error.LibcurlNotFound;
+}
+
+/// Returns true when the target differs from the build host.
+fn isCrossCompiling(target: std.Build.ResolvedTarget) bool {
+    return target.result.os.tag != builtin.os.tag or
+        target.result.cpu.arch != builtin.cpu.arch;
+}
+
+/// Link curl dependencies to a compile step.
+///
+/// Platform strategy (per requirements):
+///   Linux / FreeBSD: static libcurl.a  + dynamic system ssl/crypto/z
+///   macOS:           static libcurl.a  + Secure Transport frameworks + z
+///   Windows:         stub (CI) / dynamic libcurl (user-provided)
+///   Cross-compile:   stub (subprocess backend at runtime)
+fn linkCurlToStep(
+    step: *std.Build.Step.Compile,
+    b: *std.Build,
+    target_os: std.Target.Os.Tag,
+    is_cross: bool,
+) void {
+    step.addIncludePath(b.path(CURL_INSTALL_DIR ++ "/include"));
+
+    if (target_os == .windows or is_cross) {
+        // Stub: compile curl_stub.c for the target.
+        step.addCSourceFile(.{
+            .file = b.path(CURL_VENDOR_DIR ++ "/stub/curl_stub.c"),
+            .flags = &.{},
+        });
+    } else if (target_os == .macos) {
+        // macOS: static libcurl + Secure Transport
+        step.addObjectFile(b.path(CURL_INSTALL_DIR ++ "/lib/libcurl.a"));
+        step.linkSystemLibrary("z");
+        step.linkFramework("CoreFoundation");
+        step.linkFramework("Security");
+        step.linkFramework("SystemConfiguration");
+    } else {
+        // Linux, FreeBSD, other POSIX: static libcurl + dynamic OpenSSL
+        step.addObjectFile(b.path(CURL_INSTALL_DIR ++ "/lib/libcurl.a"));
+        step.linkSystemLibrary("ssl");
+        step.linkSystemLibrary("crypto");
+        step.linkSystemLibrary("z");
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Vendored SQLite integrity verification
+// ═══════════════════════════════════════════════════════════════════════════
+
 const VendoredFileHash = struct {
     path: []const u8,
     sha256_hex: []const u8,
@@ -65,6 +318,10 @@ fn verifyVendoredSqliteHashes(b: *std.Build) !void {
         }
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Channel / engine selection (unchanged)
+// ═══════════════════════════════════════════════════════════════════════════
 
 const ChannelSelection = struct {
     enable_channel_cli: bool = false,
@@ -319,11 +576,34 @@ fn parseEnginesOption(raw: []const u8) !EngineSelection {
     return selection;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Main build function
+// ═══════════════════════════════════════════════════════════════════════════
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const is_wasi = target.result.os.tag == .wasi;
-    const is_static = b.option(bool, "static", "Static build") orelse false;
+    const is_windows = target.result.os.tag == .windows;
+    const is_cross = isCrossCompiling(target);
+
+    // --- Curl setup (build from source for native Linux/macOS/FreeBSD) ---
+    const curl_available = !is_wasi and hasCurlVendor(b);
+
+    if (curl_available) {
+        if (!is_cross and !is_windows) {
+            // Native POSIX: build libcurl from source
+            ensureLibcurlBuilt(b) catch |err| {
+                std.log.err("failed to build libcurl: {s}", .{@errorName(err)});
+                std.process.exit(1);
+            };
+        } else {
+            // Windows / cross-compile: just ensure headers are available
+            ensureCurlHeaders(b);
+        }
+    }
+
+    // --- Options ---
     const app_version = b.option([]const u8, "version", "Version string embedded in the binary") orelse
         getGitVersion(b) orelse "unknown";
     const channels_raw = b.option(
@@ -485,17 +765,10 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = exe_imports,
     });
-    const exe = if (is_static)
-        b.addExecutable(.{
-            .name = "nullclaw",
-            .root_module = exe_root_module,
-            .linkage = .static,
-        })
-    else
-        b.addExecutable(.{
-            .name = "nullclaw",
-            .root_module = exe_root_module,
-        });
+    const exe = b.addExecutable(.{
+        .name = "nullclaw",
+        .root_module = exe_root_module,
+    });
     exe.root_module.addImport("build_options", build_options_module);
 
     // Link libc so that std.DynLib uses dlopen/dlsym for SO plugin loading.
@@ -512,6 +785,11 @@ pub fn build(b: *std.Build) void {
         }
         if (effective_enable_postgres) {
             exe.root_module.linkSystemLibrary("pq", .{});
+        }
+
+        // Link libcurl
+        if (curl_available) {
+            linkCurlToStep(exe, b, target.result.os.tag, is_cross);
         }
     }
     exe.dead_strip_dylibs = true;
@@ -553,8 +831,16 @@ pub fn build(b: *std.Build) void {
         if (effective_enable_postgres) {
             lib_tests.root_module.linkSystemLibrary("pq", .{});
         }
+        if (curl_available) {
+            lib_tests.linkLibC();
+            linkCurlToStep(lib_tests, b, target.result.os.tag, is_cross);
+        }
 
         const exe_tests = b.addTest(.{ .root_module = exe.root_module });
+        if (curl_available) {
+            exe_tests.linkLibC();
+            linkCurlToStep(exe_tests, b, target.result.os.tag, is_cross);
+        }
         test_step.dependOn(&b.addRunArtifact(lib_tests).step);
         test_step.dependOn(&b.addRunArtifact(exe_tests).step);
     }
