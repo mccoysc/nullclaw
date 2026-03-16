@@ -53,7 +53,9 @@ fn hasSystemLibcurl() bool {
 /// Get the best available libcurl source directory name
 fn findCurlSourceDir(b: *std.Build) ?[]const u8 {
     const vendor_dir = b.pathFromRoot(CUR_VENDOR_DIR);
-    var dir = std.fs.cwd().openDir(vendor_dir, .{}) catch return null;
+    var dir = std.fs.cwd().openDir(vendor_dir, .{
+        .iterate = true,
+    }) catch return null;
     defer dir.close();
 
     var best_version: ?[]const u8 = null;
