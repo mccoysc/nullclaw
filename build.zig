@@ -133,7 +133,20 @@ fn buildLibcurlFromSource(b: *std.Build, source_dir_name: []const u8) !void {
         std.log.info("libcurl not built in source tree, building from source...", .{});
         
         // Build using autotools
-        const configure_argv = [_][]const u8{ "./configure", "--prefix=/tmp/curl-build", "--enable-static", "--disable-shared", "--disable-ldap", "--disable-ldaps", "--without-brotli", "--without-nghttp2", "--without-zstd", "--without-libpsl", "--with-secure-transport" };
+        // Use --with-secure-transport on macOS, --with-openssl on Linux/other
+        const configure_argv = [_][]const u8{
+            "./configure",
+            "--prefix=/tmp/curl-build",
+            "--enable-static",
+            "--disable-shared",
+            "--disable-ldap",
+            "--disable-ldaps",
+            "--without-brotli",
+            "--without-nghttp2",
+            "--without-zstd",
+            "--without-libpsl",
+            if (builtin.os.tag == .macos) "--with-secure-transport" else "--with-openssl",
+        };
         var configure_proc = std.process.Child.init(&configure_argv, allocator);
         configure_proc.cwd = source_dir;
         try configure_proc.spawn();
@@ -768,17 +781,24 @@ pub fn build(b: *std.Build) void {
             exe.addIncludePath(b.path(CUR_INSTALL_DIR ++ "/include"));
             exe.linkSystemLibrary("curl");
         } else {
-            // Link libcurl (statically compiled from source with SecureTransport)
+            // Link libcurl (statically compiled from source with TLS support)
             exe.addIncludePath(b.path(CUR_INSTALL_DIR ++ "/include"));
             // Link zlib (required by libcurl)
             exe.linkSystemLibrary("z");
             // Link libcurl - use library path to find our static build
             exe.addLibraryPath(b.path(CUR_INSTALL_DIR ++ "/lib"));
             exe.linkSystemLibrary("curl");
-            // Link frameworks required by SecureTransport
-            exe.linkFramework("CoreFoundation");
-            exe.linkFramework("Security");
-            exe.linkFramework("SystemConfiguration");
+            // Link TLS libraries based on platform
+            if (builtin.os.tag == .macos) {
+                // Link frameworks required by SecureTransport on macOS
+                exe.linkFramework("CoreFoundation");
+                exe.linkFramework("Security");
+                exe.linkFramework("SystemConfiguration");
+            } else {
+                // Link OpenSSL on Linux and other platforms
+                exe.linkSystemLibrary("ssl");
+                exe.linkSystemLibrary("crypto");
+            }
         }
     }
     exe.dead_strip_dylibs = true;
@@ -830,9 +850,15 @@ pub fn build(b: *std.Build) void {
             lib_tests.linkSystemLibrary("z");
             lib_tests.addLibraryPath(b.path(CUR_INSTALL_DIR ++ "/lib"));
             lib_tests.linkSystemLibrary("curl");
-            lib_tests.linkFramework("CoreFoundation");
-            lib_tests.linkFramework("Security");
-            lib_tests.linkFramework("SystemConfiguration");
+            // Link TLS libraries based on platform
+            if (builtin.os.tag == .macos) {
+                lib_tests.linkFramework("CoreFoundation");
+                lib_tests.linkFramework("Security");
+                lib_tests.linkFramework("SystemConfiguration");
+            } else {
+                lib_tests.linkSystemLibrary("ssl");
+                lib_tests.linkSystemLibrary("crypto");
+            }
         }
 
         const exe_tests = b.addTest(.{ .root_module = exe.root_module });
@@ -845,9 +871,15 @@ pub fn build(b: *std.Build) void {
             exe_tests.linkSystemLibrary("z");
             exe_tests.addLibraryPath(b.path(CUR_INSTALL_DIR ++ "/lib"));
             exe_tests.linkSystemLibrary("curl");
-            exe_tests.linkFramework("CoreFoundation");
-            exe_tests.linkFramework("Security");
-            exe_tests.linkFramework("SystemConfiguration");
+            // Link TLS libraries based on platform
+            if (builtin.os.tag == .macos) {
+                exe_tests.linkFramework("CoreFoundation");
+                exe_tests.linkFramework("Security");
+                exe_tests.linkFramework("SystemConfiguration");
+            } else {
+                exe_tests.linkSystemLibrary("ssl");
+                exe_tests.linkSystemLibrary("crypto");
+            }
         }
         test_step.dependOn(&b.addRunArtifact(lib_tests).step);
         test_step.dependOn(&b.addRunArtifact(exe_tests).step);
