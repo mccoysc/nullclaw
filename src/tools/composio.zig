@@ -4,6 +4,7 @@ const root = @import("root.zig");
 const Tool = root.Tool;
 const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
+const http_util = @import("../http_util.zig");
 
 const COMPOSIO_API_BASE_V2 = "https://backend.composio.dev/api/v2";
 const COMPOSIO_API_BASE_V3 = "https://backend.composio.dev/api/v3";
@@ -213,46 +214,25 @@ pub const ComposioTool = struct {
         const auth_header = try std.fmt.allocPrint(allocator, "X-API-Key: {s}", .{self.api_key});
         defer allocator.free(auth_header);
 
-        var v2_body_buf: std.ArrayListUnmanaged(u8) = .empty;
-        defer v2_body_buf.deinit(allocator);
-        try v2_body_buf.appendSlice(allocator, "{\"entity_id\":\"");
-        try appendJsonEscaped(&v2_body_buf, allocator, entity);
-        try v2_body_buf.appendSlice(allocator, "\",\"appName\":\"");
-        try appendJsonEscaped(&v2_body_buf, allocator, app_for_v2);
-        try v2_body_buf.appendSlice(allocator, "\"}");
-        const body = try v2_body_buf.toOwnedSlice(allocator);
+        // Build body for v2 fallback
+        var body_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer body_buf.deinit(allocator);
+        try body_buf.appendSlice(allocator, "{\"app\":\"");
+        try body_buf.appendSlice(allocator, app_for_v2);
+        try body_buf.appendSlice(allocator, "\",\"user_id\":\"");
+        try appendJsonEscaped(&body_buf, allocator, entity);
+        try body_buf.appendSlice(allocator, "\"}");
+        const body = try body_buf.toOwnedSlice(allocator);
         defer allocator.free(body);
 
-        var argv_buf: [20][]const u8 = undefined;
-        var argc: usize = 0;
-        argv_buf[argc] = "curl";
-        argc += 1;
-        argv_buf[argc] = "-sL";
-        argc += 1;
-        argv_buf[argc] = "-m";
-        argc += 1;
-        argv_buf[argc] = "15";
-        argc += 1;
-        argv_buf[argc] = "-X";
-        argc += 1;
-        argv_buf[argc] = "POST";
-        argc += 1;
-        argv_buf[argc] = "-H";
-        argc += 1;
-        argv_buf[argc] = auth_header;
-        argc += 1;
-        argv_buf[argc] = "-H";
-        argc += 1;
-        argv_buf[argc] = "Content-Type: application/json";
-        argc += 1;
-        argv_buf[argc] = "-d";
-        argc += 1;
-        argv_buf[argc] = body;
-        argc += 1;
-        argv_buf[argc] = "https://backend.composio.dev/api/v1/connectedAccounts";
-        argc += 1;
+        // Use libcurl instead of subprocess for v2 fallback
+        const result = http_util.curlPost(allocator, "https://backend.composio.dev/api/v1/connectedAccounts", body, &.{ auth_header, "Content-Type: application/json" }) catch |err| {
+            const err_msg = try std.fmt.allocPrint(allocator, "HTTP POST failed: {}", .{err});
+            return ToolResult{ .success = false, .output = "", .error_msg = err_msg };
+        };
+        defer allocator.free(result);
 
-        return self.runCurl(allocator, argv_buf[0..argc]);
+        return ToolResult{ .success = true, .output = result };
     }
 
     // ── HTTP helpers ───────────────────────────────────────────────
@@ -261,78 +241,37 @@ pub const ComposioTool = struct {
         const auth_header = try std.fmt.allocPrint(allocator, "x-api-key: {s}", .{self.api_key});
         defer allocator.free(auth_header);
 
-        var argv_buf: [20][]const u8 = undefined;
-        var argc: usize = 0;
-        argv_buf[argc] = "curl";
-        argc += 1;
-        argv_buf[argc] = "-sL";
-        argc += 1;
-        argv_buf[argc] = "-m";
-        argc += 1;
-        argv_buf[argc] = "15";
-        argc += 1;
-        argv_buf[argc] = "-H";
-        argc += 1;
-        argv_buf[argc] = auth_header;
-        argc += 1;
-        argv_buf[argc] = url;
-        argc += 1;
+        // Use libcurl instead of subprocess
+        const result = http_util.curlGet(allocator, url, &.{auth_header}, "15") catch |err| {
+            const err_msg = try std.fmt.allocPrint(allocator, "HTTP GET failed: {}", .{err});
+            return ToolResult{ .success = false, .output = "", .error_msg = err_msg };
+        };
+        defer allocator.free(result);
 
-        return self.runCurl(allocator, argv_buf[0..argc]);
+        return ToolResult{ .success = true, .output = result };
     }
 
     fn httpPost(self: *ComposioTool, allocator: std.mem.Allocator, url: []const u8, body: []const u8) !ToolResult {
         const auth_header = try std.fmt.allocPrint(allocator, "x-api-key: {s}", .{self.api_key});
         defer allocator.free(auth_header);
 
-        var argv_buf: [20][]const u8 = undefined;
-        var argc: usize = 0;
-        argv_buf[argc] = "curl";
-        argc += 1;
-        argv_buf[argc] = "-sL";
-        argc += 1;
-        argv_buf[argc] = "-m";
-        argc += 1;
-        argv_buf[argc] = "15";
-        argc += 1;
-        argv_buf[argc] = "-X";
-        argc += 1;
-        argv_buf[argc] = "POST";
-        argc += 1;
-        argv_buf[argc] = "-H";
-        argc += 1;
-        argv_buf[argc] = auth_header;
-        argc += 1;
-        argv_buf[argc] = "-H";
-        argc += 1;
-        argv_buf[argc] = "Content-Type: application/json";
-        argc += 1;
-        argv_buf[argc] = "-d";
-        argc += 1;
-        argv_buf[argc] = body;
-        argc += 1;
-        argv_buf[argc] = url;
-        argc += 1;
+        // Use libcurl instead of subprocess
+        const result = http_util.curlPost(allocator, url, body, &.{auth_header}) catch |err| {
+            const err_msg = try std.fmt.allocPrint(allocator, "HTTP POST failed: {}", .{err});
+            return ToolResult{ .success = false, .output = "", .error_msg = err_msg };
+        };
+        defer allocator.free(result);
 
-        return self.runCurl(allocator, argv_buf[0..argc]);
+        return ToolResult{ .success = true, .output = result };
     }
 
     /// Run curl as a child process and return stdout on success, stderr on failure.
-    fn runCurl(_: *ComposioTool, allocator: std.mem.Allocator, argv: []const []const u8) !ToolResult {
-        const proc = @import("process_util.zig");
-        const result = try proc.run(allocator, argv, .{});
-        defer allocator.free(result.stderr);
-        if (result.success) {
-            if (result.stdout.len > 0) return ToolResult{ .success = true, .output = result.stdout };
-            allocator.free(result.stdout);
-            return ToolResult{ .success = true, .output = try allocator.dupe(u8, "(empty response)") };
-        }
-        defer allocator.free(result.stdout);
-        if (result.exit_code != null) {
-            const err_out = try allocator.dupe(u8, if (result.stderr.len > 0) result.stderr else "curl failed with non-zero exit code");
-            return ToolResult{ .success = false, .output = "", .error_msg = err_out };
-        }
-        return ToolResult{ .success = false, .output = "", .error_msg = "curl terminated by signal" };
+    /// Kept for backward compatibility but now uses libcurl internally.
+    fn runCurl(_: *ComposioTool, _: std.mem.Allocator, argv: []const []const u8) !ToolResult {
+        // This function is kept for backward compatibility but no longer used
+        // The new implementation uses http_util.curlPost directly
+        _ = argv;
+        return ToolResult.fail("runCurl is deprecated - use httpGet/httpPost instead");
     }
 };
 

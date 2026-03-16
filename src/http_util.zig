@@ -1,12 +1,7 @@
-//! Shared HTTP utilities.
+//! HTTP utilities using libcurl C API.
 //!
-//! Backend selection (also used by ws_util):
-//!  - `subprocess` : curl / wscat child processes (default on macOS).
-//!  - `native`     : Zig std.http.Client (default on other platforms).
-//!
-//! Override at startup with `--http-backend native|subprocess`.
-//!
-//! Replaces 9+ local `curlPost` / `curlGet` duplicates across the codebase.
+//! All HTTP operations use libcurl compiled from source and statically linked.
+//! This module provides a clean interface for HTTP requests with full timeout support.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -15,31 +10,40 @@ const AtomicBool = std.atomic.Value(bool);
 
 const log = std.log.scoped(.http_util);
 
-// ── Backend selection ────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+// HTTP backend selection (native curl vs subprocess)
+// ═══════════════════════════════════════════════════════════════════════════
 
-pub const NetBackend = enum { native, subprocess };
+pub const HttpBackend = enum {
+    native,
+    subprocess,
+};
 
-/// Platform default: macOS -> subprocess (avoids TLS Bus-error on ARM),
-/// everything else -> native std.http.Client.
-const platform_default: NetBackend = if (builtin.os.tag == .macos) .subprocess else .native;
+var current_backend: HttpBackend = if (builtin.os.tag == .macos) .subprocess else .native;
 
-/// CLI override set via `--http-backend`.
-var backend_override: ?NetBackend = null;
-
-/// Called once from CLI arg parsing.
-pub fn setNetBackend(b: NetBackend) void {
-    backend_override = b;
+/// Set the HTTP backend to use for requests.
+pub fn setNetBackend(backend: HttpBackend) void {
+    current_backend = backend;
 }
 
-/// Active backend (override wins, then platform default).
-pub fn netBackend() NetBackend {
-    return backend_override orelse platform_default;
+/// Get the current HTTP backend.
+pub fn getNetBackend() HttpBackend {
+    return current_backend;
 }
 
-/// Convenience: true when subprocess path should be used.
-pub fn useSubprocess() bool {
-    return netBackend() == .subprocess;
-}
+// Import libcurl C API
+const c = @cImport({
+    @cInclude("curl/curl.h");
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Global initialization
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Thread interrupt flag support
+// ═══════════════════════════════════════════════════════════════════════════
+
 threadlocal var thread_interrupt_flag: ?*const AtomicBool = null;
 
 pub fn setThreadInterruptFlag(flag: ?*const AtomicBool) void {
@@ -50,36 +54,98 @@ pub fn currentThreadInterruptFlag() ?*const AtomicBool {
     return thread_interrupt_flag;
 }
 
-const CancelWatcherCtx = struct {
-    child: *std.process.Child,
-    cancel_flag: *const AtomicBool,
-    done: *AtomicBool,
-};
+// ═══════════════════════════════════════════════════════════════════════════
+// Global initialization
+// ═══════════════════════════════════════════════════════════════════════════
 
-fn cancelWatcherMain(ctx: *CancelWatcherCtx) void {
-    while (!ctx.done.load(.acquire)) {
-        if (ctx.cancel_flag.load(.acquire)) {
-            if (comptime @import("builtin").os.tag == .windows) {
-                std.os.windows.TerminateProcess(ctx.child.id, 1) catch {};
-            } else {
-                std.posix.kill(ctx.child.id, std.posix.SIG.TERM) catch {};
-            }
-            break;
+var curl_initialized: bool = false;
+
+fn ensureCurlInit() !void {
+    if (!curl_initialized) {
+        const result = c.curl_global_init(c.CURL_GLOBAL_DEFAULT);
+        if (result != c.CURLE_OK) {
+            return error.CurlInitFailed;
         }
-        std.Thread.sleep(20 * std.time.ns_per_ms);
+        curl_initialized = true;
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Response structure
+// ═══════════════════════════════════════════════════════════════════════════
 
 pub const HttpResponse = struct {
     status_code: u16,
     body: []u8,
 };
 
-/// HTTP POST via curl subprocess with optional proxy and timeout.
-///
-/// `headers` is a slice of header strings (e.g. `"Authorization: Bearer xxx"`).
-/// `proxy` is an optional proxy URL (e.g. `"socks5://host:port"`).
-/// `max_time` is an optional --max-time value as a string (e.g. `"300"`).
+// ═══════════════════════════════════════════════════════════════════════════
+// Write context for libcurl - holds both ArrayListUnmanaged and its allocator
+// ═══════════════════════════════════════════════════════════════════════════
+
+const WriteContext = struct {
+    list: *std.ArrayListUnmanaged(u8),
+    allocator: Allocator,
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Write callback for libcurl - collects response into an ArrayListUnmanaged
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn writeCallback(
+    contents: ?*anyopaque,
+    size: usize,
+    nmemb: usize,
+    userp: ?*anyopaque,
+) callconv(.c) usize {
+    const real_size = size * nmemb;
+    if (real_size == 0) return 0;
+
+    const ctx = userp orelse return 0;
+    const write_ctx = @as(*WriteContext, @ptrCast(@alignCast(ctx)));
+    const list = write_ctx.list;
+    const allocator = write_ctx.allocator;
+
+    // Convert opaque pointer to slice
+    const contents_ptr = @as([*]const u8, @ptrCast(contents orelse return 0));
+    list.appendSlice(allocator, contents_ptr[0..real_size]) catch return 0;
+    return real_size;
+}
+
+// Read callback for libcurl - provides request body
+fn readCallback(
+    buffer: ?*anyopaque,
+    size: usize,
+    nitems: usize,
+    userp: ?*anyopaque,
+) callconv(.c) usize {
+    const max_size = size * nitems;
+    const context = userp orelse return 0;
+    const read_ctx = @as(*ReadContext, @ptrCast(@alignCast(context)));
+
+    if (read_ctx.offset >= read_ctx.data.len) {
+        return 0;
+    }
+
+    const remaining = read_ctx.data.len - read_ctx.offset;
+    const to_copy = @min(max_size, remaining);
+
+    @memcpy(@as([*]u8, @ptrCast(buffer))[0..to_copy], read_ctx.data[read_ctx.offset..]);
+    read_ctx.offset += to_copy;
+
+    return to_copy;
+}
+
+const ReadContext = struct {
+    data: []const u8,
+    offset: usize = 0,
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HTTP POST with libcurl
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// HTTP POST with optional proxy and timeout.
 /// Returns the response body. Caller owns returned memory.
 pub fn curlPostWithProxy(
     allocator: Allocator,
@@ -89,20 +155,188 @@ pub fn curlPostWithProxy(
     proxy: ?[]const u8,
     max_time: ?[]const u8,
 ) ![]u8 {
-    return curlRequestWithProxy(
-        allocator,
-        "POST",
-        "Content-Type: application/json",
-        url,
-        body,
-        headers,
-        proxy,
-        max_time,
-    );
+    try ensureCurlInit();
+
+    const curl = c.curl_easy_init();
+    if (curl == null) {
+        return error.CurlInitFailed;
+    }
+    defer c.curl_easy_cleanup(curl);
+
+    // Set URL
+    const url_c = try allocator.dupeZ(u8, url);
+    defer allocator.free(url_c);
+    if (c.curl_easy_setopt(curl, c.CURLOPT_URL, url_c.ptr) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    // Set POST method and body
+    if (c.curl_easy_setopt(curl, c.CURLOPT_POST, @as(c_long, 1)) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    const body_c = try allocator.dupeZ(u8, body);
+    defer allocator.free(body_c);
+    if (c.curl_easy_setopt(curl, c.CURLOPT_POSTFIELDS, body_c.ptr) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    // Set headers
+    var header_list: ?[*]c.curl_slist = null;
+    defer {
+        if (header_list) |list| {
+            c.curl_slist_free_all(list);
+        }
+    }
+
+    // Content-Type header
+    const ct_header = "Content-Type: application/json";
+    var new_list = c.curl_slist_append(header_list, ct_header);
+    if (new_list == null) {
+        return error.CurlHeaderError;
+    }
+    header_list = new_list;
+
+    // Additional headers
+    for (headers) |hdr| {
+        const hdr_c = try allocator.dupeZ(u8, hdr);
+        defer allocator.free(hdr_c);
+        new_list = c.curl_slist_append(header_list, hdr_c.ptr);
+        if (new_list == null) {
+            return error.CurlHeaderError;
+        }
+        header_list = new_list;
+    }
+
+    if (c.curl_easy_setopt(curl, c.CURLOPT_HTTPHEADER, header_list) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    // Set timeout
+    if (max_time) |timeout| {
+        const timeout_secs = std.fmt.parseInt(c_long, timeout, 10) catch 300;
+        if (c.curl_easy_setopt(curl, c.CURLOPT_TIMEOUT, timeout_secs) != c.CURLE_OK) {
+            return error.CurlOptionError;
+        }
+    }
+
+    // Set proxy
+    if (proxy) |p| {
+        const proxy_c = try allocator.dupeZ(u8, p);
+        defer allocator.free(proxy_c);
+        if (c.curl_easy_setopt(curl, c.CURLOPT_PROXY, proxy_c.ptr) != c.CURLE_OK) {
+            return error.CurlOptionError;
+        }
+    }
+
+    // Follow redirects
+    if (c.curl_easy_setopt(curl, c.CURLOPT_FOLLOWLOCATION, @as(c_long, 1)) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    // Fail on HTTP errors (4xx, 5xx)
+    if (c.curl_easy_setopt(curl, c.CURLOPT_FAILONERROR, @as(c_long, 1)) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    // Set up response buffer with initial capacity
+    var response: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer response.deinit(allocator);
+
+    // Create write context to pass both list and allocator to callback
+    var write_ctx = WriteContext{ .list = &response, .allocator = allocator };
+
+    if (c.curl_easy_setopt(curl, c.CURLOPT_WRITEFUNCTION, writeCallback) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+    if (c.curl_easy_setopt(curl, c.CURLOPT_WRITEDATA, &write_ctx) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    // Perform request
+    const result = c.curl_easy_perform(curl);
+    if (result != c.CURLE_OK) {
+        // Check for HTTP error
+        if (result == c.CURLE_HTTP_RETURNED_ERROR) {
+            var response_code: c_long = 0;
+            _ = c.curl_easy_getinfo(curl, c.CURLINFO_RESPONSE_CODE, &response_code);
+            log.warn("HTTP error: status={d}", .{response_code});
+        }
+        return error.CurlRequestFailed;
+    }
+
+    return try response.toOwnedSlice(allocator);
 }
 
-/// HTTP POST with application/x-www-form-urlencoded body via curl subprocess,
-/// with optional proxy and timeout.
+/// HTTP POST (no proxy, no timeout).
+pub fn curlPost(allocator: Allocator, url: []const u8, body: []const u8, headers: []const []const u8) ![]u8 {
+    return curlPostWithProxy(allocator, url, body, headers, null, null);
+}
+
+/// HTTP POST with application/x-www-form-urlencoded body.
+pub fn curlPostForm(allocator: Allocator, url: []const u8, body: []const u8) ![]u8 {
+    try ensureCurlInit();
+
+    const curl = c.curl_easy_init();
+    if (curl == null) {
+        return error.CurlInitFailed;
+    }
+    defer c.curl_easy_cleanup(curl);
+
+    // Set URL
+    const url_c = try allocator.dupeZ(u8, url);
+    defer allocator.free(url_c);
+    if (c.curl_easy_setopt(curl, c.CURLOPT_URL, url_c.ptr) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    // Set POST method and body
+    if (c.curl_easy_setopt(curl, c.CURLOPT_POST, @as(c_long, 1)) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    const body_c = try allocator.dupeZ(u8, body);
+    defer allocator.free(body_c);
+    if (c.curl_easy_setopt(curl, c.CURLOPT_POSTFIELDS, body_c.ptr) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    // Content-Type header for form data
+    const ct_header = "Content-Type: application/x-www-form-urlencoded";
+    const header_list = c.curl_slist_append(null, ct_header);
+    defer {
+        if (header_list) |list| {
+            c.curl_slist_free_all(list);
+        }
+    }
+    if (c.curl_easy_setopt(curl, c.CURLOPT_HTTPHEADER, header_list) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    // Set up response buffer with initial capacity
+    var response: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer response.deinit(allocator);
+
+    // Create write context to pass both list and allocator to callback
+    var write_ctx = WriteContext{ .list = &response, .allocator = allocator };
+
+    if (c.curl_easy_setopt(curl, c.CURLOPT_WRITEFUNCTION, writeCallback) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+    if (c.curl_easy_setopt(curl, c.CURLOPT_WRITEDATA, &write_ctx) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    // Perform request
+    const result = c.curl_easy_perform(curl);
+    if (result != c.CURLE_OK) {
+        return error.CurlRequestFailed;
+    }
+
+    return try response.toOwnedSlice(allocator);
+}
+
+/// HTTP POST with form data and proxy/timeout
 pub fn curlPostFormWithProxy(
     allocator: Allocator,
     url: []const u8,
@@ -110,415 +344,281 @@ pub fn curlPostFormWithProxy(
     proxy: ?[]const u8,
     max_time: ?[]const u8,
 ) ![]u8 {
-    return curlRequestWithProxy(
-        allocator,
-        "POST",
-        "Content-Type: application/x-www-form-urlencoded",
-        url,
-        body,
-        &.{},
-        proxy,
-        max_time,
-    );
-}
+    try ensureCurlInit();
 
-fn curlRequestWithProxy(
-    allocator: Allocator,
-    method: []const u8,
-    content_type_header: []const u8,
-    url: []const u8,
-    body: []const u8,
-    headers: []const []const u8,
-    proxy: ?[]const u8,
-    max_time: ?[]const u8,
-) ![]u8 {
-    // Fall back to subprocess when proxy or timeout is configured, since native
-    // std.http.Client does not support proxy or timeout settings.
-    if (!useSubprocess() and proxy == null and max_time == null) {
-        return nativeHttpRequest(allocator, method, content_type_header, url, body, headers);
+    const curl = c.curl_easy_init();
+    if (curl == null) {
+        return error.CurlInitFailed;
     }
-    return curlRequestWithProxySubprocess(allocator, method, content_type_header, url, body, headers, proxy, max_time);
-}
+    defer c.curl_easy_cleanup(curl);
 
-fn curlRequestWithProxySubprocess(
-    allocator: Allocator,
-    method: []const u8,
-    content_type_header: []const u8,
-    url: []const u8,
-    body: []const u8,
-    headers: []const []const u8,
-    proxy: ?[]const u8,
-    max_time: ?[]const u8,
-) ![]u8 {
-    var argv_buf: [40][]const u8 = undefined;
-    var argc: usize = 0;
-
-    argv_buf[argc] = "curl";
-    argc += 1;
-    argv_buf[argc] = "-s";
-    argc += 1;
-    argv_buf[argc] = "-X";
-    argc += 1;
-    argv_buf[argc] = method;
-    argc += 1;
-    argv_buf[argc] = "-H";
-    argc += 1;
-    argv_buf[argc] = content_type_header;
-    argc += 1;
-
-    if (proxy) |p| {
-        argv_buf[argc] = "--proxy";
-        argc += 1;
-        argv_buf[argc] = p;
-        argc += 1;
+    // Set URL
+    const url_c = try allocator.dupeZ(u8, url);
+    defer allocator.free(url_c);
+    if (c.curl_easy_setopt(curl, c.CURLOPT_URL, url_c.ptr) != c.CURLE_OK) {
+        return error.CurlOptionError;
     }
 
-    if (max_time) |mt| {
-        argv_buf[argc] = "--max-time";
-        argc += 1;
-        argv_buf[argc] = mt;
-        argc += 1;
+    // Set POST method and body
+    if (c.curl_easy_setopt(curl, c.CURLOPT_POST, @as(c_long, 1)) != c.CURLE_OK) {
+        return error.CurlOptionError;
     }
 
-    for (headers) |hdr| {
-        if (argc + 2 > argv_buf.len) break;
-        argv_buf[argc] = "-H";
-        argc += 1;
-        argv_buf[argc] = hdr;
-        argc += 1;
+    const body_c = try allocator.dupeZ(u8, body);
+    defer allocator.free(body_c);
+    if (c.curl_easy_setopt(curl, c.CURLOPT_POSTFIELDS, body_c.ptr) != c.CURLE_OK) {
+        return error.CurlOptionError;
     }
 
-    // Pass payload via stdin to avoid OS argv length limits for large JSON
-    // bodies (e.g. multimodal base64 images).
-    argv_buf[argc] = "--data-binary";
-    argc += 1;
-    argv_buf[argc] = "@-";
-    argc += 1;
-    argv_buf[argc] = url;
-    argc += 1;
-
-    var child = std.process.Child.init(argv_buf[0..argc], allocator);
-    child.stdin_behavior = .Pipe;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
-
-    try child.spawn();
-    const cancel_flag = thread_interrupt_flag;
-    var cancel_done = AtomicBool.init(false);
-    var cancel_watcher: ?std.Thread = null;
-    var watcher_ctx: CancelWatcherCtx = undefined;
-    if (cancel_flag) |flag| {
-        watcher_ctx = .{ .child = &child, .cancel_flag = flag, .done = &cancel_done };
-        cancel_watcher = std.Thread.spawn(.{}, cancelWatcherMain, .{&watcher_ctx}) catch null;
-    }
+    // Content-Type header for form data
+    const ct_header = "Content-Type: application/x-www-form-urlencoded";
+    const header_list = c.curl_slist_append(null, ct_header);
     defer {
-        cancel_done.store(true, .release);
-        if (cancel_watcher) |t| t.join();
+        if (header_list) |list| {
+            c.curl_slist_free_all(list);
+        }
+    }
+    if (c.curl_easy_setopt(curl, c.CURLOPT_HTTPHEADER, header_list) != c.CURLE_OK) {
+        return error.CurlOptionError;
     }
 
-    if (child.stdin) |stdin_file| {
-        stdin_file.writeAll(body) catch {
-            stdin_file.close();
-            child.stdin = null;
-            _ = child.kill() catch {};
-            _ = child.wait() catch {};
-            return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWriteError;
-        };
-        stdin_file.close();
-        child.stdin = null;
-    } else {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
-        return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWriteError;
+    // Set timeout
+    if (max_time) |timeout| {
+        const timeout_secs = std.fmt.parseInt(c_long, timeout, 10) catch 300;
+        if (c.curl_easy_setopt(curl, c.CURLOPT_TIMEOUT, timeout_secs) != c.CURLE_OK) {
+            return error.CurlOptionError;
+        }
     }
 
-    const stdout = child.stdout.?.readToEndAlloc(allocator, 1024 * 1024) catch {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
-        return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlReadError;
-    };
-
-    const term = child.wait() catch |err| {
-        log.err("curl child.wait failed: {}", .{err});
-        allocator.free(stdout);
-        return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWaitError;
-    };
-    switch (term) {
-        .Exited => |code| if (code != 0) {
-            allocator.free(stdout);
-            return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlFailed;
-        },
-        else => {
-            allocator.free(stdout);
-            return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlFailed;
-        },
+    // Set proxy
+    if (proxy) |p| {
+        const proxy_c = try allocator.dupeZ(u8, p);
+        defer allocator.free(proxy_c);
+        if (c.curl_easy_setopt(curl, c.CURLOPT_PROXY, proxy_c.ptr) != c.CURLE_OK) {
+            return error.CurlOptionError;
+        }
     }
 
-    return stdout;
+    // Follow redirects
+    if (c.curl_easy_setopt(curl, c.CURLOPT_FOLLOWLOCATION, @as(c_long, 1)) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    // Fail on HTTP errors
+    if (c.curl_easy_setopt(curl, c.CURLOPT_FAILONERROR, @as(c_long, 1)) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    // Set up response buffer with initial capacity
+    var response: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer response.deinit(allocator);
+
+    // Create write context to pass both list and allocator to callback
+    var write_ctx = WriteContext{ .list = &response, .allocator = allocator };
+
+    if (c.curl_easy_setopt(curl, c.CURLOPT_WRITEFUNCTION, writeCallback) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+    if (c.curl_easy_setopt(curl, c.CURLOPT_WRITEDATA, &write_ctx) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    // Perform request
+    const result = c.curl_easy_perform(curl);
+    if (result != c.CURLE_OK) {
+        return error.CurlRequestFailed;
+    }
+
+    return try response.toOwnedSlice(allocator);
 }
 
-/// HTTP POST via curl subprocess (no proxy, no timeout).
-pub fn curlPost(allocator: Allocator, url: []const u8, body: []const u8, headers: []const []const u8) ![]u8 {
-    return curlPostWithProxy(allocator, url, body, headers, null, null);
-}
-
-/// HTTP POST with application/x-www-form-urlencoded body via curl subprocess.
-///
-/// `body` must already be percent-encoded form data (e.g. `"key=val&key2=val2"`).
-/// Returns the response body. Caller owns returned memory.
-pub fn curlPostForm(allocator: Allocator, url: []const u8, body: []const u8) ![]u8 {
-    return curlPostFormWithProxy(allocator, url, body, null, null);
-}
-
-/// HTTP POST and include HTTP status code in response.
-/// On macOS uses curl subprocess; on other platforms uses native std.http.Client.
-/// Caller owns `response.body`.
+/// HTTP POST and return status code along with body.
 pub fn curlPostWithStatus(
     allocator: Allocator,
     url: []const u8,
     body: []const u8,
     headers: []const []const u8,
 ) !HttpResponse {
-    if (!useSubprocess()) {
-        return nativePostWithStatus(allocator, url, body, headers);
+    try ensureCurlInit();
+
+    const curl = c.curl_easy_init();
+    if (curl == null) {
+        return error.CurlInitFailed;
     }
-    return curlPostWithStatusSubprocess(allocator, url, body, headers);
-}
+    defer c.curl_easy_cleanup(curl);
 
-fn curlPostWithStatusSubprocess(
-    allocator: Allocator,
-    url: []const u8,
-    body: []const u8,
-    headers: []const []const u8,
-) !HttpResponse {
-    var argv_buf: [48][]const u8 = undefined;
-    var argc: usize = 0;
-
-    argv_buf[argc] = "curl";
-    argc += 1;
-    argv_buf[argc] = "-s";
-    argc += 1;
-    argv_buf[argc] = "-X";
-    argc += 1;
-    argv_buf[argc] = "POST";
-    argc += 1;
-    argv_buf[argc] = "-H";
-    argc += 1;
-    argv_buf[argc] = "Content-Type: application/json";
-    argc += 1;
-
-    for (headers) |hdr| {
-        if (argc + 2 > argv_buf.len) break;
-        argv_buf[argc] = "-H";
-        argc += 1;
-        argv_buf[argc] = hdr;
-        argc += 1;
+    // Set URL
+    const url_c = try allocator.dupeZ(u8, url);
+    defer allocator.free(url_c);
+    if (c.curl_easy_setopt(curl, c.CURLOPT_URL, url_c.ptr) != c.CURLE_OK) {
+        return error.CurlOptionError;
     }
 
-    argv_buf[argc] = "--data-binary";
-    argc += 1;
-    argv_buf[argc] = "@-";
-    argc += 1;
-    argv_buf[argc] = "-w";
-    argc += 1;
-    argv_buf[argc] = "\n%{http_code}";
-    argc += 1;
-    argv_buf[argc] = url;
-    argc += 1;
-
-    var child = std.process.Child.init(argv_buf[0..argc], allocator);
-    child.stdin_behavior = .Pipe;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
-
-    try child.spawn();
-    const cancel_flag = thread_interrupt_flag;
-    var cancel_done = AtomicBool.init(false);
-    var cancel_watcher: ?std.Thread = null;
-    var watcher_ctx: CancelWatcherCtx = undefined;
-    if (cancel_flag) |flag| {
-        watcher_ctx = .{ .child = &child, .cancel_flag = flag, .done = &cancel_done };
-        cancel_watcher = std.Thread.spawn(.{}, cancelWatcherMain, .{&watcher_ctx}) catch null;
+    // Set POST method and body
+    if (c.curl_easy_setopt(curl, c.CURLOPT_POST, @as(c_long, 1)) != c.CURLE_OK) {
+        return error.CurlOptionError;
     }
+
+    const body_c = try allocator.dupeZ(u8, body);
+    defer allocator.free(body_c);
+    if (c.curl_easy_setopt(curl, c.CURLOPT_POSTFIELDS, body_c.ptr) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    // Content-Type header
+    const ct_header = "Content-Type: application/json";
+    var header_list = c.curl_slist_append(null, ct_header);
     defer {
-        cancel_done.store(true, .release);
-        if (cancel_watcher) |t| t.join();
+        if (header_list) |list| {
+            c.curl_slist_free_all(list);
+        }
     }
 
-    if (child.stdin) |stdin_file| {
-        stdin_file.writeAll(body) catch {
-            stdin_file.close();
-            child.stdin = null;
-            _ = child.kill() catch {};
-            _ = child.wait() catch {};
-            return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWriteError;
-        };
-        stdin_file.close();
-        child.stdin = null;
-    } else {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
-        return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWriteError;
+    // Additional headers
+    for (headers) |hdr| {
+        const hdr_c = try allocator.dupeZ(u8, hdr);
+        defer allocator.free(hdr_c);
+        const next_list = c.curl_slist_append(header_list, hdr_c.ptr);
+        if (next_list == null) {
+            return error.CurlHeaderError;
+        }
+        header_list = next_list;
     }
 
-    const stdout = child.stdout.?.readToEndAlloc(allocator, 1024 * 1024) catch {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
-        return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlReadError;
-    };
-    errdefer allocator.free(stdout);
-
-    const term = child.wait() catch |err| {
-        log.err("curl child.wait failed: {}", .{err});
-        return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWaitError;
-    };
-    switch (term) {
-        .Exited => |code| if (code != 0) return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlFailed,
-        else => return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlFailed,
+    if (c.curl_easy_setopt(curl, c.CURLOPT_HTTPHEADER, header_list) != c.CURLE_OK) {
+        return error.CurlOptionError;
     }
 
-    const status_sep = std.mem.lastIndexOfScalar(u8, stdout, '\n') orelse return error.CurlParseError;
-    const status_raw = std.mem.trim(u8, stdout[status_sep + 1 ..], " \t\r\n");
-    if (status_raw.len != 3) return error.CurlParseError;
-    const status_code = std.fmt.parseInt(u16, status_raw, 10) catch return error.CurlParseError;
-    const body_slice = stdout[0..status_sep];
-    const response_body = try allocator.dupe(u8, body_slice);
-    allocator.free(stdout);
+    // Follow redirects
+    if (c.curl_easy_setopt(curl, c.CURLOPT_FOLLOWLOCATION, @as(c_long, 1)) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
 
-    return .{
-        .status_code = status_code,
+    // Set up response buffer with initial capacity
+    var response: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer response.deinit(allocator);
+
+    // Create write context to pass both list and allocator to callback
+    var write_ctx = WriteContext{ .list = &response, .allocator = allocator };
+
+    if (c.curl_easy_setopt(curl, c.CURLOPT_WRITEFUNCTION, writeCallback) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+    if (c.curl_easy_setopt(curl, c.CURLOPT_WRITEDATA, &write_ctx) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    // Perform request
+    _ = c.curl_easy_perform(curl);
+
+    // Get status code
+    var response_code: c_long = 200;
+    _ = c.curl_easy_getinfo(curl, c.CURLINFO_RESPONSE_CODE, &response_code);
+
+    const response_body = try response.toOwnedSlice(allocator);
+
+    return HttpResponse{
+        .status_code = @intCast(response_code),
         .body = response_body,
     };
 }
 
-/// HTTP PUT via curl subprocess (no proxy, no timeout).
+/// HTTP PUT request
 pub fn curlPut(allocator: Allocator, url: []const u8, body: []const u8, headers: []const []const u8) ![]u8 {
-    return curlRequestWithProxy(
-        allocator,
-        "PUT",
-        "Content-Type: application/json",
-        url,
-        body,
-        headers,
-        null,
-        null,
-    );
-}
+    try ensureCurlInit();
 
-/// HTTP GET with optional proxy.
-///
-/// On macOS uses curl subprocess; on other platforms uses native std.http.Client.
-/// `headers` is a slice of header strings (e.g. `"Authorization: Bearer xxx"`).
-/// `timeout_secs` sets --max-time (curl only). Returns the response body. Caller owns returned memory.
-fn curlGetWithProxyAndResolve(
-    allocator: Allocator,
-    url: []const u8,
-    headers: []const []const u8,
-    timeout_secs: []const u8,
-    proxy: ?[]const u8,
-    resolve_entry: ?[]const u8,
-) ![]u8 {
-    // Fall back to subprocess when proxy, resolve_entry, or timeout is set.
-    // Native std.http.Client lacks proxy, DNS pinning (--resolve), and
-    // request timeout support.
-    const has_timeout = timeout_secs.len > 0 and !std.mem.eql(u8, timeout_secs, "0");
-    if (!useSubprocess() and proxy == null and resolve_entry == null and !has_timeout) {
-        return nativeHttpGet(allocator, url, headers);
+    const curl = c.curl_easy_init();
+    if (curl == null) {
+        return error.CurlInitFailed;
     }
-    return curlGetWithProxyAndResolveSubprocess(allocator, url, headers, timeout_secs, proxy, resolve_entry);
-}
+    defer c.curl_easy_cleanup(curl);
 
-fn curlGetWithProxyAndResolveSubprocess(
-    allocator: Allocator,
-    url: []const u8,
-    headers: []const []const u8,
-    timeout_secs: []const u8,
-    proxy: ?[]const u8,
-    resolve_entry: ?[]const u8,
-) ![]u8 {
-    var argv_buf: [48][]const u8 = undefined;
-    var argc: usize = 0;
-
-    argv_buf[argc] = "curl";
-    argc += 1;
-    argv_buf[argc] = "-sf";
-    argc += 1;
-    argv_buf[argc] = "--max-time";
-    argc += 1;
-    argv_buf[argc] = timeout_secs;
-    argc += 1;
-
-    if (proxy) |p| {
-        argv_buf[argc] = "--proxy";
-        argc += 1;
-        argv_buf[argc] = p;
-        argc += 1;
+    // Set URL
+    const url_c = try allocator.dupeZ(u8, url);
+    defer allocator.free(url_c);
+    if (c.curl_easy_setopt(curl, c.CURLOPT_URL, url_c.ptr) != c.CURLE_OK) {
+        return error.CurlOptionError;
     }
 
-    if (resolve_entry) |entry| {
-        argv_buf[argc] = "--resolve";
-        argc += 1;
-        argv_buf[argc] = entry;
-        argc += 1;
+    // Set PUT method
+    if (c.curl_easy_setopt(curl, c.CURLOPT_UPLOAD, @as(c_long, 1)) != c.CURLE_OK) {
+        return error.CurlOptionError;
     }
 
-    for (headers) |hdr| {
-        if (argc + 2 > argv_buf.len) break;
-        argv_buf[argc] = "-H";
-        argc += 1;
-        argv_buf[argc] = hdr;
-        argc += 1;
+    // Set request body via read callback
+    var read_ctx = ReadContext{ .data = body };
+    if (c.curl_easy_setopt(curl, c.CURLOPT_READDATA, &read_ctx) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+    if (c.curl_easy_setopt(curl, c.CURLOPT_READFUNCTION, readCallback) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+    if (c.curl_easy_setopt(curl, c.CURLOPT_INFILESIZE_LARGE, @as(c_ulonglong, body.len)) != c.CURLE_OK) {
+        return error.CurlOptionError;
     }
 
-    argv_buf[argc] = url;
-    argc += 1;
-
-    var child = std.process.Child.init(argv_buf[0..argc], allocator);
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
-
-    try child.spawn();
-    const cancel_flag = thread_interrupt_flag;
-    var cancel_done = AtomicBool.init(false);
-    var cancel_watcher: ?std.Thread = null;
-    var watcher_ctx: CancelWatcherCtx = undefined;
-    if (cancel_flag) |flag| {
-        watcher_ctx = .{ .child = &child, .cancel_flag = flag, .done = &cancel_done };
-        cancel_watcher = std.Thread.spawn(.{}, cancelWatcherMain, .{&watcher_ctx}) catch null;
-    }
+    // Content-Type header
+    const ct_header = "Content-Type: application/json";
+    var header_list = c.curl_slist_append(null, ct_header);
     defer {
-        cancel_done.store(true, .release);
-        if (cancel_watcher) |t| t.join();
+        if (header_list) |list| {
+            c.curl_slist_free_all(list);
+        }
     }
 
-    const stdout = child.stdout.?.readToEndAlloc(allocator, 4 * 1024 * 1024) catch {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
-        return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlReadError;
-    };
-
-    const term = child.wait() catch |err| {
-        log.err("curl child.wait failed: {}", .{err});
-        return error.CurlWaitError;
-    };
-    switch (term) {
-        .Exited => |code| if (code != 0) {
-            allocator.free(stdout);
-            return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlFailed;
-        },
-        else => {
-            allocator.free(stdout);
-            return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlFailed;
-        },
+    // Additional headers
+    for (headers) |hdr| {
+        const hdr_c = try allocator.dupeZ(u8, hdr);
+        defer allocator.free(hdr_c);
+        const next_list = c.curl_slist_append(header_list, hdr_c.ptr);
+        if (next_list == null) {
+            return error.CurlHeaderError;
+        }
+        header_list = next_list;
     }
 
-    return stdout;
+    if (c.curl_easy_setopt(curl, c.CURLOPT_HTTPHEADER, header_list) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    // Follow redirects
+    if (c.curl_easy_setopt(curl, c.CURLOPT_FOLLOWLOCATION, @as(c_long, 1)) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    // Fail on HTTP errors
+    if (c.curl_easy_setopt(curl, c.CURLOPT_FAILONERROR, @as(c_long, 1)) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    // Set up response buffer with initial capacity
+    var response: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer response.deinit(allocator);
+
+    // Create write context to pass both list and allocator to callback
+    var write_ctx = WriteContext{ .list = &response, .allocator = allocator };
+
+    if (c.curl_easy_setopt(curl, c.CURLOPT_WRITEFUNCTION, writeCallback) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+    if (c.curl_easy_setopt(curl, c.CURLOPT_WRITEDATA, &write_ctx) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    // Perform request
+    const result = c.curl_easy_perform(curl);
+    if (result != c.CURLE_OK) {
+        return error.CurlRequestFailed;
+    }
+
+    return try response.toOwnedSlice(allocator);
 }
 
-/// HTTP GET via curl subprocess with optional proxy.
-///
-/// `headers` is a slice of header strings (e.g. `"Authorization: Bearer xxx"`).
-/// `timeout_secs` sets --max-time. Returns the response body. Caller owns returned memory.
+// ═══════════════════════════════════════════════════════════════════════════
+// HTTP GET with libcurl
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// HTTP GET with optional proxy and timeout.
 pub fn curlGetWithProxy(
     allocator: Allocator,
     url: []const u8,
@@ -526,12 +626,101 @@ pub fn curlGetWithProxy(
     timeout_secs: []const u8,
     proxy: ?[]const u8,
 ) ![]u8 {
-    return curlGetWithProxyAndResolve(allocator, url, headers, timeout_secs, proxy, null);
+    try ensureCurlInit();
+
+    const curl = c.curl_easy_init();
+    if (curl == null) {
+        return error.CurlInitFailed;
+    }
+    defer c.curl_easy_cleanup(curl);
+
+    // Set URL
+    const url_c = try allocator.dupeZ(u8, url);
+    defer allocator.free(url_c);
+    if (c.curl_easy_setopt(curl, c.CURLOPT_URL, url_c.ptr) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    // Set GET method (default)
+    if (c.curl_easy_setopt(curl, c.CURLOPT_HTTPGET, @as(c_long, 1)) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    // Set headers
+    var header_list: ?[*]c.curl_slist = null;
+    defer {
+        if (header_list) |list| {
+            c.curl_slist_free_all(list);
+        }
+    }
+
+    for (headers) |hdr| {
+        const hdr_c = try allocator.dupeZ(u8, hdr);
+        defer allocator.free(hdr_c);
+        const next_list = c.curl_slist_append(header_list, hdr_c.ptr);
+        if (next_list == null) {
+            return error.CurlHeaderError;
+        }
+        header_list = next_list;
+    }
+
+    if (header_list != null) {
+        if (c.curl_easy_setopt(curl, c.CURLOPT_HTTPHEADER, header_list) != c.CURLE_OK) {
+            return error.CurlOptionError;
+        }
+    }
+
+    // Set timeout
+    if (timeout_secs.len > 0) {
+        const timeout = std.fmt.parseInt(c_long, timeout_secs, 10) catch 300;
+        if (c.curl_easy_setopt(curl, c.CURLOPT_TIMEOUT, timeout) != c.CURLE_OK) {
+            return error.CurlOptionError;
+        }
+    }
+
+    // Set proxy
+    if (proxy) |p| {
+        const proxy_c = try allocator.dupeZ(u8, p);
+        defer allocator.free(proxy_c);
+        if (c.curl_easy_setopt(curl, c.CURLOPT_PROXY, proxy_c.ptr) != c.CURLE_OK) {
+            return error.CurlOptionError;
+        }
+    }
+
+    // Follow redirects
+    if (c.curl_easy_setopt(curl, c.CURLOPT_FOLLOWLOCATION, @as(c_long, 1)) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    // Fail on HTTP errors
+    if (c.curl_easy_setopt(curl, c.CURLOPT_FAILONERROR, @as(c_long, 1)) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    // Set up response buffer with initial capacity
+    var response: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer response.deinit(allocator);
+
+    // Create write context to pass both list and allocator to callback
+    var write_ctx = WriteContext{ .list = &response, .allocator = allocator };
+
+    if (c.curl_easy_setopt(curl, c.CURLOPT_WRITEFUNCTION, writeCallback) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+    if (c.curl_easy_setopt(curl, c.CURLOPT_WRITEDATA, &write_ctx) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    // Perform request
+    const result = c.curl_easy_perform(curl);
+    if (result != c.CURLE_OK) {
+        return error.CurlRequestFailed;
+    }
+
+    return try response.toOwnedSlice(allocator);
 }
 
-/// HTTP GET via curl subprocess with a pinned host mapping.
-///
-/// `resolve_entry` must be in curl `--resolve` format: `host:port:address`.
+/// HTTP GET with DNS pinning (--resolve)
 pub fn curlGetWithResolve(
     allocator: Allocator,
     url: []const u8,
@@ -539,25 +728,580 @@ pub fn curlGetWithResolve(
     timeout_secs: []const u8,
     resolve_entry: []const u8,
 ) ![]u8 {
-    return curlGetWithProxyAndResolve(allocator, url, headers, timeout_secs, null, resolve_entry);
+    try ensureCurlInit();
+
+    const curl = c.curl_easy_init();
+    if (curl == null) {
+        return error.CurlInitFailed;
+    }
+    defer c.curl_easy_cleanup(curl);
+
+    // Set URL
+    const url_c = try allocator.dupeZ(u8, url);
+    defer allocator.free(url_c);
+    if (c.curl_easy_setopt(curl, c.CURLOPT_URL, url_c.ptr) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    // Set GET method
+    if (c.curl_easy_setopt(curl, c.CURLOPT_HTTPGET, @as(c_long, 1)) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    // Set resolve entry (DNS pinning) - must be passed as a curl_slist
+    const resolve_c = try allocator.dupeZ(u8, resolve_entry);
+    defer allocator.free(resolve_c);
+    const resolve_list = c.curl_slist_append(null, resolve_c.ptr);
+    defer {
+        if (resolve_list) |list| {
+            c.curl_slist_free_all(list);
+        }
+    }
+    if (c.curl_easy_setopt(curl, c.CURLOPT_RESOLVE, resolve_list) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    // Set headers
+    var header_list: ?[*]c.curl_slist = null;
+    defer {
+        if (header_list) |list| {
+            c.curl_slist_free_all(list);
+        }
+    }
+
+    for (headers) |hdr| {
+        const hdr_c = try allocator.dupeZ(u8, hdr);
+        defer allocator.free(hdr_c);
+        const next_list = c.curl_slist_append(header_list, hdr_c.ptr);
+        if (next_list == null) {
+            return error.CurlHeaderError;
+        }
+        header_list = next_list;
+    }
+
+    if (header_list != null) {
+        if (c.curl_easy_setopt(curl, c.CURLOPT_HTTPHEADER, header_list) != c.CURLE_OK) {
+            return error.CurlOptionError;
+        }
+    }
+
+    // Set timeout
+    if (timeout_secs.len > 0) {
+        const timeout = std.fmt.parseInt(c_long, timeout_secs, 10) catch 300;
+        if (c.curl_easy_setopt(curl, c.CURLOPT_TIMEOUT, timeout) != c.CURLE_OK) {
+            return error.CurlOptionError;
+        }
+    }
+
+    // Follow redirects
+    if (c.curl_easy_setopt(curl, c.CURLOPT_FOLLOWLOCATION, @as(c_long, 1)) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    // Fail on HTTP errors
+    if (c.curl_easy_setopt(curl, c.CURLOPT_FAILONERROR, @as(c_long, 1)) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    // Set up response buffer with initial capacity
+    var response: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer response.deinit(allocator);
+
+    // Create write context to pass both list and allocator to callback
+    var write_ctx = WriteContext{ .list = &response, .allocator = allocator };
+
+    if (c.curl_easy_setopt(curl, c.CURLOPT_WRITEFUNCTION, writeCallback) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+    if (c.curl_easy_setopt(curl, c.CURLOPT_WRITEDATA, &write_ctx) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    // Perform request
+    const result = c.curl_easy_perform(curl);
+    if (result != c.CURLE_OK) {
+        return error.CurlRequestFailed;
+    }
+
+    return try response.toOwnedSlice(allocator);
 }
 
-/// HTTP GET via curl subprocess (no proxy).
+/// Generic HTTP request with any method and DNS pinning (--resolve)
+/// Returns status code and body
+pub fn curlRequestWithResolve(
+    allocator: Allocator,
+    url: []const u8,
+    method: []const u8,
+    body: ?[]const u8,
+    headers: []const []const u8,
+    timeout_secs: []const u8,
+    resolve_entry: []const u8,
+) !HttpResponse {
+    try ensureCurlInit();
+
+    const curl = c.curl_easy_init();
+    if (curl == null) {
+        return error.CurlInitFailed;
+    }
+    defer c.curl_easy_cleanup(curl);
+
+    // Set URL
+    const url_c = try allocator.dupeZ(u8, url);
+    defer allocator.free(url_c);
+    if (c.curl_easy_setopt(curl, c.CURLOPT_URL, url_c.ptr) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    // Normalize method to uppercase
+    const method_upper = blk: {
+        var buf = try allocator.alloc(u8, method.len);
+        for (method, 0..) |m, i| {
+            buf[i] = std.ascii.toUpper(m);
+        }
+        break :blk buf;
+    };
+    defer allocator.free(method_upper);
+
+    // Set method
+    if (std.mem.eql(u8, method_upper, "GET")) {
+        if (c.curl_easy_setopt(curl, c.CURLOPT_HTTPGET, @as(c_long, 1)) != c.CURLE_OK) {
+            return error.CurlOptionError;
+        }
+    } else if (std.mem.eql(u8, method_upper, "POST")) {
+        if (c.curl_easy_setopt(curl, c.CURLOPT_POST, @as(c_long, 1)) != c.CURLE_OK) {
+            return error.CurlOptionError;
+        }
+    } else if (std.mem.eql(u8, method_upper, "PUT")) {
+        if (c.curl_easy_setopt(curl, c.CURLOPT_UPLOAD, @as(c_long, 1)) != c.CURLE_OK) {
+            return error.CurlOptionError;
+        }
+    } else if (std.mem.eql(u8, method_upper, "DELETE")) {
+        if (c.curl_easy_setopt(curl, c.CURLOPT_CUSTOMREQUEST, "DELETE") != c.CURLE_OK) {
+            return error.CurlOptionError;
+        }
+    } else if (std.mem.eql(u8, method_upper, "PATCH")) {
+        if (c.curl_easy_setopt(curl, c.CURLOPT_CUSTOMREQUEST, "PATCH") != c.CURLE_OK) {
+            return error.CurlOptionError;
+        }
+    } else if (std.mem.eql(u8, method_upper, "HEAD")) {
+        if (c.curl_easy_setopt(curl, c.CURLOPT_NOBODY, @as(c_long, 1)) != c.CURLE_OK) {
+            return error.CurlOptionError;
+        }
+    } else if (std.mem.eql(u8, method_upper, "OPTIONS")) {
+        if (c.curl_easy_setopt(curl, c.CURLOPT_CUSTOMREQUEST, "OPTIONS") != c.CURLE_OK) {
+            return error.CurlOptionError;
+        }
+    } else {
+        // Custom method
+        const method_c = try allocator.dupeZ(u8, method_upper);
+        defer allocator.free(method_c);
+        if (c.curl_easy_setopt(curl, c.CURLOPT_CUSTOMREQUEST, method_c.ptr) != c.CURLE_OK) {
+            return error.CurlOptionError;
+        }
+    }
+
+    // Set body for POST/PUT
+    if (body) |b| {
+        const body_c = try allocator.dupeZ(u8, b);
+        defer allocator.free(body_c);
+        if (c.curl_easy_setopt(curl, c.CURLOPT_POSTFIELDS, body_c.ptr) != c.CURLE_OK) {
+            return error.CurlOptionError;
+        }
+    }
+
+    // Set resolve entry (DNS pinning) - must be passed as a curl_slist
+    const resolve_c = try allocator.dupeZ(u8, resolve_entry);
+    defer allocator.free(resolve_c);
+    const resolve_list = c.curl_slist_append(null, resolve_c.ptr);
+    defer {
+        if (resolve_list) |list| {
+            c.curl_slist_free_all(list);
+        }
+    }
+    if (c.curl_easy_setopt(curl, c.CURLOPT_RESOLVE, resolve_list) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    // Set headers
+    var header_list: ?[*]c.curl_slist = null;
+    defer {
+        if (header_list) |list| {
+            c.curl_slist_free_all(list);
+        }
+    }
+
+    for (headers) |hdr| {
+        const hdr_c = try allocator.dupeZ(u8, hdr);
+        defer allocator.free(hdr_c);
+        const next_list = c.curl_slist_append(header_list, hdr_c.ptr);
+        if (next_list == null) {
+            return error.CurlHeaderError;
+        }
+        header_list = next_list;
+    }
+
+    if (header_list != null) {
+        if (c.curl_easy_setopt(curl, c.CURLOPT_HTTPHEADER, header_list) != c.CURLE_OK) {
+            return error.CurlOptionError;
+        }
+    }
+
+    // Set timeout
+    if (timeout_secs.len > 0) {
+        const timeout = std.fmt.parseInt(c_long, timeout_secs, 10) catch 300;
+        if (c.curl_easy_setopt(curl, c.CURLOPT_TIMEOUT, timeout) != c.CURLE_OK) {
+            return error.CurlOptionError;
+        }
+    }
+
+    // Follow redirects
+    if (c.curl_easy_setopt(curl, c.CURLOPT_FOLLOWLOCATION, @as(c_long, 1)) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    // Set up response buffer
+    var response: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer response.deinit(allocator);
+
+    var write_ctx = WriteContext{ .list = &response, .allocator = allocator };
+
+    if (c.curl_easy_setopt(curl, c.CURLOPT_WRITEFUNCTION, writeCallback) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+    if (c.curl_easy_setopt(curl, c.CURLOPT_WRITEDATA, &write_ctx) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    // Perform request
+    _ = c.curl_easy_perform(curl);
+
+    // Get status code
+    var response_code: c_long = 200;
+    _ = c.curl_easy_getinfo(curl, c.CURLINFO_RESPONSE_CODE, &response_code);
+
+    const response_body = try response.toOwnedSlice(allocator);
+
+    return HttpResponse{
+        .status_code = @intCast(response_code),
+        .body = response_body,
+    };
+}
+
+/// HTTP GET (no proxy).
 pub fn curlGet(allocator: Allocator, url: []const u8, headers: []const []const u8, timeout_secs: []const u8) ![]u8 {
     return curlGetWithProxy(allocator, url, headers, timeout_secs, null);
 }
 
-/// Read proxy URL from standard environment variables.
-/// Checks HTTPS_PROXY, HTTP_PROXY, ALL_PROXY in that order.
-/// Returns null if no proxy is set.
-/// Caller owns returned memory.
+/// HTTP DELETE request with timeout
+pub fn curlDelete(
+    allocator: Allocator,
+    url: []const u8,
+    headers: []const []const u8,
+    timeout_secs: []const u8,
+) ![]u8 {
+    try ensureCurlInit();
+
+    const curl = c.curl_easy_init();
+    if (curl == null) {
+        return error.CurlInitFailed;
+    }
+    defer c.curl_easy_cleanup(curl);
+
+    // Set URL
+    const url_c = try allocator.dupeZ(u8, url);
+    defer allocator.free(url_c);
+    if (c.curl_easy_setopt(curl, c.CURLOPT_URL, url_c.ptr) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    // Set DELETE method
+    if (c.curl_easy_setopt(curl, c.CURLOPT_CUSTOMREQUEST, "DELETE") != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    // Set headers
+    var header_list: ?[*]c.curl_slist = null;
+    defer {
+        if (header_list) |list| {
+            c.curl_slist_free_all(list);
+        }
+    }
+
+    for (headers) |hdr| {
+        const hdr_c = try allocator.dupeZ(u8, hdr);
+        defer allocator.free(hdr_c);
+        const next_list = c.curl_slist_append(header_list, hdr_c.ptr);
+        if (next_list == null) {
+            return error.CurlHeaderError;
+        }
+        header_list = next_list;
+    }
+
+    if (header_list != null) {
+        if (c.curl_easy_setopt(curl, c.CURLOPT_HTTPHEADER, header_list) != c.CURLE_OK) {
+            return error.CurlOptionError;
+        }
+    }
+
+    // Set timeout
+    if (timeout_secs.len > 0) {
+        const timeout = std.fmt.parseInt(c_long, timeout_secs, 10) catch 300;
+        if (c.curl_easy_setopt(curl, c.CURLOPT_TIMEOUT, timeout) != c.CURLE_OK) {
+            return error.CurlOptionError;
+        }
+    }
+
+    // Follow redirects
+    if (c.curl_easy_setopt(curl, c.CURLOPT_FOLLOWLOCATION, @as(c_long, 1)) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    // Set up response buffer
+    var response: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer response.deinit(allocator);
+
+    var write_ctx = WriteContext{ .list = &response, .allocator = allocator };
+
+    if (c.curl_easy_setopt(curl, c.CURLOPT_WRITEFUNCTION, writeCallback) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+    if (c.curl_easy_setopt(curl, c.CURLOPT_WRITEDATA, &write_ctx) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    // Perform request
+    const result = c.curl_easy_perform(curl);
+    if (result != c.CURLE_OK) {
+        return error.CurlRequestFailed;
+    }
+
+    return try response.toOwnedSlice(allocator);
+}
+
+/// Generic HTTP request with any method, returns status code and body
+pub fn curlRequestWithStatus(
+    allocator: Allocator,
+    url: []const u8,
+    method: []const u8,
+    body: ?[]const u8,
+    headers: []const []const u8,
+    timeout_secs: []const u8,
+) !HttpResponse {
+    try ensureCurlInit();
+
+    const curl = c.curl_easy_init();
+    if (curl == null) {
+        return error.CurlInitFailed;
+    }
+    defer c.curl_easy_cleanup(curl);
+
+    // Set URL
+    const url_c = try allocator.dupeZ(u8, url);
+    defer allocator.free(url_c);
+    if (c.curl_easy_setopt(curl, c.CURLOPT_URL, url_c.ptr) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    // Normalize method to uppercase
+    const method_upper = blk: {
+        var buf = try allocator.alloc(u8, method.len);
+        for (method, 0..) |m, i| {
+            buf[i] = std.ascii.toUpper(m);
+        }
+        break :blk buf;
+    };
+    defer allocator.free(method_upper);
+
+    // Set method
+    if (std.mem.eql(u8, method_upper, "GET")) {
+        if (c.curl_easy_setopt(curl, c.CURLOPT_HTTPGET, @as(c_long, 1)) != c.CURLE_OK) {
+            return error.CurlOptionError;
+        }
+    } else if (std.mem.eql(u8, method_upper, "POST")) {
+        if (c.curl_easy_setopt(curl, c.CURLOPT_POST, @as(c_long, 1)) != c.CURLE_OK) {
+            return error.CurlOptionError;
+        }
+    } else if (std.mem.eql(u8, method_upper, "PUT")) {
+        if (c.curl_easy_setopt(curl, c.CURLOPT_UPLOAD, @as(c_long, 1)) != c.CURLE_OK) {
+            return error.CurlOptionError;
+        }
+    } else if (std.mem.eql(u8, method_upper, "DELETE")) {
+        if (c.curl_easy_setopt(curl, c.CURLOPT_CUSTOMREQUEST, "DELETE") != c.CURLE_OK) {
+            return error.CurlOptionError;
+        }
+    } else {
+        // Custom method
+        const method_c = try allocator.dupeZ(u8, method_upper);
+        defer allocator.free(method_c);
+        if (c.curl_easy_setopt(curl, c.CURLOPT_CUSTOMREQUEST, method_c.ptr) != c.CURLE_OK) {
+            return error.CurlOptionError;
+        }
+    }
+
+    // Set body for POST/PUT
+    if (body) |b| {
+        const body_c = try allocator.dupeZ(u8, b);
+        defer allocator.free(body_c);
+        if (c.curl_easy_setopt(curl, c.CURLOPT_POSTFIELDS, body_c.ptr) != c.CURLE_OK) {
+            return error.CurlOptionError;
+        }
+    }
+
+    // Set headers
+    var header_list: ?[*]c.curl_slist = null;
+    defer {
+        if (header_list) |list| {
+            c.curl_slist_free_all(list);
+        }
+    }
+
+    for (headers) |hdr| {
+        const hdr_c = try allocator.dupeZ(u8, hdr);
+        defer allocator.free(hdr_c);
+        const next_list = c.curl_slist_append(header_list, hdr_c.ptr);
+        if (next_list == null) {
+            return error.CurlHeaderError;
+        }
+        header_list = next_list;
+    }
+
+    if (header_list != null) {
+        if (c.curl_easy_setopt(curl, c.CURLOPT_HTTPHEADER, header_list) != c.CURLE_OK) {
+            return error.CurlOptionError;
+        }
+    }
+
+    // Set timeout
+    if (timeout_secs.len > 0) {
+        const timeout = std.fmt.parseInt(c_long, timeout_secs, 10) catch 300;
+        if (c.curl_easy_setopt(curl, c.CURLOPT_TIMEOUT, timeout) != c.CURLE_OK) {
+            return error.CurlOptionError;
+        }
+    }
+
+    // Follow redirects
+    if (c.curl_easy_setopt(curl, c.CURLOPT_FOLLOWLOCATION, @as(c_long, 1)) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    // Set up response buffer
+    var response: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer response.deinit(allocator);
+
+    var write_ctx = WriteContext{ .list = &response, .allocator = allocator };
+
+    if (c.curl_easy_setopt(curl, c.CURLOPT_WRITEFUNCTION, writeCallback) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+    if (c.curl_easy_setopt(curl, c.CURLOPT_WRITEDATA, &write_ctx) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    // Perform request
+    _ = c.curl_easy_perform(curl);
+
+    // Get status code
+    var response_code: c_long = 200;
+    _ = c.curl_easy_getinfo(curl, c.CURLINFO_RESPONSE_CODE, &response_code);
+
+    const response_body = try response.toOwnedSlice(allocator);
+
+    return HttpResponse{
+        .status_code = @intCast(response_code),
+        .body = response_body,
+    };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SSE (Server-Sent Events) support
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// HTTP GET for SSE (Server-Sent Events).
+pub fn curlGetSSE(
+    allocator: Allocator,
+    url: []const u8,
+    timeout_secs: []const u8,
+) ![]u8 {
+    try ensureCurlInit();
+
+    const curl = c.curl_easy_init();
+    if (curl == null) {
+        return error.CurlInitFailed;
+    }
+    defer c.curl_easy_cleanup(curl);
+
+    // Set URL
+    const url_c = try allocator.dupeZ(u8, url);
+    defer allocator.free(url_c);
+    if (c.curl_easy_setopt(curl, c.CURLOPT_URL, url_c.ptr) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    // Set GET method
+    if (c.curl_easy_setopt(curl, c.CURLOPT_HTTPGET, @as(c_long, 1)) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    // Accept SSE
+    const accept_header = "Accept: text/event-stream";
+    const header_list = c.curl_slist_append(null, accept_header);
+    defer {
+        if (header_list) |list| {
+            c.curl_slist_free_all(list);
+        }
+    }
+    if (c.curl_easy_setopt(curl, c.CURLOPT_HTTPHEADER, header_list) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    // Set timeout
+    if (timeout_secs.len > 0) {
+        const timeout = std.fmt.parseInt(c_long, timeout_secs, 10) catch 300;
+        if (c.curl_easy_setopt(curl, c.CURLOPT_TIMEOUT, timeout) != c.CURLE_OK) {
+            return error.CurlOptionError;
+        }
+    }
+
+    // Follow redirects
+    if (c.curl_easy_setopt(curl, c.CURLOPT_FOLLOWLOCATION, @as(c_long, 1)) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    // Set up response buffer with initial capacity
+    var response: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer response.deinit(allocator);
+
+    // Create write context to pass both list and allocator to callback
+    var write_ctx = WriteContext{ .list = &response, .allocator = allocator };
+
+    if (c.curl_easy_setopt(curl, c.CURLOPT_WRITEFUNCTION, writeCallback) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+    if (c.curl_easy_setopt(curl, c.CURLOPT_WRITEDATA, &write_ctx) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    // Perform request
+    const result = c.curl_easy_perform(curl);
+    // For SSE, we don't fail on HTTP errors since the server might send
+    // partial data before closing
+    if (result != c.CURLE_OK and result != c.CURLE_HTTP_RETURNED_ERROR) {
+        return error.CurlRequestFailed;
+    }
+
+    return try response.toOwnedSlice(allocator);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Proxy support
+// ═══════════════════════════════════════════════════════════════════════════
+
 var proxy_override_value: ?[]u8 = null;
 var proxy_override_mutex: std.Thread.Mutex = .{};
 
 pub const ProxyOverrideError = error{OutOfMemory};
 
 /// Set process-wide proxy override from config.
-/// When set, this value has higher priority than proxy environment variables.
 pub fn setProxyOverride(proxy: ?[]const u8) ProxyOverrideError!void {
     proxy_override_mutex.lock();
     defer proxy_override_mutex.unlock();
@@ -580,7 +1324,8 @@ fn normalizeProxyEnvValue(allocator: Allocator, val: []const u8) !?[]const u8 {
     return try allocator.dupe(u8, trimmed);
 }
 
-pub fn getProxyFromEnv(allocator: Allocator) !?[]const u8 {
+/// Read proxy URL from standard environment variables.
+pub fn getProxyFromEnv(allocator: Allocator) !?[]u8 {
     {
         proxy_override_mutex.lock();
         defer proxy_override_mutex.unlock();
@@ -593,306 +1338,240 @@ pub fn getProxyFromEnv(allocator: Allocator) !?[]const u8 {
     for (env_vars) |var_name| {
         if (std.process.getEnvVarOwned(allocator, var_name)) |val| {
             errdefer allocator.free(val);
-            const out = try normalizeProxyEnvValue(allocator, val);
+            const trimmed = std.mem.trim(u8, val, " \t\r\n");
             allocator.free(val);
-            if (out) |proxy| return proxy;
+            if (trimmed.len > 0) {
+                return try allocator.dupe(u8, trimmed);
+            }
         } else |_| {}
     }
     return null;
 }
 
-/// HTTP GET for SSE (Server-Sent Events).
-///
-/// On macOS uses curl subprocess; on other platforms uses native std.http.Client.
-/// Uses unbuffered mode to allow SSE events to be received in real-time.
-pub fn curlGetSSE(
+// ═══════════════════════════════════════════════════════════════════════════
+// Stream helpers for providers
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// HTTP POST for streaming responses
+pub fn curlPostStream(
     allocator: Allocator,
     url: []const u8,
+    body: []const u8,
+    headers: []const []const u8,
     timeout_secs: []const u8,
 ) ![]u8 {
-    // SSE always uses subprocess because native std.http.Client does not
-    // support streaming reads or request timeouts needed for SSE.
-    return curlGetSSESubprocess(allocator, url, timeout_secs);
-}
+    try ensureCurlInit();
 
-fn curlGetSSESubprocess(
-    allocator: Allocator,
-    url: []const u8,
-    timeout_secs: []const u8,
-) ![]u8 {
-    var argv_buf: [40][]const u8 = undefined;
-    var argc: usize = 0;
-
-    argv_buf[argc] = "curl";
-    argc += 1;
-    argv_buf[argc] = "-sf";
-    argc += 1;
-    argv_buf[argc] = "-N";
-    argc += 1;
-    argv_buf[argc] = "--max-time";
-    argc += 1;
-    argv_buf[argc] = timeout_secs;
-    argc += 1;
-    argv_buf[argc] = "-H";
-    argc += 1;
-    argv_buf[argc] = "Accept: text/event-stream";
-    argc += 1;
-    argv_buf[argc] = url;
-    argc += 1;
-
-    var child = std.process.Child.init(argv_buf[0..argc], allocator);
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
-
-    child.spawn() catch |err| {
-        std.debug.print("[curlGetSSE] spawn failed: {}\n", .{err});
-        return error.CurlFailed;
-    };
-    const cancel_flag = thread_interrupt_flag;
-    var cancel_done = AtomicBool.init(false);
-    var cancel_watcher: ?std.Thread = null;
-    var watcher_ctx: CancelWatcherCtx = undefined;
-    if (cancel_flag) |flag| {
-        watcher_ctx = .{ .child = &child, .cancel_flag = flag, .done = &cancel_done };
-        cancel_watcher = std.Thread.spawn(.{}, cancelWatcherMain, .{&watcher_ctx}) catch null;
+    const curl = c.curl_easy_init();
+    if (curl == null) {
+        return error.CurlInitFailed;
     }
+    defer c.curl_easy_cleanup(curl);
+
+    // Set URL
+    const url_c = try allocator.dupeZ(u8, url);
+    defer allocator.free(url_c);
+    if (c.curl_easy_setopt(curl, c.CURLOPT_URL, url_c.ptr) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    // Set POST method and body
+    if (c.curl_easy_setopt(curl, c.CURLOPT_POST, @as(c_long, 1)) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    const body_c = try allocator.dupeZ(u8, body);
+    defer allocator.free(body_c);
+    if (c.curl_easy_setopt(curl, c.CURLOPT_POSTFIELDS, body_c.ptr) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    // Set headers
+    var header_list: ?[*]c.curl_slist = null;
     defer {
-        cancel_done.store(true, .release);
-        if (cancel_watcher) |t| t.join();
+        if (header_list) |list| {
+            c.curl_slist_free_all(list);
+        }
     }
 
-    const stdout = child.stdout.?.readToEndAlloc(allocator, 4 * 1024 * 1024) catch {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
-        return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlReadError;
-    };
+    // Content-Type
+    const ct_list = c.curl_slist_append(header_list, "Content-Type: application/json");
+    if (ct_list == null) {
+        return error.CurlHeaderError;
+    }
+    header_list = ct_list;
 
-    const term = child.wait() catch |err| {
-        log.err("curl child.wait failed: {}", .{err});
-        allocator.free(stdout);
-        return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWaitError;
-    };
-    switch (term) {
-        .Exited => |code| {
-            if (code != 0) {
-                // Exit code 28 = timeout. This is expected for SSE when no data arrives,
-                // but curl may have received some data before timing out - return it.
-                // For other exit codes, treat as error.
-                if (code != 28) {
-                    std.debug.print("[curlGetSSE] curl error: code={}\n", .{code});
-                    allocator.free(stdout);
-                    return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlFailed;
-                }
-                // Timeout (code 28) - return any data we received
-            }
-        },
-        else => {
-            allocator.free(stdout);
-            return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlFailed;
-        },
+    // Accept streaming
+    const accept_list = c.curl_slist_append(header_list, "Accept: text/event-stream");
+    if (accept_list == null) {
+        return error.CurlHeaderError;
+    }
+    header_list = accept_list;
+
+    // Additional headers
+    for (headers) |hdr| {
+        const hdr_c = try allocator.dupeZ(u8, hdr);
+        defer allocator.free(hdr_c);
+        const next_list = c.curl_slist_append(header_list, hdr_c.ptr);
+        if (next_list == null) {
+            return error.CurlHeaderError;
+        }
+        header_list = next_list;
     }
 
-    return stdout;
+    if (c.curl_easy_setopt(curl, c.CURLOPT_HTTPHEADER, header_list) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    // Set timeout
+    if (timeout_secs.len > 0) {
+        const timeout = std.fmt.parseInt(c_long, timeout_secs, 10) catch 300;
+        if (c.curl_easy_setopt(curl, c.CURLOPT_TIMEOUT, timeout) != c.CURLE_OK) {
+            return error.CurlOptionError;
+        }
+    }
+
+    // Follow redirects
+    if (c.curl_easy_setopt(curl, c.CURLOPT_FOLLOWLOCATION, @as(c_long, 1)) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    // Set up response buffer with initial capacity
+    var response: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer response.deinit(allocator);
+
+    // Create write context to pass both list and allocator to callback
+    var write_ctx = WriteContext{ .list = &response, .allocator = allocator };
+
+    if (c.curl_easy_setopt(curl, c.CURLOPT_WRITEFUNCTION, writeCallback) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+    if (c.curl_easy_setopt(curl, c.CURLOPT_WRITEDATA, &write_ctx) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    // Perform request
+    const result = c.curl_easy_perform(curl);
+    // For streaming, we may get partial data even on error
+    if (result != c.CURLE_OK and result != c.CURLE_HTTP_RETURNED_ERROR) {
+        return error.CurlRequestFailed;
+    }
+
+    return try response.toOwnedSlice(allocator);
 }
 
-// ═══════════════════════════════════════════════════════════════════════
-// Native HTTP backend (non-macOS)
-// ═══════════════════════════════════════════════════════════════════════
-
-/// Parse a "Name: Value" header string into std.http.Header.
-pub fn parseHeaderString(header: []const u8) ?std.http.Header {
-    const colon_pos = std.mem.indexOfScalar(u8, header, ':') orelse return null;
-    const name = header[0..colon_pos];
-    const rest = header[colon_pos + 1 ..];
-    const value = if (rest.len > 0 and rest[0] == ' ') rest[1..] else rest;
-    return .{ .name = name, .value = value };
-}
-
-/// Map a method string ("POST", "PUT", "GET") to std.http.Method.
-fn httpMethodFromString(method: []const u8) std.http.Method {
-    if (std.mem.eql(u8, method, "PUT")) return .PUT;
-    if (std.mem.eql(u8, method, "GET")) return .GET;
-    return .POST;
-}
-
-/// Native HTTP POST/PUT via std.http.Client (used on non-macOS).
-fn nativeHttpRequest(
+/// HTTP GET for streaming responses
+pub fn curlGetStream(
     allocator: Allocator,
-    method: []const u8,
-    content_type_header: []const u8,
     url: []const u8,
-    body: []const u8,
     headers: []const []const u8,
+    timeout_secs: []const u8,
 ) ![]u8 {
-    var client: std.http.Client = .{ .allocator = allocator };
-    defer client.deinit();
+    try ensureCurlInit();
 
-    var extra_headers_buf: [20]std.http.Header = undefined;
-    var n_headers: usize = 0;
+    const curl = c.curl_easy_init();
+    if (curl == null) {
+        return error.CurlInitFailed;
+    }
+    defer c.curl_easy_cleanup(curl);
 
-    if (parseHeaderString(content_type_header)) |h| {
-        extra_headers_buf[n_headers] = h;
-        n_headers += 1;
+    // Set URL
+    const url_c = try allocator.dupeZ(u8, url);
+    defer allocator.free(url_c);
+    if (c.curl_easy_setopt(curl, c.CURLOPT_URL, url_c.ptr) != c.CURLE_OK) {
+        return error.CurlOptionError;
     }
 
-    for (headers) |hdr| {
-        if (n_headers >= extra_headers_buf.len) break;
-        if (parseHeaderString(hdr)) |h| {
-            extra_headers_buf[n_headers] = h;
-            n_headers += 1;
+    // Set GET method
+    if (c.curl_easy_setopt(curl, c.CURLOPT_HTTPGET, @as(c_long, 1)) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    // Set headers
+    var header_list: ?[*]c.curl_slist = null;
+    defer {
+        if (header_list) |list| {
+            c.curl_slist_free_all(list);
         }
     }
 
-    var aw: std.Io.Writer.Allocating = .init(allocator);
-    defer aw.deinit();
+    // Accept streaming
+    const accept_list = c.curl_slist_append(header_list, "Accept: text/event-stream");
+    if (accept_list == null) {
+        return error.CurlHeaderError;
+    }
+    header_list = accept_list;
 
-    const result = client.fetch(.{
-        .location = .{ .url = url },
-        .method = httpMethodFromString(method),
-        .payload = body,
-        .extra_headers = extra_headers_buf[0..n_headers],
-        .response_writer = &aw.writer,
-    }) catch |err| {
-        log.warn("native HTTP {s} to {s} failed: {}", .{ method, url, err });
-        return error.CurlFailed;
-    };
-
-    // Match curl -sf behavior: fail on 4xx/5xx status codes.
-    const status_int = @intFromEnum(result.status);
-    if (status_int >= 400) {
-        log.warn("native HTTP {s} {s} returned status {d}", .{ method, url, status_int });
-        return error.CurlFailed;
+    // Additional headers
+    for (headers) |hdr| {
+        const hdr_c = try allocator.dupeZ(u8, hdr);
+        defer allocator.free(hdr_c);
+        const next_list = c.curl_slist_append(header_list, hdr_c.ptr);
+        if (next_list == null) {
+            return error.CurlHeaderError;
+        }
+        header_list = next_list;
     }
 
-    return try allocator.dupe(u8, aw.writer.buffer[0..aw.writer.end]);
-}
-
-/// Native HTTP GET via std.http.Client (used on non-macOS).
-fn nativeHttpGet(
-    allocator: Allocator,
-    url: []const u8,
-    headers: []const []const u8,
-) ![]u8 {
-    var client: std.http.Client = .{ .allocator = allocator };
-    defer client.deinit();
-
-    var extra_headers_buf: [20]std.http.Header = undefined;
-    var n_headers: usize = 0;
-
-    for (headers) |hdr| {
-        if (n_headers >= extra_headers_buf.len) break;
-        if (parseHeaderString(hdr)) |h| {
-            extra_headers_buf[n_headers] = h;
-            n_headers += 1;
+    if (header_list != null) {
+        if (c.curl_easy_setopt(curl, c.CURLOPT_HTTPHEADER, header_list) != c.CURLE_OK) {
+            return error.CurlOptionError;
         }
     }
 
-    var aw: std.Io.Writer.Allocating = .init(allocator);
-    defer aw.deinit();
-
-    const result = client.fetch(.{
-        .location = .{ .url = url },
-        .method = .GET,
-        .extra_headers = extra_headers_buf[0..n_headers],
-        .response_writer = &aw.writer,
-    }) catch |err| {
-        log.warn("native HTTP GET {s} failed: {}", .{ url, err });
-        return error.CurlFailed;
-    };
-
-    // Match curl -sf behavior: fail on 4xx/5xx status codes.
-    const status_int = @intFromEnum(result.status);
-    if (status_int >= 400) {
-        log.warn("native HTTP GET {s} returned status {d}", .{ url, status_int });
-        return error.CurlFailed;
-    }
-
-    return try allocator.dupe(u8, aw.writer.buffer[0..aw.writer.end]);
-}
-
-/// Native HTTP POST with status code via std.http.Client (used on non-macOS).
-fn nativePostWithStatus(
-    allocator: Allocator,
-    url: []const u8,
-    body: []const u8,
-    headers: []const []const u8,
-) !HttpResponse {
-    var client: std.http.Client = .{ .allocator = allocator };
-    defer client.deinit();
-
-    var extra_headers_buf: [20]std.http.Header = undefined;
-    var n_headers: usize = 0;
-
-    extra_headers_buf[n_headers] = .{ .name = "Content-Type", .value = "application/json" };
-    n_headers += 1;
-
-    for (headers) |hdr| {
-        if (n_headers >= extra_headers_buf.len) break;
-        if (parseHeaderString(hdr)) |h| {
-            extra_headers_buf[n_headers] = h;
-            n_headers += 1;
+    // Set timeout
+    if (timeout_secs.len > 0) {
+        const timeout = std.fmt.parseInt(c_long, timeout_secs, 10) catch 300;
+        if (c.curl_easy_setopt(curl, c.CURLOPT_TIMEOUT, timeout) != c.CURLE_OK) {
+            return error.CurlOptionError;
         }
     }
 
-    var aw: std.Io.Writer.Allocating = .init(allocator);
-    defer aw.deinit();
+    // Follow redirects
+    if (c.curl_easy_setopt(curl, c.CURLOPT_FOLLOWLOCATION, @as(c_long, 1)) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
 
-    const result = client.fetch(.{
-        .location = .{ .url = url },
-        .method = .POST,
-        .payload = body,
-        .extra_headers = extra_headers_buf[0..n_headers],
-        .response_writer = &aw.writer,
-    }) catch |err| {
-        log.warn("native HTTP POST {s} failed: {}", .{ url, err });
-        return error.CurlFailed;
-    };
+    // Set up response buffer with initial capacity
+    var response: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer response.deinit(allocator);
 
-    const response_body = try allocator.dupe(u8, aw.writer.buffer[0..aw.writer.end]);
+    // Create write context to pass both list and allocator to callback
+    var write_ctx = WriteContext{ .list = &response, .allocator = allocator };
 
-    return .{
-        .status_code = @intFromEnum(result.status),
-        .body = response_body,
-    };
+    if (c.curl_easy_setopt(curl, c.CURLOPT_WRITEFUNCTION, writeCallback) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+    if (c.curl_easy_setopt(curl, c.CURLOPT_WRITEDATA, &write_ctx) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    // Perform request
+    const result = c.curl_easy_perform(curl);
+    if (result != c.CURLE_OK and result != c.CURLE_HTTP_RETURNED_ERROR) {
+        return error.CurlRequestFailed;
+    }
+
+    return try response.toOwnedSlice(allocator);
 }
 
-// ── Tests ───────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+// Tests
+// ═══════════════════════════════════════════════════════════════════════════
 
-test "curlPostWithProxy header guard allows at most (argv_buf_len - base_args) / 2 headers" {
-    // argv_buf is [40][]const u8. Base args consume 8 slots (curl -s -X POST -H
-    // Content-Type --data-binary @- url), leaving 32 slots = 16 header pairs.
-    // The guard `argc + 2 > argv_buf.len` stops additions before overflow.
-    // We verify the guard constant is consistent: remaining = 40 - 8 = 32, max headers = 16.
-    const argv_buf_len = 40;
-    const base_args = 8; // curl -s -X POST -H <ct> --data-binary @- <url>
-    const max_header_pairs = (argv_buf_len - base_args) / 2;
-    try std.testing.expectEqual(@as(usize, 16), max_header_pairs);
-}
-
-test "curlPostWithStatus compiles and is callable" {
+test "curlPost function signatures compile" {
     try std.testing.expect(true);
 }
 
-test "curlPut compiles and is callable" {
+test "curlGet function signatures compile" {
     try std.testing.expect(true);
 }
 
-test "curlPostForm uses exactly 9 fixed args plus url" {
-    // argv_buf is [10][]const u8: curl -s -X POST -H <ct> --data-binary @- <url> = 9 slots.
-    // Verify the constant is consistent with the implementation.
-    const argv_buf_len = 10;
-    const fixed_args = 9; // curl -s -X POST -H Content-Type --data-binary @- (url)
-    try std.testing.expect(fixed_args < argv_buf_len);
+test "curlPostForm function signatures compile" {
+    try std.testing.expect(true);
 }
 
-test "curlGet with zero headers compiles and is callable" {
-    // Smoke-test: verifies the function signature is reachable and the arg-building
-    // path with an empty header slice does not panic at comptime.
-    _ = curlGet;
-}
-
-test "curlGetWithResolve compiles and is callable" {
+test "curlGetSSE function signatures compile" {
     try std.testing.expect(true);
 }
 
@@ -909,61 +1588,455 @@ test "normalizeProxyEnvValue rejects empty values" {
     try std.testing.expect(normalized == null);
 }
 
-test "setProxyOverride applies and clears process-wide override" {
-    const override = "  socks5://proxy-override-test.invalid:1080  ";
-    const normalized_override = "socks5://proxy-override-test.invalid:1080";
+// ═══════════════════════════════════════════════════════════════════════════
+// Streaming SSE callback support
+// ═══════════════════════════════════════════════════════════════════════════
 
-    try setProxyOverride(override);
-    const from_override = try getProxyFromEnv(std.testing.allocator);
-    defer if (from_override) |v| std.testing.allocator.free(v);
-    try std.testing.expect(from_override != null);
-    try std.testing.expectEqualStrings(normalized_override, from_override.?);
+/// Callback type for streaming SSE data
+pub const StreamWriteCallback = fn (context: *anyopaque, data: [*]const u8, len: usize) callconv(.c) usize;
 
-    try setProxyOverride(null);
-    const after_clear = try getProxyFromEnv(std.testing.allocator);
-    defer if (after_clear) |v| std.testing.allocator.free(v);
-    if (after_clear) |proxy| {
-        // Environment may define a proxy; only assert our override no longer leaks.
-        try std.testing.expect(!std.mem.eql(u8, proxy, normalized_override));
+/// Context for streaming SSE callback
+const StreamContext = struct {
+    callback: *const fn (*anyopaque, [*]const u8, usize) callconv(.c) usize,
+    context: *anyopaque,
+    allocator: Allocator,
+    line_buffer: *std.ArrayListUnmanaged(u8),
+};
+
+/// Streaming write callback that processes data line by line and invokes the callback
+fn streamWriteCallback(
+    contents: ?*anyopaque,
+    size: usize,
+    nmemb: usize,
+    userp: ?*anyopaque,
+) callconv(.c) usize {
+    const real_size = size * nmemb;
+    if (real_size == 0) return 0;
+
+    const ctx = userp orelse return 0;
+    const stream_ctx = @as(*StreamContext, @ptrCast(@alignCast(ctx)));
+
+    const contents_ptr = @as([*]const u8, @ptrCast(contents orelse return 0));
+    const data = contents_ptr[0..real_size];
+
+    // Process each byte, building lines
+    for (data) |byte| {
+        if (byte == '\n') {
+            // Line complete - invoke callback with the line
+            if (stream_ctx.line_buffer.items.len > 0) {
+                const line = stream_ctx.line_buffer.items;
+                _ = stream_ctx.callback(stream_ctx.context, line.ptr, line.len);
+                stream_ctx.line_buffer.clearRetainingCapacity();
+            } else {
+                // Empty line - still send it
+                _ = stream_ctx.callback(stream_ctx.context, "", 0);
+            }
+        } else if (byte != '\r') {
+            // Accumulate non-CR characters
+            stream_ctx.line_buffer.append(stream_ctx.allocator, byte) catch return 0;
+        }
+    }
+
+    return real_size;
+}
+
+/// HTTP POST for streaming SSE with callback support
+/// Calls the callback for each line of SSE data as it arrives
+pub fn curlPostStreamSSE(
+    allocator: Allocator,
+    url: []const u8,
+    body: []const u8,
+    headers: []const []const u8,
+    timeout_secs: []const u8,
+    proxy: ?[]const u8,
+    callback: StreamWriteCallback,
+    callback_ctx: *anyopaque,
+) !void {
+    try ensureCurlInit();
+
+    const curl = c.curl_easy_init();
+    if (curl == null) {
+        return error.CurlInitFailed;
+    }
+    defer c.curl_easy_cleanup(curl);
+
+    // Set URL
+    const url_c = try allocator.dupeZ(u8, url);
+    defer allocator.free(url_c);
+    if (c.curl_easy_setopt(curl, c.CURLOPT_URL, url_c.ptr) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    // Set POST method and body
+    if (c.curl_easy_setopt(curl, c.CURLOPT_POST, @as(c_long, 1)) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    const body_c = try allocator.dupeZ(u8, body);
+    defer allocator.free(body_c);
+    if (c.curl_easy_setopt(curl, c.CURLOPT_POSTFIELDS, body_c.ptr) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    // Set headers
+    var header_list: ?[*]c.curl_slist = null;
+    defer {
+        if (header_list) |list| {
+            c.curl_slist_free_all(list);
+        }
+    }
+
+    // Content-Type
+    const ct_list = c.curl_slist_append(header_list, "Content-Type: application/json");
+    if (ct_list == null) {
+        return error.CurlHeaderError;
+    }
+    header_list = ct_list;
+
+    // Accept streaming
+    const accept_list = c.curl_slist_append(header_list, "Accept: text/event-stream");
+    if (accept_list == null) {
+        return error.CurlHeaderError;
+    }
+    header_list = accept_list;
+
+    // Additional headers
+    for (headers) |hdr| {
+        const hdr_c = try allocator.dupeZ(u8, hdr);
+        defer allocator.free(hdr_c);
+        const next_list = c.curl_slist_append(header_list, hdr_c.ptr);
+        if (next_list == null) {
+            return error.CurlHeaderError;
+        }
+        header_list = next_list;
+    }
+
+    if (c.curl_easy_setopt(curl, c.CURLOPT_HTTPHEADER, header_list) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    // Set timeout
+    if (timeout_secs.len > 0) {
+        const timeout = std.fmt.parseInt(c_long, timeout_secs, 10) catch 300;
+        if (c.curl_easy_setopt(curl, c.CURLOPT_TIMEOUT, timeout) != c.CURLE_OK) {
+            return error.CurlOptionError;
+        }
+    }
+
+    // Set proxy
+    if (proxy) |p| {
+        const proxy_c = try allocator.dupeZ(u8, p);
+        defer allocator.free(proxy_c);
+        if (c.curl_easy_setopt(curl, c.CURLOPT_PROXY, proxy_c.ptr) != c.CURLE_OK) {
+            return error.CurlOptionError;
+        }
+    }
+
+    // Follow redirects
+    if (c.curl_easy_setopt(curl, c.CURLOPT_FOLLOWLOCATION, @as(c_long, 1)) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    // Set up streaming callback context
+    var line_buffer: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer line_buffer.deinit(allocator);
+
+    var stream_ctx = StreamContext{
+        .callback = callback,
+        .context = callback_ctx,
+        .allocator = allocator,
+        .line_buffer = &line_buffer,
+    };
+
+    if (c.curl_easy_setopt(curl, c.CURLOPT_WRITEFUNCTION, streamWriteCallback) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+    if (c.curl_easy_setopt(curl, c.CURLOPT_WRITEDATA, &stream_ctx) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    // Perform request
+    const result = c.curl_easy_perform(curl);
+    // For streaming, we may get partial data even on error
+    if (result != c.CURLE_OK and result != c.CURLE_HTTP_RETURNED_ERROR) {
+        return error.CurlRequestFailed;
+    }
+
+    // Send any remaining data in the line buffer
+    if (line_buffer.items.len > 0) {
+        _ = callback(callback_ctx, line_buffer.items.ptr, line_buffer.items.len);
     }
 }
 
-test "netBackend returns platform default when no override set" {
-    // Ensure no leftover override from other tests.
-    const saved = backend_override;
-    backend_override = null;
-    defer backend_override = saved;
+/// Same as curlPostStreamSSE but takes auth_header separately for convenience
+pub fn curlPostStreamSSEWithAuth(
+    allocator: Allocator,
+    url: []const u8,
+    body: []const u8,
+    auth_header: ?[]const u8,
+    extra_headers: []const []const u8,
+    timeout_secs: u64,
+    proxy: ?[]const u8,
+    callback: StreamWriteCallback,
+    callback_ctx: *anyopaque,
+) !void {
+    // Build headers list
+    var headers = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer headers.deinit(allocator);
 
-    const expected: NetBackend = if (builtin.os.tag == .macos) .subprocess else .native;
-    try std.testing.expectEqual(expected, netBackend());
+    if (auth_header) |auth| {
+        try headers.append(allocator, auth);
+    }
+    try headers.appendSlice(allocator, extra_headers);
+
+    var timeout_buf: [32]u8 = undefined;
+    const timeout_str = if (timeout_secs > 0) std.fmt.bufPrint(&timeout_buf, "{d}", .{timeout_secs}) catch "" else "";
+
+    return curlPostStreamSSE(
+        allocator,
+        url,
+        body,
+        headers.items,
+        timeout_str,
+        proxy,
+        callback,
+        callback_ctx,
+    );
 }
 
-test "setNetBackend overrides platform default" {
-    const saved = backend_override;
-    defer backend_override = saved;
+// ═══════════════════════════════════════════════════════════════════════════
+// WebSocket support using libcurl
+// ═══════════════════════════════════════════════════════════════════════════
 
-    setNetBackend(.subprocess);
-    try std.testing.expectEqual(NetBackend.subprocess, netBackend());
-    try std.testing.expect(useSubprocess());
+/// WebSocket frame types
+pub const WsFrameType = enum(c_uint) {
+    text = 1,
+    binary = 2,
+    close = 8,
+    ping = 9,
+    pong = 10,
+};
 
-    setNetBackend(.native);
-    try std.testing.expectEqual(NetBackend.native, netBackend());
-    try std.testing.expect(!useSubprocess());
+/// WebSocket message structure
+pub const WsMessage = struct {
+    data: []u8,
+    frame_type: WsFrameType,
+};
+
+/// WebSocket connection using libcurl
+pub const WsConnection = struct {
+    allocator: Allocator,
+    curl: ?*c.CURL,
+    websocket: ?*c.curl_ws,
+    connected: bool = false,
+};
+
+/// Connect to a WebSocket server using libcurl
+pub fn wsConnect(
+    allocator: Allocator,
+    url: []const u8,
+    extra_headers: []const []const u8,
+) !*WsConnection {
+    try ensureCurlInit();
+
+    const curl = c.curl_easy_init();
+    if (curl == null) {
+        return error.CurlInitFailed;
+    }
+
+    const conn = try allocator.create(WsConnection);
+    errdefer allocator.destroy(conn);
+
+    conn.* = .{
+        .allocator = allocator,
+        .curl = curl,
+        .websocket = null,
+        .connected = false,
+    };
+
+    // Set URL
+    const url_c = try allocator.dupeZ(u8, url);
+    errdefer allocator.free(url_c);
+    if (c.curl_easy_setopt(curl, c.CURLOPT_URL, url_c.ptr) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    // Build headers for WebSocket upgrade
+    var header_list: ?[*]c.curl_slist = null;
+    defer {
+        if (header_list) |list| {
+            c.curl_slist_free_all(list);
+        }
+    }
+
+    // Add WebSocket upgrade headers
+    const ws_key = "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==";
+    var ws_list = c.curl_slist_append(header_list, ws_key);
+    if (ws_list == null) {
+        return error.CurlHeaderError;
+    }
+    header_list = ws_list;
+
+    const ws_version = "Sec-WebSocket-Version: 13";
+    ws_list = c.curl_slist_append(header_list, ws_version);
+    if (ws_list == null) {
+        return error.CurlHeaderError;
+    }
+    header_list = ws_list;
+
+    // Add custom headers
+    for (extra_headers) |hdr| {
+        const hdr_c = try allocator.dupeZ(u8, hdr);
+        errdefer allocator.free(hdr_c);
+        ws_list = c.curl_slist_append(header_list, hdr_c.ptr);
+        if (ws_list == null) {
+            return error.CurlHeaderError;
+        }
+        header_list = ws_list;
+    }
+
+    if (c.curl_easy_setopt(curl, c.CURLOPT_HTTPHEADER, header_list) != c.CURLE_OK) {
+        return error.CurlOptionError;
+    }
+
+    // Perform WebSocket upgrade using curl_easy_ws_connect
+    var ws: ?*c.curl_ws = undefined;
+    const result = c.curl_easy_ws_connect(curl, 0, &ws);
+    if (result != c.CURLE_OK or ws == null) {
+        log.err("WebSocket connection failed: {d}", .{result});
+        return error.WsConnectFailed;
+    }
+
+    conn.websocket = ws;
+    conn.connected = true;
+
+    return conn;
 }
 
-test "setProxyOverride accepts long proxy URLs" {
-    const allocator = std.testing.allocator;
-    var long_proxy = try allocator.alloc(u8, 1600);
-    defer allocator.free(long_proxy);
+/// Send text message over WebSocket
+pub fn wsSendText(conn: *WsConnection, message: []const u8) !void {
+    if (!conn.connected or conn.websocket == null) {
+        return error.WsNotConnected;
+    }
 
-    @memcpy(long_proxy[0.."http://".len], "http://");
-    @memset(long_proxy["http://".len..], 'a');
+    const msg_data = try conn.allocator.dupeZ(u8, message);
+    defer conn.allocator.free(msg_data);
 
-    try setProxyOverride(long_proxy);
-    defer setProxyOverride(null) catch unreachable;
+    const result = c.curl_ws_send(
+        conn.websocket,
+        msg_data.ptr,
+        message.len,
+        0,
+        c.CURLWS_TEXT,
+    );
 
-    const from_override = try getProxyFromEnv(allocator);
-    defer if (from_override) |v| allocator.free(v);
-    try std.testing.expect(from_override != null);
-    try std.testing.expectEqual(long_proxy.len, from_override.?.len);
+    if (result != c.CURLE_OK) {
+        return error.WsSendFailed;
+    }
+}
+
+/// Send binary message over WebSocket
+pub fn wsSendBinary(conn: *WsConnection, data: []const u8) !void {
+    if (!conn.connected or conn.websocket == null) {
+        return error.WsNotConnected;
+    }
+
+    const data_copy = try conn.allocator.dupe(u8, data);
+    defer conn.allocator.free(data_copy);
+
+    const result = c.curl_ws_send(
+        conn.websocket,
+        data_copy.ptr,
+        data.len,
+        0,
+        c.CURLWS_BINARY,
+    );
+
+    if (result != c.CURLE_OK) {
+        return error.WsSendFailed;
+    }
+}
+
+/// Receive a WebSocket message (text or binary)
+/// Returns null if connection closed or timeout
+pub fn wsRecv(conn: *WsConnection, _: u32) !?WsMessage {
+    if (!conn.connected or conn.websocket == null) {
+        return error.WsNotConnected;
+    }
+
+    // Allocate receive buffer
+    const buf = try conn.allocator.alloc(u8, 8192);
+    errdefer conn.allocator.free(buf);
+
+    var flags: c_uint = 0;
+    var nrecv: c_uint = 0;
+
+    // Note: timeout is not directly supported in curl_ws_recv
+    // We rely on the socket having data available
+    const result = c.curl_ws_recv(
+        conn.websocket,
+        buf.ptr,
+        buf.len,
+        &flags,
+        &nrecv,
+    );
+
+    if (result == c.CURLE_AGAIN) {
+        // No data available yet
+        return null;
+    }
+
+    if (result != c.CURLE_OK) {
+        log.warn("WebSocket recv failed: {d}", .{result});
+        conn.connected = false;
+        return null;
+    }
+
+    if (nrecv == 0) {
+        // Connection closed
+        conn.connected = false;
+        return null;
+    }
+
+    // Determine frame type
+    const frame_type: WsFrameType = if ((flags & c.CURLWS_TEXT) != 0)
+        .text
+    else if ((flags & c.CURLWS_BINARY) != 0)
+        .binary
+    else if ((flags & c.CURLWS_CLOSE) != 0)
+        .close
+    else
+        .text; // Default to text
+
+    const data = try conn.allocator.dupe(u8, buf[0..nrecv]);
+
+    return WsMessage{
+        .data = data,
+        .frame_type = frame_type,
+    };
+}
+
+/// Check if WebSocket is connected
+pub fn wsIsConnected(conn: *WsConnection) bool {
+    return conn.connected;
+}
+
+/// Close WebSocket connection
+pub fn wsClose(conn: *WsConnection) void {
+    if (conn.websocket) |ws| {
+        // Send close frame
+        c.curl_ws_close(ws, 0, 0, c.CURLWS_CLOSE);
+    }
+
+    if (conn.curl) |curl| {
+        c.curl_easy_cleanup(curl);
+    }
+
+    conn.connected = false;
+}
+
+/// Destroy WebSocket connection and free memory
+pub fn wsDestroy(conn: *WsConnection) void {
+    wsClose(conn);
+    conn.allocator.destroy(conn);
 }

@@ -107,44 +107,39 @@ pub const BrowserTool = struct {
         return ToolResult{ .success = true, .output = msg };
     }
 
-    /// "read" — fetch URL content via curl and return body text (truncated to 8 KB).
+    /// "read" — fetch URL content via libcurl and return body text (truncated to 8 KB).
     fn executeRead(allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
         const url = root.getString(args, "url") orelse
             return ToolResult.fail("Missing 'url' parameter for read action");
 
-        // Use curl to fetch the page. Flags:
-        //   -sS  silent but show errors
-        //   -L   follow redirects
-        //   -m 10  timeout 10 seconds
-        //   --max-filesize 65536  abort if body exceeds 64 KB
+        // Use libcurl to fetch the page.
+        const http_util = @import("../http_util.zig");
         const max_size_str = std.fmt.comptimePrint("{d}", .{MAX_FETCH_BYTES});
-        const proc = @import("process_util.zig");
-        const result = proc.run(allocator, &.{ "curl", "-sS", "-L", "-m", "10", "--max-filesize", max_size_str, url }, .{ .max_output_bytes = MAX_FETCH_BYTES }) catch {
-            return ToolResult.fail("Failed to spawn curl — is curl installed?");
-        };
-        defer allocator.free(result.stderr);
-        defer allocator.free(result.stdout);
+        const empty_headers: []const []const u8 = &.{};
 
-        if (!result.success) {
-            if (result.exit_code) |code| {
-                const detail = if (result.stderr.len > 0) result.stderr else "curl request failed";
-                const msg = try std.fmt.allocPrint(allocator, "curl exited with code {d}: {s}", .{ code, detail });
-                return ToolResult{ .success = false, .output = "", .error_msg = msg };
-            }
-            return ToolResult{ .success = false, .output = "", .error_msg = "curl terminated by signal" };
+        const result = http_util.curlRequestWithStatus(allocator, url, "GET", null, empty_headers, max_size_str) catch {
+            return ToolResult.fail("Failed to fetch URL via HTTP client");
+        };
+        defer {
+            allocator.free(result.body);
         }
 
-        if (result.stdout.len == 0) {
+        if (result.status_code != 200) {
+            const msg = try std.fmt.allocPrint(allocator, "HTTP request failed with status {d}", .{result.status_code});
+            return ToolResult{ .success = false, .output = "", .error_msg = msg };
+        }
+
+        if (result.body.len == 0) {
             const msg = try allocator.dupe(u8, "Page returned empty response");
             return ToolResult{ .success = true, .output = msg };
         }
 
         // Truncate to MAX_READ_BYTES
-        const truncated = result.stdout.len > MAX_READ_BYTES;
-        const body_len = if (truncated) MAX_READ_BYTES else result.stdout.len;
+        const truncated = result.body.len > MAX_READ_BYTES;
+        const body_len = if (truncated) MAX_READ_BYTES else result.body.len;
         const suffix: []const u8 = if (truncated) "\n\n[Content truncated to 8 KB]" else "";
 
-        const output = try std.fmt.allocPrint(allocator, "{s}{s}", .{ result.stdout[0..body_len], suffix });
+        const output = try std.fmt.allocPrint(allocator, "{s}{s}", .{ result.body[0..body_len], suffix });
         return ToolResult{ .success = true, .output = output };
     }
 };

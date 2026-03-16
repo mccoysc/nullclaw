@@ -208,153 +208,51 @@ fn runCurlRequestWithStatus(
     body: ?[]const u8,
     max_response_size: usize,
 ) !http_util.HttpResponse {
-    var argv_buf: [64][]const u8 = undefined;
-    var argc: usize = 0;
-    const reserved_tail_args: usize = if (body != null) 5 else 3;
-
-    argv_buf[argc] = "curl";
-    argc += 1;
-    argv_buf[argc] = "-sS";
-    argc += 1;
-    argv_buf[argc] = "-X";
-    argc += 1;
-    argv_buf[argc] = method;
-    argc += 1;
-    argv_buf[argc] = "--max-time";
-    argc += 1;
-    argv_buf[argc] = "60";
-    argc += 1;
-
+    // Build resolve entry for DNS pinning (SSRF protection)
     var resolve_entry: ?[]u8 = null;
     defer if (resolve_entry) |entry| allocator.free(entry);
+
     if (shouldUseCurlResolve(host)) {
         resolve_entry = try buildCurlResolveEntry(allocator, host, resolved_port, connect_host);
-        argv_buf[argc] = "--resolve";
-        argc += 1;
-        argv_buf[argc] = resolve_entry.?;
-        argc += 1;
     }
 
-    var header_lines: std.ArrayListUnmanaged([]u8) = .empty;
-    defer {
-        for (header_lines.items) |line| allocator.free(line);
-        header_lines.deinit(allocator);
-    }
+    // Build headers list for http_util
+    var header_list: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer header_list.deinit(allocator);
 
     for (headers) |h| {
-        // Reserve room for trailing args:
-        // -w "\n%{http_code}" <url> and optional --data-binary @-
-        if (argc + 2 + reserved_tail_args > argv_buf.len) break;
         const line = try std.fmt.allocPrint(allocator, "{s}: {s}", .{ h[0], h[1] });
-        try header_lines.append(allocator, line);
-        argv_buf[argc] = "-H";
-        argc += 1;
-        argv_buf[argc] = line;
-        argc += 1;
+        try header_list.append(allocator, line);
     }
 
-    if (body != null) {
-        if (argc + 2 + 3 > argv_buf.len) return error.CurlArgsOverflow;
-        argv_buf[argc] = "--data-binary";
-        argc += 1;
-        argv_buf[argc] = "@-";
-        argc += 1;
+    // Use libcurl with DNS pinning
+    const result = if (resolve_entry) |re|
+        try http_util.curlRequestWithResolve(
+            allocator,
+            url,
+            method,
+            body,
+            header_list.items,
+            "60", // timeout
+            re,
+        )
+    else
+        try http_util.curlRequestWithStatus(
+            allocator,
+            url,
+            method,
+            body,
+            header_list.items,
+            "60", // timeout
+        );
+
+    // Check response size
+    if (result.body.len > max_response_size) {
+        allocator.free(result.body);
+        return error.ResponseTooLarge;
     }
 
-    if (argc + 3 > argv_buf.len) return error.CurlArgsOverflow;
-    argv_buf[argc] = "-w";
-    argc += 1;
-    argv_buf[argc] = "\n%{http_code}";
-    argc += 1;
-    argv_buf[argc] = url;
-    argc += 1;
-
-    var child = std.process.Child.init(argv_buf[0..argc], allocator);
-    child.stdin_behavior = if (body != null) .Pipe else .Ignore;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
-
-    try child.spawn();
-
-    const cancel_flag = http_util.currentThreadInterruptFlag();
-    const AtomicBool = std.atomic.Value(bool);
-    const CancelCtx = struct {
-        child: *std.process.Child,
-        cancel_flag: *const AtomicBool,
-        done: *AtomicBool,
-    };
-    const watcherFn = struct {
-        fn run(ctx: *CancelCtx) void {
-            while (!ctx.done.load(.acquire)) {
-                if (ctx.cancel_flag.load(.acquire)) {
-                    if (comptime @import("builtin").os.tag == .windows) {
-                        std.os.windows.TerminateProcess(ctx.child.id, 1) catch {};
-                    } else {
-                        std.posix.kill(ctx.child.id, std.posix.SIG.TERM) catch {};
-                    }
-                    break;
-                }
-                std.Thread.sleep(20 * std.time.ns_per_ms);
-            }
-        }
-    }.run;
-    var done = AtomicBool.init(false);
-    var watcher: ?std.Thread = null;
-    var cancel_ctx: CancelCtx = undefined;
-    if (cancel_flag) |flag| {
-        cancel_ctx = .{ .child = &child, .cancel_flag = flag, .done = &done };
-        watcher = std.Thread.spawn(.{}, watcherFn, .{&cancel_ctx}) catch null;
-    }
-    defer {
-        done.store(true, .release);
-        if (watcher) |t| t.join();
-    }
-
-    if (body) |b| {
-        if (child.stdin) |stdin_file| {
-            stdin_file.writeAll(b) catch {
-                stdin_file.close();
-                child.stdin = null;
-                _ = child.kill() catch {};
-                _ = child.wait() catch {};
-                return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWriteError;
-            };
-            stdin_file.close();
-            child.stdin = null;
-        } else {
-            _ = child.kill() catch {};
-            _ = child.wait() catch {};
-            return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWriteError;
-        }
-    }
-
-    const stdout = child.stdout.?.readToEndAlloc(allocator, max_response_size + 64) catch {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
-        return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlReadError;
-    };
-    errdefer allocator.free(stdout);
-
-    const term = child.wait() catch return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWaitError;
-    switch (term) {
-        .Exited => |code| if (code != 0 and !(cancel_flag != null and cancel_flag.?.load(.acquire))) return error.CurlFailed,
-        else => return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlFailed,
-    }
-
-    if (cancel_flag != null and cancel_flag.?.load(.acquire)) return error.CurlInterrupted;
-
-    const status_sep = std.mem.lastIndexOfScalar(u8, stdout, '\n') orelse return error.CurlParseError;
-    const status_raw = std.mem.trim(u8, stdout[status_sep + 1 ..], " \t\r\n");
-    if (status_raw.len != 3) return error.CurlParseError;
-    const status_code = std.fmt.parseInt(u16, status_raw, 10) catch return error.CurlParseError;
-    const body_slice = stdout[0..status_sep];
-    const response_body = try allocator.dupe(u8, body_slice);
-    allocator.free(stdout);
-
-    return .{
-        .status_code = status_code,
-        .body = response_body,
-    };
+    return result;
 }
 
 fn ensureTlsCaBundleLoaded(client: *std.http.Client) !void {
