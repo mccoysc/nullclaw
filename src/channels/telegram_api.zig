@@ -149,52 +149,6 @@ pub const Client = struct {
         return self.post(allocator, "editMessageText", body.items, "10");
     }
 
-    /// Edit a message with HTML parse_mode enabled.
-    pub fn editMessageTextHtml(
-        self: Client,
-        allocator: std.mem.Allocator,
-        chat_id: []const u8,
-        message_id: i64,
-        html_text: []const u8,
-    ) ![]u8 {
-        var body: std.ArrayListUnmanaged(u8) = .empty;
-        defer body.deinit(allocator);
-
-        try body.appendSlice(allocator, "{\"chat_id\":");
-        try body.appendSlice(allocator, chat_id);
-        try body.appendSlice(allocator, ",\"message_id\":");
-        var msg_id_buf: [32]u8 = undefined;
-        const msg_id_str = try std.fmt.bufPrint(&msg_id_buf, "{d}", .{message_id});
-        try body.appendSlice(allocator, msg_id_str);
-        try body.appendSlice(allocator, ",\"text\":");
-        try root.json_util.appendJsonString(&body, allocator, html_text);
-        try body.appendSlice(allocator, ",\"parse_mode\":\"HTML\"");
-        try body.appendSlice(allocator, "}");
-
-        return self.post(allocator, "editMessageText", body.items, "10");
-    }
-
-    /// Delete a message from a chat.
-    pub fn deleteMessage(
-        self: Client,
-        allocator: std.mem.Allocator,
-        chat_id: []const u8,
-        message_id: i64,
-    ) ![]u8 {
-        var body: std.ArrayListUnmanaged(u8) = .empty;
-        defer body.deinit(allocator);
-
-        try body.appendSlice(allocator, "{\"chat_id\":");
-        try body.appendSlice(allocator, chat_id);
-        try body.appendSlice(allocator, ",\"message_id\":");
-        var msg_id_buf: [32]u8 = undefined;
-        const msg_id_str = try std.fmt.bufPrint(&msg_id_buf, "{d}", .{message_id});
-        try body.appendSlice(allocator, msg_id_str);
-        try body.appendSlice(allocator, "}");
-
-        return self.post(allocator, "deleteMessage", body.items, "10");
-    }
-
     pub fn getFilePath(self: Client, allocator: std.mem.Allocator, file_id: []const u8) ![]u8 {
         var body: std.ArrayListUnmanaged(u8) = .empty;
         defer body.deinit(allocator);
@@ -437,64 +391,4 @@ test "editMessageText builds valid JSON body" {
     try std.testing.expectEqual(@as(i64, 42), mid.integer);
     const txt = obj.get("text") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("hello world", txt.string);
-}
-
-test "editMessageTextHtml builds valid JSON body with parse_mode" {
-    const allocator = std.testing.allocator;
-    var body: std.ArrayListUnmanaged(u8) = .empty;
-    defer body.deinit(allocator);
-
-    const chat_id = "12345678";
-    const message_id: i64 = 99;
-    const html_text = "<b>bold</b> text";
-
-    try body.appendSlice(allocator, "{\"chat_id\":");
-    try body.appendSlice(allocator, chat_id);
-    try body.appendSlice(allocator, ",\"message_id\":");
-    var msg_id_buf: [32]u8 = undefined;
-    const msg_id_str = try std.fmt.bufPrint(&msg_id_buf, "{d}", .{message_id});
-    try body.appendSlice(allocator, msg_id_str);
-    try body.appendSlice(allocator, ",\"text\":");
-    try root.json_util.appendJsonString(&body, allocator, html_text);
-    try body.appendSlice(allocator, ",\"parse_mode\":\"HTML\"");
-    try body.appendSlice(allocator, "}");
-
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body.items, .{});
-    defer parsed.deinit();
-
-    const obj = parsed.value.object;
-    const cid = obj.get("chat_id") orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@as(i64, 12345678), cid.integer);
-    const mid = obj.get("message_id") orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@as(i64, 99), mid.integer);
-    const txt = obj.get("text") orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("<b>bold</b> text", txt.string);
-    const pm = obj.get("parse_mode") orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("HTML", pm.string);
-}
-
-test "deleteMessage builds valid JSON body" {
-    const allocator = std.testing.allocator;
-    var body: std.ArrayListUnmanaged(u8) = .empty;
-    defer body.deinit(allocator);
-
-    const chat_id = "12345678";
-    const message_id: i64 = 55;
-
-    try body.appendSlice(allocator, "{\"chat_id\":");
-    try body.appendSlice(allocator, chat_id);
-    try body.appendSlice(allocator, ",\"message_id\":");
-    var msg_id_buf: [32]u8 = undefined;
-    const msg_id_str = try std.fmt.bufPrint(&msg_id_buf, "{d}", .{message_id});
-    try body.appendSlice(allocator, msg_id_str);
-    try body.appendSlice(allocator, "}");
-
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body.items, .{});
-    defer parsed.deinit();
-
-    const obj = parsed.value.object;
-    const cid = obj.get("chat_id") orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@as(i64, 12345678), cid.integer);
-    const mid = obj.get("message_id") orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@as(i64, 55), mid.integer);
 }
