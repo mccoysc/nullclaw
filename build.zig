@@ -589,8 +589,11 @@ pub fn build(b: *std.Build) void {
     const is_windows = target.result.os.tag == .windows;
 
     // --- Curl setup ---
-    // Build static libcurl via autotools for all non-Windows, non-WASI targets.
-    // Windows uses dynamic system libcurl. WASI has no curl.
+    // Build static libcurl via autotools for all non-Windows, non-WASI, non-cross targets.
+    // Native Windows uses dynamic system libcurl (vcpkg).
+    // Cross-compiled Windows targets skip libcurl entirely (all curl usage is subprocess-based).
+    // WASI has no curl.
+    const is_cross = isCrossCompiling(target);
     const curl_source_available = !is_wasi and hasCurlSource(b);
     const curl_install_dir: ?[]const u8 = if (curl_source_available and !is_windows) blk: {
         break :blk buildLibcurlFromSource(b, target) catch |err| {
@@ -598,6 +601,10 @@ pub fn build(b: *std.Build) void {
             std.process.exit(1);
         };
     } else null;
+    // Link libcurl only when: vendored source is available (POSIX), or
+    // native Windows build (vcpkg provides libcurl.lib). Cross-compiled
+    // Windows builds skip this — the binary uses subprocess curl at runtime.
+    const link_curl = curl_source_available or (is_windows and !is_cross);
 
     // --- Options ---
     const app_version = b.option([]const u8, "version", "Version string embedded in the binary") orelse
@@ -784,7 +791,7 @@ pub fn build(b: *std.Build) void {
         }
 
         // Link libcurl
-        if (curl_source_available or is_windows) {
+        if (link_curl) {
             linkCurlToStep(exe, b, curl_install_dir, target);
         }
     }
@@ -827,13 +834,13 @@ pub fn build(b: *std.Build) void {
         if (effective_enable_postgres) {
             lib_tests.root_module.linkSystemLibrary("pq", .{});
         }
-        if (curl_source_available or is_windows) {
+        if (link_curl) {
             lib_tests.linkLibC();
             linkCurlToStep(lib_tests, b, curl_install_dir, target);
         }
 
         const exe_tests = b.addTest(.{ .root_module = exe.root_module });
-        if (curl_source_available or is_windows) {
+        if (link_curl) {
             exe_tests.linkLibC();
             linkCurlToStep(exe_tests, b, curl_install_dir, target);
         }
