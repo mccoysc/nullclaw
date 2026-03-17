@@ -1,0 +1,13 @@
+# This is a generated file.  Do not edit.
+buildinfo.configure.tool: configure
+buildinfo.configure.args:  '--prefix=/Users/bm/Desktop/code/nullclaw/vendor/curl/install' '--enable-static' '--disable-shared' '--without-libpsl' '--disable-ldap' '--disable-ldaps' '--enable-http' '--enable-proxy' '--without-brotli' '--without-zstd' '--disable-mqtt' '--with-secure-transport'
+buildinfo.host: aarch64-apple-darwin25.3.0
+buildinfo.host.cpu: aarch64
+buildinfo.host.os: darwin25.3.0
+buildinfo.target: aarch64-apple-darwin25.3.0
+buildinfo.target.cpu: aarch64
+buildinfo.target.os: darwin25.3.0
+buildinfo.target.flags: APPLE UNIX
+buildinfo.compiler: APPLECLANG
+buildinfo.compiler.version: 17.0
+buildinfo.sysroot: 

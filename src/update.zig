@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const http_util = @import("http_util.zig");
 
 const log = std.log.scoped(.update);
 
@@ -194,26 +195,19 @@ pub const ReleaseInfo = struct {
 pub fn getLatestRelease(allocator: std.mem.Allocator) !ReleaseInfo {
     const url = "https://api.github.com/repos/nullclaw/nullclaw/releases/latest";
 
-    // Use curl subprocess approach (from http_util pattern)
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &.{ "curl", "-sf", "--max-time", "30", url },
-        .max_output_bytes = 10 * 1024 * 1024,
-    }) catch |err| {
+    // Use libcurl to fetch the GitHub API response
+    const result = http_util.curlGet(allocator, url, &.{}, "30") catch |err| {
         log.err("curl failed: {}", .{err});
         return error.CurlFailed;
     };
-    defer {
-        allocator.free(result.stdout);
-        allocator.free(result.stderr);
-    }
+    defer allocator.free(result);
 
-    if (result.stdout.len == 0) {
+    if (result.len == 0) {
         return error.EmptyResponse;
     }
 
     // Parse JSON
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{}) catch |err| {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, result, .{}) catch |err| {
         log.err("JSON parse failed: {}", .{err});
         return error.InvalidJson;
     };
@@ -348,59 +342,22 @@ fn downloadAndInstall(
     std.debug.print("Installed successfully.\n", .{});
 }
 
-/// Download a URL directly to a file using curl.
+/// Download a URL directly to a file using libcurl.
 /// Streams the data to avoid memory buffer limits.
 /// Returns the number of bytes downloaded.
 fn downloadToFile(allocator: std.mem.Allocator, url: []const u8, file: *std.fs.File) !usize {
-    const argv = &[_][]const u8{ "curl", "-sfL", "--max-time", "60", url };
-    var child = std.process.Child.init(argv, allocator);
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
-
-    child.spawn() catch |err| {
-        log.err("curl spawn failed: {}", .{err});
+    const response = http_util.curlGet(allocator, url, &.{}, "60") catch |err| {
+        log.err("curl download failed: {}", .{err});
         return error.CurlFailed;
     };
+    defer allocator.free(response);
 
-    const stdout = child.stdout.?;
-
-    const BUF_SIZE = 64 * 1024;
-    var buffer: [BUF_SIZE]u8 = undefined;
-    var total_bytes: usize = 0;
-
-    while (true) {
-        const bytes_read = stdout.read(&buffer) catch |err| {
-            log.err("curl read failed: {}", .{err});
-            _ = child.kill() catch {};
-            _ = child.wait() catch {};
-            return error.CurlFailed;
-        };
-
-        if (bytes_read == 0) break;
-
-        file.writeAll(buffer[0..bytes_read]) catch |err| {
-            log.err("download write failed: {}", .{err});
-            _ = child.kill() catch {};
-            _ = child.wait() catch {};
-            return err;
-        };
-        total_bytes += bytes_read;
+    if (response.len == 0) {
+        return 0;
     }
 
-    const term = child.wait() catch |err| {
-        log.err("curl wait failed: {}", .{err});
-        return error.CurlFailed;
-    };
-
-    switch (term) {
-        .Exited => |code| if (code != 0) {
-            log.err("curl exited with code: {}", .{code});
-            return error.CurlFailed;
-        },
-        else => return error.CurlFailed,
-    }
-
-    return total_bytes;
+    try file.writeAll(response);
+    return response.len;
 }
 
 fn atomicReplace(tmp_path: []const u8, exe_path: []const u8) !void {

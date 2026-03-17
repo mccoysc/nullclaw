@@ -3,39 +3,10 @@ name: Release
 on:
   push:
     tags: ['v*']
-  workflow_dispatch:
 
 jobs:
-  generate-tag:
-    if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    outputs:
-      tag: ${{ steps.calver.outputs.tag }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Generate CalVer tag
-        id: calver
-        run: |
-          PREFIX="v$(date -u +%Y.%-m.%-d)"
-          LAST=$(git tag -l "${PREFIX}.*" | sort -t. -k4 -n | tail -1)
-          if [ -z "$LAST" ]; then
-            TAG="${PREFIX}.0"
-          else
-            N="${LAST##*.}"
-            TAG="${PREFIX}.$((N + 1))"
-          fi
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "Generated tag: $TAG"
-
   build:
     name: Build (${{ matrix.target }})
-    needs: [generate-tag]
-    if: always() && (needs.generate-tag.result == 'success' || (needs.generate-tag.result == 'skipped' && github.event_name != 'workflow_dispatch'))
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -77,15 +48,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev zlib1g-dev
+
       - name: Install Zig 0.15.2
         uses: mlugg/setup-zig@v2
         with:
           version: 0.15.2
 
       - name: Build ReleaseSmall
-        env:
-          VERSION: ${{ needs.generate-tag.outputs.tag || github.ref_name }}
-        run: zig build -Doptimize=ReleaseSmall -Dversion="$VERSION" ${{ matrix.zig_target && format('-Dtarget={0}', matrix.zig_target) || '' }}
+        run: |
+          # For musl targets, delete pre-existing vendor curl installs to force rebuild from source
+          # This ensures curl is built with the correct TLS/zlib dependencies for the target
+          if [[ "${{ matrix.zig_target }}" == *"musl"* ]]; then
+            rm -rf vendor/curl/install-linux-x86_64
+            rm -rf vendor/curl/install-linux-arm64
+            rm -rf vendor/curl/install-linux-arm
+            rm -rf vendor/curl/install-linux-riscv64
+          fi
+          zig build -Doptimize=ReleaseSmall -Dversion=${{ github.ref_name }} ${{ matrix.zig_target && format('-Dtarget={0}', matrix.zig_target) || '' }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -94,8 +78,7 @@ jobs:
           path: zig-out/bin/nullclaw${{ matrix.ext }}
 
   release:
-    needs: [generate-tag, build]
-    if: always() && needs.build.result == 'success'
+    needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -104,34 +87,31 @@ jobs:
       - uses: actions/download-artifact@v4
 
       - name: Rename binaries
-        env:
-          VERSION: ${{ needs.generate-tag.outputs.tag || github.ref_name }}
         run: |
-          mv nullclaw-linux-x86_64/nullclaw   "nullclaw-${VERSION}-linux-x86_64.bin"
-          mv nullclaw-linux-aarch64/nullclaw  "nullclaw-${VERSION}-linux-aarch64.bin"
-          mv nullclaw-linux-riscv64/nullclaw  "nullclaw-${VERSION}-linux-riscv64.bin"
-          mv nullclaw-macos-aarch64/nullclaw  "nullclaw-${VERSION}-macos-aarch64.bin"
-          mv nullclaw-macos-x86_64/nullclaw   "nullclaw-${VERSION}-macos-x86_64.bin"
-          mv nullclaw-windows-x86_64/nullclaw.exe  "nullclaw-${VERSION}-windows-x86_64.exe"
-          mv nullclaw-windows-aarch64/nullclaw.exe "nullclaw-${VERSION}-windows-aarch64.exe"
+          VERSION="${{ github.ref_name }}"
+          mv nullclaw-linux-x86_64/nullclaw   nullclaw-${VERSION}-linux-x86_64.bin
+          mv nullclaw-linux-aarch64/nullclaw  nullclaw-${VERSION}-linux-aarch64.bin
+          mv nullclaw-linux-riscv64/nullclaw  nullclaw-${VERSION}-linux-riscv64.bin
+          mv nullclaw-macos-aarch64/nullclaw  nullclaw-${VERSION}-macos-aarch64.bin
+          mv nullclaw-macos-x86_64/nullclaw   nullclaw-${VERSION}-macos-x86_64.bin
+          mv nullclaw-windows-x86_64/nullclaw.exe  nullclaw-${VERSION}-windows-x86_64.exe
+          mv nullclaw-windows-aarch64/nullclaw.exe nullclaw-${VERSION}-windows-aarch64.exe
 
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ needs.generate-tag.outputs.tag || github.ref_name }}
           files: |
-            nullclaw-${{ needs.generate-tag.outputs.tag || github.ref_name }}-linux-x86_64.bin
-            nullclaw-${{ needs.generate-tag.outputs.tag || github.ref_name }}-linux-aarch64.bin
-            nullclaw-${{ needs.generate-tag.outputs.tag || github.ref_name }}-linux-riscv64.bin
-            nullclaw-${{ needs.generate-tag.outputs.tag || github.ref_name }}-macos-aarch64.bin
-            nullclaw-${{ needs.generate-tag.outputs.tag || github.ref_name }}-macos-x86_64.bin
-            nullclaw-${{ needs.generate-tag.outputs.tag || github.ref_name }}-windows-x86_64.exe
-            nullclaw-${{ needs.generate-tag.outputs.tag || github.ref_name }}-windows-aarch64.exe
+            nullclaw-${{ github.ref_name }}-linux-x86_64.bin
+            nullclaw-${{ github.ref_name }}-linux-aarch64.bin
+            nullclaw-${{ github.ref_name }}-linux-riscv64.bin
+            nullclaw-${{ github.ref_name }}-macos-aarch64.bin
+            nullclaw-${{ github.ref_name }}-macos-x86_64.bin
+            nullclaw-${{ github.ref_name }}-windows-x86_64.exe
+            nullclaw-${{ github.ref_name }}-windows-aarch64.exe
           generate_release_notes: true
 
   docker:
-    needs: [generate-tag, release]
-    if: always() && needs.release.result == 'success'
+    needs: release
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -159,11 +139,8 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
-            type=raw,value=${{ needs.generate-tag.outputs.tag || github.ref_name }}
+            type=semver,pattern={{raw}}
             type=raw,value=latest
-
-      - name: Verify build context
-        run: ls -la vendor/ && ls -la vendor/websocket/
 
       - name: Build and push
         uses: docker/build-push-action@v6
@@ -173,3 +150,5 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

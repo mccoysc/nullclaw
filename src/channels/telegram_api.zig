@@ -1,5 +1,6 @@
 const std = @import("std");
 const root = @import("root.zig");
+const log = std.log.scoped(.telegram_api);
 
 pub const SentMessageMeta = struct {
     message_id: ?i64 = null,
@@ -148,52 +149,6 @@ pub const Client = struct {
         return self.post(allocator, "editMessageText", body.items, "10");
     }
 
-    /// Edit a message with HTML parse_mode enabled.
-    pub fn editMessageTextHtml(
-        self: Client,
-        allocator: std.mem.Allocator,
-        chat_id: []const u8,
-        message_id: i64,
-        html_text: []const u8,
-    ) ![]u8 {
-        var body: std.ArrayListUnmanaged(u8) = .empty;
-        defer body.deinit(allocator);
-
-        try body.appendSlice(allocator, "{\"chat_id\":");
-        try body.appendSlice(allocator, chat_id);
-        try body.appendSlice(allocator, ",\"message_id\":");
-        var msg_id_buf: [32]u8 = undefined;
-        const msg_id_str = try std.fmt.bufPrint(&msg_id_buf, "{d}", .{message_id});
-        try body.appendSlice(allocator, msg_id_str);
-        try body.appendSlice(allocator, ",\"text\":");
-        try root.json_util.appendJsonString(&body, allocator, html_text);
-        try body.appendSlice(allocator, ",\"parse_mode\":\"HTML\"");
-        try body.appendSlice(allocator, "}");
-
-        return self.post(allocator, "editMessageText", body.items, "10");
-    }
-
-    /// Delete a message from a chat.
-    pub fn deleteMessage(
-        self: Client,
-        allocator: std.mem.Allocator,
-        chat_id: []const u8,
-        message_id: i64,
-    ) ![]u8 {
-        var body: std.ArrayListUnmanaged(u8) = .empty;
-        defer body.deinit(allocator);
-
-        try body.appendSlice(allocator, "{\"chat_id\":");
-        try body.appendSlice(allocator, chat_id);
-        try body.appendSlice(allocator, ",\"message_id\":");
-        var msg_id_buf: [32]u8 = undefined;
-        const msg_id_str = try std.fmt.bufPrint(&msg_id_buf, "{d}", .{message_id});
-        try body.appendSlice(allocator, msg_id_str);
-        try body.appendSlice(allocator, "}");
-
-        return self.post(allocator, "deleteMessage", body.items, "10");
-    }
-
     pub fn getFilePath(self: Client, allocator: std.mem.Allocator, file_id: []const u8) ![]u8 {
         var body: std.ArrayListUnmanaged(u8) = .empty;
         defer body.deinit(allocator);
@@ -239,72 +194,70 @@ pub const Client = struct {
         var url_buf: [512]u8 = undefined;
         const url = try self.apiUrl(&url_buf, method);
 
-        var file_arg_buf: [1024]u8 = undefined;
-        var file_fbs = std.io.fixedBufferStream(&file_arg_buf);
+        // Build multipart form data manually
+        var body = std.ArrayListUnmanaged(u8).empty;
+        defer body.deinit(allocator);
+
+        // Add chat_id field
+        try body.appendSlice(allocator, "--boundary\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n");
+        try body.appendSlice(allocator, chat_id);
+        try body.appendSlice(allocator, "\r\n");
+
+        // Add media field (either file reference or URL)
+        try body.appendSlice(allocator, "--boundary\r\nContent-Disposition: form-data; name=\"");
+        try body.appendSlice(allocator, field_name);
+        try body.appendSlice(allocator, "\"");
         if (std.mem.startsWith(u8, media_path, "http://") or
             std.mem.startsWith(u8, media_path, "https://"))
         {
-            try file_fbs.writer().print("{s}={s}", .{ field_name, media_path });
+            try body.appendSlice(allocator, "; filename=\"attachment\"\r\nContent-Type: application/octet-stream\r\n\r\n");
+            try body.appendSlice(allocator, media_path);
         } else {
-            try file_fbs.writer().print("{s}=@{s}", .{ field_name, media_path });
+            try body.appendSlice(allocator, "; filename=\"file\"\r\nContent-Type: application/octet-stream\r\n\r\n");
+            // Read file content
+            const file_content = std.fs.cwd().readFileAlloc(allocator, media_path, 10 * 1024 * 1024) catch
+                return error.FileReadError;
+            defer allocator.free(file_content);
+            try body.appendSlice(allocator, file_content);
         }
-        const file_arg = file_fbs.getWritten();
+        try body.appendSlice(allocator, "\r\n");
 
-        var chatid_arg_buf: [128]u8 = undefined;
-        var chatid_fbs = std.io.fixedBufferStream(&chatid_arg_buf);
-        try chatid_fbs.writer().print("chat_id={s}", .{chat_id});
-        const chatid_arg = chatid_fbs.getWritten();
-
-        var argv_buf: [24][]const u8 = undefined;
-        var argc: usize = 0;
-        argv_buf[argc] = "curl";
-        argc += 1;
-        argv_buf[argc] = "-s";
-        argc += 1;
-        argv_buf[argc] = "-m";
-        argc += 1;
-        argv_buf[argc] = "120";
-        argc += 1;
-
-        if (self.proxy) |p| {
-            argv_buf[argc] = "-x";
-            argc += 1;
-            argv_buf[argc] = p;
-            argc += 1;
-        }
-
-        argv_buf[argc] = "-F";
-        argc += 1;
-        argv_buf[argc] = chatid_arg;
-        argc += 1;
-        argv_buf[argc] = "-F";
-        argc += 1;
-        argv_buf[argc] = file_arg;
-        argc += 1;
-
-        var caption_arg_buf: [1024]u8 = undefined;
+        // Add caption if present
         if (caption) |cap| {
-            var cap_fbs = std.io.fixedBufferStream(&caption_arg_buf);
-            try cap_fbs.writer().print("caption={s}", .{cap});
-            argv_buf[argc] = "-F";
-            argc += 1;
-            argv_buf[argc] = cap_fbs.getWritten();
-            argc += 1;
+            try body.appendSlice(allocator, "--boundary\r\nContent-Disposition: form-data; name=\"caption\"\r\n\r\n");
+            try body.appendSlice(allocator, cap);
+            try body.appendSlice(allocator, "\r\n");
         }
 
-        argv_buf[argc] = url;
-        argc += 1;
+        // Close boundary
+        try body.appendSlice(allocator, "--boundary--\r\n");
 
-        var child = std.process.Child.init(argv_buf[0..argc], allocator);
-        child.stdout_behavior = .Pipe;
-        child.stderr_behavior = .Ignore;
-        try child.spawn();
+        // Build headers
+        var headers = std.ArrayListUnmanaged([]const u8).empty;
+        defer headers.deinit(allocator);
+        try headers.append(allocator, "Content-Type: multipart/form-data; boundary=boundary");
 
-        _ = child.stdout.?.readToEndAlloc(allocator, 1024 * 1024) catch return error.CurlReadError;
-        const term = child.wait() catch return error.CurlWaitError;
-        switch (term) {
-            .Exited => |code| if (code != 0) return error.CurlFailed,
-            else => return error.CurlFailed,
+        // Use libcurl to POST the multipart data
+        const http_util = @import("../http_util.zig");
+        const response = http_util.curlPostWithProxy(
+            allocator,
+            url,
+            body.items,
+            headers.items,
+            self.proxy,
+            "120",
+        ) catch |err| {
+            log.err("multipart post failed: {}", .{err});
+            return error.CurlFailed;
+        };
+        defer allocator.free(response);
+
+        // Check for Telegram errors
+        if (response.len > 0 and response[0] == '{') {
+            if (std.mem.indexOf(u8, response, "\"ok\":false") != null) {
+                log.err("Telegram API error: {s}", .{response});
+                return error.CurlFailed;
+            }
         }
     }
 
@@ -438,64 +391,4 @@ test "editMessageText builds valid JSON body" {
     try std.testing.expectEqual(@as(i64, 42), mid.integer);
     const txt = obj.get("text") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("hello world", txt.string);
-}
-
-test "editMessageTextHtml builds valid JSON body with parse_mode" {
-    const allocator = std.testing.allocator;
-    var body: std.ArrayListUnmanaged(u8) = .empty;
-    defer body.deinit(allocator);
-
-    const chat_id = "12345678";
-    const message_id: i64 = 99;
-    const html_text = "<b>bold</b> text";
-
-    try body.appendSlice(allocator, "{\"chat_id\":");
-    try body.appendSlice(allocator, chat_id);
-    try body.appendSlice(allocator, ",\"message_id\":");
-    var msg_id_buf: [32]u8 = undefined;
-    const msg_id_str = try std.fmt.bufPrint(&msg_id_buf, "{d}", .{message_id});
-    try body.appendSlice(allocator, msg_id_str);
-    try body.appendSlice(allocator, ",\"text\":");
-    try root.json_util.appendJsonString(&body, allocator, html_text);
-    try body.appendSlice(allocator, ",\"parse_mode\":\"HTML\"");
-    try body.appendSlice(allocator, "}");
-
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body.items, .{});
-    defer parsed.deinit();
-
-    const obj = parsed.value.object;
-    const cid = obj.get("chat_id") orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@as(i64, 12345678), cid.integer);
-    const mid = obj.get("message_id") orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@as(i64, 99), mid.integer);
-    const txt = obj.get("text") orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("<b>bold</b> text", txt.string);
-    const pm = obj.get("parse_mode") orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("HTML", pm.string);
-}
-
-test "deleteMessage builds valid JSON body" {
-    const allocator = std.testing.allocator;
-    var body: std.ArrayListUnmanaged(u8) = .empty;
-    defer body.deinit(allocator);
-
-    const chat_id = "12345678";
-    const message_id: i64 = 55;
-
-    try body.appendSlice(allocator, "{\"chat_id\":");
-    try body.appendSlice(allocator, chat_id);
-    try body.appendSlice(allocator, ",\"message_id\":");
-    var msg_id_buf: [32]u8 = undefined;
-    const msg_id_str = try std.fmt.bufPrint(&msg_id_buf, "{d}", .{message_id});
-    try body.appendSlice(allocator, msg_id_str);
-    try body.appendSlice(allocator, "}");
-
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body.items, .{});
-    defer parsed.deinit();
-
-    const obj = parsed.value.object;
-    const cid = obj.get("chat_id") orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@as(i64, 12345678), cid.integer);
-    const mid = obj.get("message_id") orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@as(i64, 55), mid.integer);
 }

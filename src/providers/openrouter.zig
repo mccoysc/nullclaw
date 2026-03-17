@@ -532,31 +532,10 @@ fn appendOpenRouterReasoning(
     try buf.append(allocator, '}');
 }
 
-/// HTTP GET via curl subprocess with auth header.
+/// HTTP GET via libcurl with auth header.
 fn curlGet(allocator: std.mem.Allocator, url: []const u8, auth_hdr: []const u8) ![]u8 {
-    var child = std.process.Child.init(&.{
-        "curl", "-s", "-H", auth_hdr, url,
-    }, allocator);
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
-
-    try child.spawn();
-
-    const stdout = child.stdout.?.readToEndAlloc(allocator, 1024 * 1024) catch return error.CurlReadError;
-
-    const term = child.wait() catch return error.CurlWaitError;
-    switch (term) {
-        .Exited => |code| if (code != 0) {
-            allocator.free(stdout);
-            return error.CurlFailed;
-        },
-        else => {
-            allocator.free(stdout);
-            return error.CurlFailed;
-        },
-    }
-
-    return stdout;
+    const http_util = @import("../http_util.zig");
+    return http_util.curlGet(allocator, url, &.{auth_hdr}, "30");
 }
 
 // ════════════════════════════════════════════════════════════════════════════

@@ -588,61 +588,30 @@ fn appendAnthropicThinkingConfig(
     try buf.append(allocator, '}');
 }
 
-/// HTTP POST with OAuth-specific headers (anthropic-beta, user-agent).
+/// HTTP POST with OAuth-specific headers using libcurl.
 fn curlPostOAuth(allocator: std.mem.Allocator, url: []const u8, body: []const u8, auth_hdr: []const u8, version_hdr: []const u8) ![]u8 {
-    var argv = std.ArrayListUnmanaged([]const u8){};
-    defer argv.deinit(allocator);
-    try argv.appendSlice(allocator, &.{ "curl", "-s", "-X", "POST" });
+    // Build headers list with OAuth-specific headers
+    var headers = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer headers.deinit(allocator);
 
+    try headers.append(allocator, "Content-Type: application/json");
+    try headers.append(allocator, auth_hdr);
+    try headers.append(allocator, version_hdr);
+    try headers.append(allocator, "anthropic-beta: oauth-2025-04-20");
+
+    // Get proxy from environment
     const proxy = http_util.getProxyFromEnv(allocator) catch null;
     defer if (proxy) |p| allocator.free(p);
-    if (proxy) |p| {
-        try argv.appendSlice(allocator, &.{ "--proxy", p });
-    }
 
-    try argv.appendSlice(allocator, &.{
-        "-H", "Content-Type: application/json",   "-H",            auth_hdr,
-        "-H", version_hdr,                        "-H",            "anthropic-beta: oauth-2025-04-20",
-        "-A", "claude-cli/2.1.2 (external, cli)", "--data-binary", "@-",
+    // Use libcurl via http_util.curlPostWithProxy
+    return http_util.curlPostWithProxy(
+        allocator,
         url,
-    });
-
-    var child = std.process.Child.init(argv.items, allocator);
-    child.stdin_behavior = .Pipe;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
-
-    try child.spawn();
-
-    if (child.stdin) |stdin_file| {
-        stdin_file.writeAll(body) catch {
-            stdin_file.close();
-            child.stdin = null;
-            _ = child.kill() catch {};
-            _ = child.wait() catch {};
-            return error.CurlWriteError;
-        };
-        stdin_file.close();
-        child.stdin = null;
-    } else {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
-        return error.CurlWriteError;
-    }
-
-    const stdout = child.stdout.?.readToEndAlloc(allocator, 1024 * 1024) catch {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
-        return error.CurlReadError;
-    };
-
-    const term = child.wait() catch return error.CurlWaitError;
-    switch (term) {
-        .Exited => |code| if (code != 0) return error.CurlFailed,
-        else => return error.CurlFailed,
-    }
-
-    return stdout;
+        body,
+        headers.items,
+        proxy,
+        null, // no timeout
+    );
 }
 
 pub const AuthHeader = struct {
