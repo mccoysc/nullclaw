@@ -227,7 +227,9 @@ fn linkCurlToStep(
                 step.addIncludePath(.{ .cwd_relative = inc_path });
             } else |_| {}
         } else |_| {}
-        step.linkSystemLibrary("curl");
+        // vcpkg names the import library "libcurl.lib" (not "curl.lib"),
+        // so we must use "libcurl" for Zig's system library search to match.
+        step.linkSystemLibrary("libcurl");
     } else if (curl_install_dir) |install_dir| {
         // POSIX: link static libcurl built via autotools.
         const include_path = std.fmt.allocPrint(b.allocator, "{s}/include", .{install_dir}) catch return;
