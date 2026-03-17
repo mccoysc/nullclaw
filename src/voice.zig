@@ -125,11 +125,15 @@ pub fn transcribeFile(
         return error.ApiRequestFailed;
     const auth_hdr = auth_fbs.getWritten();
 
-    // POST via curl using --data-binary @tempfile
-    const resp = curlPostFromFile(
+    // POST via http_util.curlPost (build multipart body in memory)
+    // Note: We already have the multipart body in tmp_path, read it back
+    const multipart_body = std.fs.cwd().readFileAlloc(allocator, tmp_path, 10 * 1024 * 1024) catch return error.ApiRequestFailed;
+    defer allocator.free(multipart_body);
+
+    const resp = http_util.curlPost(
         allocator,
         endpoint,
-        tmp_path,
+        multipart_body,
         &.{ auth_hdr, content_type_hdr },
     ) catch return error.ApiRequestFailed;
     defer allocator.free(resp);
@@ -253,70 +257,6 @@ fn parseTranscriptionText(allocator: std.mem.Allocator, json_resp: []const u8) !
     const text_val = parsed.value.object.get("text") orelse return error.InvalidResponse;
     if (text_val != .string) return error.InvalidResponse;
     return try allocator.dupe(u8, text_val.string);
-}
-
-/// HTTP POST via curl subprocess, reading body from a file on disk.
-/// Used for multipart/form-data where body has already been written to a temp file.
-fn curlPostFromFile(
-    allocator: std.mem.Allocator,
-    url: []const u8,
-    file_path: [:0]const u8,
-    headers: []const []const u8,
-) ![]u8 {
-    // Build data-binary arg: @/path/to/file
-    var data_arg_buf: [300]u8 = undefined;
-    var data_fbs = std.io.fixedBufferStream(&data_arg_buf);
-    try data_fbs.writer().print("@{s}", .{file_path});
-    const data_arg = data_fbs.getWritten();
-
-    var argv_buf: [32][]const u8 = undefined;
-    var argc: usize = 0;
-
-    argv_buf[argc] = "curl";
-    argc += 1;
-    argv_buf[argc] = "-s";
-    argc += 1;
-    argv_buf[argc] = "-X";
-    argc += 1;
-    argv_buf[argc] = "POST";
-    argc += 1;
-
-    for (headers) |hdr| {
-        if (argc + 2 > argv_buf.len) break;
-        argv_buf[argc] = "-H";
-        argc += 1;
-        argv_buf[argc] = hdr;
-        argc += 1;
-    }
-
-    argv_buf[argc] = "--data-binary";
-    argc += 1;
-    argv_buf[argc] = data_arg;
-    argc += 1;
-    argv_buf[argc] = url;
-    argc += 1;
-
-    var child = std.process.Child.init(argv_buf[0..argc], allocator);
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
-
-    try child.spawn();
-
-    const stdout = child.stdout.?.readToEndAlloc(allocator, 4 * 1024 * 1024) catch return error.CurlReadError;
-
-    const term = child.wait() catch return error.CurlWaitError;
-    switch (term) {
-        .Exited => |code| if (code != 0) {
-            allocator.free(stdout);
-            return error.CurlFailed;
-        },
-        else => {
-            allocator.free(stdout);
-            return error.CurlFailed;
-        },
-    }
-
-    return stdout;
 }
 
 // ════════════════════════════════════════════════════════════════════════════

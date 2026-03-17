@@ -1,5 +1,6 @@
 const std = @import("std");
 const root = @import("root.zig");
+const log = std.log.scoped(.telegram_api);
 
 pub const SentMessageMeta = struct {
     message_id: ?i64 = null,
@@ -239,72 +240,70 @@ pub const Client = struct {
         var url_buf: [512]u8 = undefined;
         const url = try self.apiUrl(&url_buf, method);
 
-        var file_arg_buf: [1024]u8 = undefined;
-        var file_fbs = std.io.fixedBufferStream(&file_arg_buf);
+        // Build multipart form data manually
+        var body = std.ArrayListUnmanaged(u8).empty;
+        defer body.deinit(allocator);
+
+        // Add chat_id field
+        try body.appendSlice(allocator, "--boundary\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n");
+        try body.appendSlice(allocator, chat_id);
+        try body.appendSlice(allocator, "\r\n");
+
+        // Add media field (either file reference or URL)
+        try body.appendSlice(allocator, "--boundary\r\nContent-Disposition: form-data; name=\"");
+        try body.appendSlice(allocator, field_name);
+        try body.appendSlice(allocator, "\"");
         if (std.mem.startsWith(u8, media_path, "http://") or
             std.mem.startsWith(u8, media_path, "https://"))
         {
-            try file_fbs.writer().print("{s}={s}", .{ field_name, media_path });
+            try body.appendSlice(allocator, "; filename=\"attachment\"\r\nContent-Type: application/octet-stream\r\n\r\n");
+            try body.appendSlice(allocator, media_path);
         } else {
-            try file_fbs.writer().print("{s}=@{s}", .{ field_name, media_path });
+            try body.appendSlice(allocator, "; filename=\"file\"\r\nContent-Type: application/octet-stream\r\n\r\n");
+            // Read file content
+            const file_content = std.fs.cwd().readFileAlloc(allocator, media_path, 10 * 1024 * 1024) catch
+                return error.FileReadError;
+            defer allocator.free(file_content);
+            try body.appendSlice(allocator, file_content);
         }
-        const file_arg = file_fbs.getWritten();
+        try body.appendSlice(allocator, "\r\n");
 
-        var chatid_arg_buf: [128]u8 = undefined;
-        var chatid_fbs = std.io.fixedBufferStream(&chatid_arg_buf);
-        try chatid_fbs.writer().print("chat_id={s}", .{chat_id});
-        const chatid_arg = chatid_fbs.getWritten();
-
-        var argv_buf: [24][]const u8 = undefined;
-        var argc: usize = 0;
-        argv_buf[argc] = "curl";
-        argc += 1;
-        argv_buf[argc] = "-s";
-        argc += 1;
-        argv_buf[argc] = "-m";
-        argc += 1;
-        argv_buf[argc] = "120";
-        argc += 1;
-
-        if (self.proxy) |p| {
-            argv_buf[argc] = "-x";
-            argc += 1;
-            argv_buf[argc] = p;
-            argc += 1;
-        }
-
-        argv_buf[argc] = "-F";
-        argc += 1;
-        argv_buf[argc] = chatid_arg;
-        argc += 1;
-        argv_buf[argc] = "-F";
-        argc += 1;
-        argv_buf[argc] = file_arg;
-        argc += 1;
-
-        var caption_arg_buf: [1024]u8 = undefined;
+        // Add caption if present
         if (caption) |cap| {
-            var cap_fbs = std.io.fixedBufferStream(&caption_arg_buf);
-            try cap_fbs.writer().print("caption={s}", .{cap});
-            argv_buf[argc] = "-F";
-            argc += 1;
-            argv_buf[argc] = cap_fbs.getWritten();
-            argc += 1;
+            try body.appendSlice(allocator, "--boundary\r\nContent-Disposition: form-data; name=\"caption\"\r\n\r\n");
+            try body.appendSlice(allocator, cap);
+            try body.appendSlice(allocator, "\r\n");
         }
 
-        argv_buf[argc] = url;
-        argc += 1;
+        // Close boundary
+        try body.appendSlice(allocator, "--boundary--\r\n");
 
-        var child = std.process.Child.init(argv_buf[0..argc], allocator);
-        child.stdout_behavior = .Pipe;
-        child.stderr_behavior = .Ignore;
-        try child.spawn();
+        // Build headers
+        var headers = std.ArrayListUnmanaged([]const u8).empty;
+        defer headers.deinit(allocator);
+        try headers.append(allocator, "Content-Type: multipart/form-data; boundary=boundary");
 
-        _ = child.stdout.?.readToEndAlloc(allocator, 1024 * 1024) catch return error.CurlReadError;
-        const term = child.wait() catch return error.CurlWaitError;
-        switch (term) {
-            .Exited => |code| if (code != 0) return error.CurlFailed,
-            else => return error.CurlFailed,
+        // Use libcurl to POST the multipart data
+        const http_util = @import("../http_util.zig");
+        const response = http_util.curlPostWithProxy(
+            allocator,
+            url,
+            body.items,
+            headers.items,
+            self.proxy,
+            "120",
+        ) catch |err| {
+            log.err("multipart post failed: {}", .{err});
+            return error.CurlFailed;
+        };
+        defer allocator.free(response);
+
+        // Check for Telegram errors
+        if (response.len > 0 and response[0] == '{') {
+            if (std.mem.indexOf(u8, response, "\"ok\":false") != null) {
+                log.err("Telegram API error: {s}", .{response});
+                return error.CurlFailed;
+            }
         }
     }
 

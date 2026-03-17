@@ -16,6 +16,7 @@ const SessionStore = root.SessionStore;
 const config_types = @import("../../config_types.zig");
 const net_security = @import("../../net_security.zig");
 const url_percent = @import("../../url_percent.zig");
+const http_util = @import("../../http_util.zig");
 const log = std.log.scoped(.api_memory);
 
 // ── ApiMemory ─────────────────────────────────────────────────────
@@ -114,81 +115,35 @@ pub const ApiMemory = struct {
         method: std.http.Method,
         payload: ?[]const u8,
     ) !HttpResponse {
-        // Zig 0.15 std.http fetch has no request timeout control.
-        // Use curl subprocess so `timeout_ms` is guaranteed to apply.
+        // Use libcurl with timeout control via http_util
         const timeout_secs: u32 = @max(@as(u32, 1), (self.timeout_ms + 999) / 1000);
         var timeout_buf: [16]u8 = undefined;
-        const timeout_secs_str = std.fmt.bufPrint(&timeout_buf, "{d}", .{timeout_secs}) catch unreachable;
+        const timeout_str = std.fmt.bufPrint(&timeout_buf, "{d}", .{timeout_secs}) catch unreachable;
 
-        var auth_header: ?[]u8 = null;
-        defer if (auth_header) |h| alloc.free(h);
-
-        var argv_buf: [24][]const u8 = undefined;
-        var argc: usize = 0;
-
-        argv_buf[argc] = "curl";
-        argc += 1;
-        argv_buf[argc] = "--silent";
-        argc += 1;
-        argv_buf[argc] = "--show-error";
-        argc += 1;
-        argv_buf[argc] = "--max-time";
-        argc += 1;
-        argv_buf[argc] = timeout_secs_str;
-        argc += 1;
-        argv_buf[argc] = "--request";
-        argc += 1;
-        argv_buf[argc] = @tagName(method);
-        argc += 1;
-        argv_buf[argc] = "--header";
-        argc += 1;
-        argv_buf[argc] = "Content-Type: application/json";
-        argc += 1;
+        // Build headers list
+        var headers = std.ArrayListUnmanaged([]const u8).empty;
+        errdefer headers.deinit(alloc);
 
         if (self.api_key) |key| {
-            auth_header = try std.fmt.allocPrint(alloc, "Authorization: Bearer {s}", .{key});
-            argv_buf[argc] = "--header";
-            argc += 1;
-            argv_buf[argc] = auth_header.?;
-            argc += 1;
+            const auth_header = try std.fmt.allocPrint(alloc, "Authorization: Bearer {s}", .{key});
+            errdefer alloc.free(auth_header);
+            try headers.append(alloc, auth_header);
         }
 
-        if (payload) |body| {
-            argv_buf[argc] = "--data";
-            argc += 1;
-            argv_buf[argc] = body;
-            argc += 1;
-        }
+        // Use http_util curlRequestWithStatus for all methods
+        const http_resp = try http_util.curlRequestWithStatus(
+            alloc,
+            url,
+            @tagName(method),
+            payload,
+            headers.items,
+            timeout_str,
+        );
 
-        argv_buf[argc] = "--write-out";
-        argc += 1;
-        argv_buf[argc] = "\n%{http_code}";
-        argc += 1;
-        argv_buf[argc] = url;
-        argc += 1;
-
-        var child = std.process.Child.init(argv_buf[0..argc], alloc);
-        child.stdin_behavior = .Ignore;
-        child.stdout_behavior = .Pipe;
-        child.stderr_behavior = .Ignore;
-
-        child.spawn() catch return error.ApiConnectionError;
-
-        const raw_out = child.stdout.?.readToEndAlloc(alloc, 16 * 1024 * 1024) catch return error.ApiConnectionError;
-        defer alloc.free(raw_out);
-
-        const term = child.wait() catch return error.ApiConnectionError;
-        switch (term) {
-            .Exited => |code| {
-                if (code != 0) {
-                    if (code == 28) return error.ApiTimeout;
-                    return error.ApiConnectionError;
-                }
-            },
-            else => return error.ApiConnectionError,
-        }
-
-        return parseCurlOutput(alloc, raw_out);
+        return .{
+            .status = @enumFromInt(http_resp.status_code),
+            .body = http_resp.body,
+        };
     }
 
     fn parseCurlOutput(alloc: Allocator, raw_out: []const u8) !HttpResponse {

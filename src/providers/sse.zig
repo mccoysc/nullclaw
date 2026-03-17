@@ -2,9 +2,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const root = @import("root.zig");
 const http_util = @import("../http_util.zig");
-const platform = @import("../platform.zig");
 const error_classify = @import("error_classify.zig");
-const verbose = @import("../verbose.zig");
+const platform = @import("../platform.zig");
 const log = std.log.scoped(.provider_sse);
 
 fn finalizeStreamResult(
@@ -77,8 +76,19 @@ fn prepareCurlBodyArg(
         return error.TempDirNotFound;
     defer allocator.free(tmp_dir_path);
 
-    var tmp_dir = std.fs.openDirAbsolute(tmp_dir_path, .{}) catch
-        return error.TempDirNotFound;
+    // Try to open existing temp directory, create if it doesn't exist
+    var tmp_dir: std.fs.Dir = undefined;
+    tmp_dir = std.fs.openDirAbsolute(tmp_dir_path) catch |err| {
+        if (err == error.FileNotFound) {
+            // Directory doesn't exist, try to create it
+            std.fs.makeDirAbsolute(tmp_dir_path) catch
+                return error.TempDirNotFound;
+            tmp_dir = std.fs.openDirAbsolute(tmp_dir_path) catch
+                return error.TempDirNotFound;
+        } else {
+            return error.TempDirNotFound;
+        }
+    };
     defer tmp_dir.close();
 
     const body_path = std.fmt.bufPrint(
@@ -316,9 +326,7 @@ fn parseSseResponseBody(
 
 /// Run SSE streaming and parse output line by line (OpenAI format).
 ///
-/// Dispatches to native std.http.Client or curl subprocess based on
-/// the `--http-backend` setting.  Falls back to curl when a proxy is
-/// configured (native client does not support proxies).
+/// Uses libcurl for streaming with proxy/timeout support.
 pub fn curlStream(
     allocator: std.mem.Allocator,
     url: []const u8,
@@ -329,292 +337,50 @@ pub fn curlStream(
     callback: root.StreamCallback,
     ctx: *anyopaque,
 ) !root.StreamChatResult {
-    // Check for proxy — native client does not support proxies.
-    const proxy = http_util.getProxyFromEnv(allocator) catch null;
-    defer if (proxy) |p| allocator.free(p);
-
-    // When the user explicitly chose a backend, always honour it.
-    // Otherwise fall back to subprocess when a proxy is configured.
-    if (!http_util.useSubprocess()) {
-        if (http_util.isExplicitOverride() or proxy == null) {
-            return nativeStream(allocator, url, body, auth_header, extra_headers, callback, ctx);
-        }
-    }
-
-    // Check verbose mode once at function start
-    const log_enabled = verbose.isVerbose();
-    const debug_log = std.log.scoped(.sse);
-
-    // Build argv on stack (max 32 args)
-    var argv_buf: [32][]const u8 = undefined;
-    var argc: usize = 0;
-
-    argv_buf[argc] = "curl";
-    argc += 1;
-    argv_buf[argc] = "-sS";
-    argc += 1;
-    argv_buf[argc] = "--no-buffer";
-    argc += 1;
-    argv_buf[argc] = http_util.curlFailFlag();
-    argc += 1;
-    var timeout_buf: [32]u8 = undefined;
-    if (timeout_secs > 0) {
-        const timeout_str = std.fmt.bufPrint(&timeout_buf, "{d}", .{timeout_secs}) catch unreachable;
-        argv_buf[argc] = "--max-time";
-        argc += 1;
-        argv_buf[argc] = timeout_str;
-        argc += 1;
-    }
-
-    argv_buf[argc] = "-X";
-    argc += 1;
-    argv_buf[argc] = "POST";
-    argc += 1;
-    argv_buf[argc] = "-H";
-    argc += 1;
-    argv_buf[argc] = "Content-Type: application/json";
-    argc += 1;
-
-    if (proxy) |p| {
-        argv_buf[argc] = "--proxy";
-        argc += 1;
-        argv_buf[argc] = p;
-        argc += 1;
-    }
+    // Build headers list with auth if provided
+    var all_headers = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer all_headers.deinit(allocator);
 
     if (auth_header) |auth| {
-        argv_buf[argc] = "-H";
-        argc += 1;
-        argv_buf[argc] = auth;
-        argc += 1;
+        try all_headers.append(allocator, auth);
     }
+    try all_headers.appendSlice(allocator, extra_headers);
 
-    for (extra_headers) |hdr| {
-        argv_buf[argc] = "-H";
-        argc += 1;
-        argv_buf[argc] = hdr;
-        argc += 1;
-    }
+    // Prepare timeout string
+    var timeout_buf: [32]u8 = undefined;
+    const timeout_str = if (timeout_secs > 0)
+        std.fmt.bufPrint(&timeout_buf, "{d}", .{timeout_secs}) catch ""
+    else
+        "";
 
-    // On Windows, command line length is limited to ~32767 chars.
-    // Use a temp file there to avoid NameTooLong; keep other platforms in-memory.
-    var prepared_body = try prepareCurlBodyArg(allocator, body, log_enabled);
-    defer prepared_body.deinit(allocator);
-
-    if (prepared_body.uses_temp_file) {
-        argv_buf[argc] = "--data-binary";
-        argc += 1;
-    } else {
-        argv_buf[argc] = "-d";
-        argc += 1;
-    }
-    argv_buf[argc] = prepared_body.arg;
-    argc += 1;
-    argv_buf[argc] = url;
-    argc += 1;
-
-    // Debug: log the curl command
-    if (log_enabled) {
-        debug_log.info("curl argc={d}, body_len={d}, used_temp_file={}, body_arg={s}", .{ argc, body.len, prepared_body.uses_temp_file, prepared_body.arg });
-    }
-
-    var cmd_buf: std.ArrayListUnmanaged(u8) = .empty;
-    defer cmd_buf.deinit(allocator);
-    for (argv_buf[0..argc], 0..) |arg, i| {
-        if (i > 0) cmd_buf.append(allocator, ' ') catch {};
-        // Quote arguments that contain spaces or special chars for easy copy-paste
-        if (std.mem.indexOfAny(u8, arg, " \t\"'") != null or std.mem.startsWith(u8, arg, "@")) {
-            cmd_buf.append(allocator, '"') catch {};
-            cmd_buf.appendSlice(allocator, arg) catch {};
-            cmd_buf.append(allocator, '"') catch {};
-        } else {
-            cmd_buf.appendSlice(allocator, arg) catch {};
-        }
-    }
-    if (log_enabled) {
-        debug_log.info("curl command: {s}", .{cmd_buf.items});
-    }
-
-    var child = std.process.Child.init(argv_buf[0..argc], allocator);
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-
-    if (log_enabled) {
-        debug_log.info("spawning curl process...", .{});
-    }
-    try child.spawn();
-    if (log_enabled) {
-        const pid: i64 = if (@import("builtin").os.tag == .windows) @intCast(@intFromPtr(child.id)) else child.id;
-        debug_log.info("curl process spawned, pid={d}", .{pid});
-    }
-
-    // Read stdout line by line, parse SSE events
-    var accumulated: std.ArrayListUnmanaged(u8) = .empty;
-    defer accumulated.deinit(allocator);
-
-    var line_buf: std.ArrayListUnmanaged(u8) = .empty;
-    defer line_buf.deinit(allocator);
-
-    const stdout_file = child.stdout.?;
-    var read_buf: [4096]u8 = undefined;
-    var saw_done = false;
-    var total_stdout: usize = 0;
-
-    outer: while (true) {
-        const n = stdout_file.read(&read_buf) catch |err| {
-            if (log_enabled) {
-                debug_log.info("stdout read error: {}", .{err});
-            }
-            break;
-        };
-        if (n == 0) {
-            if (log_enabled) {
-                debug_log.info("stdout read returned 0 bytes (EOF)", .{});
-            }
-            break;
-        }
-        total_stdout += n;
-
-        if (log_enabled) {
-            debug_log.info("stdout read {d} bytes: {s}", .{ n, read_buf[0..n] });
-        }
-
-        // Check if this is JSON (starts with '{')
-        if (total_stdout == n and read_buf[0] == '{') {
-            if (log_enabled) {
-                debug_log.info("Detected JSON response, not SSE", .{});
-            }
-            // This is a JSON error, not SSE
-            const json_response = try allocator.dupe(u8, read_buf[0..n]);
-            defer allocator.free(json_response);
-
-            // Try to classify the error
-            const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_response, .{}) catch null;
-            if (parsed) |p| {
-                defer p.deinit();
-                if (error_classify.classifyKnownApiError(p.value.object)) |kind| {
-                    // Drain stderr before wait to avoid pipe deadlock
-                    const early_stderr = drainStderr(allocator, child.stderr);
-                    defer allocator.free(early_stderr);
-                    _ = child.wait() catch {};
-                    return error_classify.kindToError(kind);
-                }
-            }
-
-            // Drain stderr before wait to avoid pipe deadlock
-            {
-                const early_stderr = drainStderr(allocator, child.stderr);
-                defer allocator.free(early_stderr);
-                _ = child.wait() catch {};
-            }
-            debug_log.err("Server returned JSON error: {s}", .{json_response});
-            return error.ServerError;
-        }
-
-        for (read_buf[0..n]) |byte| {
-            if (byte == '\n') {
-                if (log_enabled) {
-                    debug_log.info("parsing SSE line: {s}", .{line_buf.items});
-                }
-                const result = parseSseLine(allocator, line_buf.items) catch {
-                    line_buf.clearRetainingCapacity();
-                    continue;
-                };
-                line_buf.clearRetainingCapacity();
-                switch (result) {
-                    .delta => |text| {
-                        defer allocator.free(text);
-                        try accumulated.appendSlice(allocator, text);
-                        callback(ctx, root.StreamChunk.textDelta(text));
-                    },
-                    .done => {
-                        if (log_enabled) {
-                            debug_log.info("SSE stream done", .{});
-                        }
-                        saw_done = true;
-                        break :outer;
-                    },
-                    .skip => {},
-                }
-            } else {
-                try line_buf.append(allocator, byte);
-            }
-        }
-    }
-
-    if (log_enabled) {
-        debug_log.info("stdout stream ended, saw_done={}, accumulated_len={d}, total_stdout={d}", .{ saw_done, accumulated.items.len, total_stdout });
-    }
-
-    // Parse a trailing line when the stream ends without a final '\n'.
-    if (!saw_done and line_buf.items.len > 0) {
-        const trailing = parseSseLine(allocator, line_buf.items) catch null;
-        line_buf.clearRetainingCapacity();
-        if (trailing) |result| {
-            switch (result) {
-                .delta => |text| {
-                    defer allocator.free(text);
-                    try accumulated.appendSlice(allocator, text);
-                    callback(ctx, root.StreamChunk.textDelta(text));
-                },
-                .done => {},
-                .skip => {},
-            }
-        }
-    }
-
-    // Drain remaining stdout to prevent deadlock on wait()
-    while (true) {
-        const n = stdout_file.read(&read_buf) catch break;
-        if (n == 0) break;
-        if (log_enabled) {
-            debug_log.info("drained {d} more stdout bytes", .{n});
-        }
-    }
-
-    // Drain stderr before wait() to avoid pipe deadlock
-    const stderr_content = drainStderr(allocator, child.stderr);
-    defer allocator.free(stderr_content);
-
-    if (log_enabled) {
-        debug_log.info("waiting for curl process to exit...", .{});
-    }
-    const term = child.wait() catch |err| {
-        log.err("curlStream child.wait failed: {}", .{err});
-        if (saw_done) {
-            log.warn("curlStream proceeding despite wait failure after receiving stream data", .{});
-            callback(ctx, root.StreamChunk.finalChunk());
-            return finalizeStreamResult(allocator, accumulated.items, null);
-        }
-        return error.CurlWaitError;
+    // Use curlPostStream which uses libcurl (not curl subprocess)
+    // Note: http_util.getProxyFromEnv reads from environment variables (HTTPS_PROXY, HTTP_PROXY, etc.)
+    const response = http_util.curlPostStream(
+        allocator,
+        url,
+        body,
+        all_headers.items,
+        timeout_str,
+    ) catch |err| {
+        log.err("curlStream failed: {}", .{err});
+        return error.CurlFailed;
     };
-    if (log_enabled) {
-        debug_log.info("curl process terminated: {}", .{term});
-    }
-    switch (term) {
-        .Exited => |code| if (code != 0) {
-            if (saw_done) {
-                log.warn("curlStream exit code {d} after stream data; returning accumulated output", .{code});
-                callback(ctx, root.StreamChunk.finalChunk());
-                return finalizeStreamResult(allocator, accumulated.items, null);
+    defer allocator.free(response);
+
+    // Check if response is JSON error
+    if (response.len > 0 and response[0] == '{') {
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, response, .{}) catch null;
+        if (parsed) |p| {
+            defer p.deinit();
+            if (error_classify.classifyKnownApiError(p.value.object)) |kind| {
+                return error_classify.kindToError(kind);
             }
-            logCurlStderr(allocator, stderr_content, code);
-            return error.CurlFailed;
-        },
-        else => {
-            if (saw_done) {
-                log.warn("curlStream abnormal termination after stream data; returning accumulated output", .{});
-                callback(ctx, root.StreamChunk.finalChunk());
-                return finalizeStreamResult(allocator, accumulated.items, null);
-            }
-            logCurlStderr(allocator, stderr_content, null);
-            return error.CurlFailed;
-        },
+        }
+        return error.ServerError;
     }
 
-    // Signal stream completion only after curl exits successfully.
-    callback(ctx, root.StreamChunk.finalChunk());
-    return finalizeStreamResult(allocator, accumulated.items, null);
+    // Parse SSE response
+    return parseSseResponseBody(allocator, response, callback, ctx);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -833,9 +599,7 @@ fn parseAnthropicSseResponseBody(
 
 /// Run SSE streaming for Anthropic and parse output line by line.
 ///
-/// Dispatches to native std.http.Client or curl subprocess based on
-/// the `--http-backend` setting.  Falls back to curl when a proxy is
-/// configured (native client does not support proxies).
+/// Uses libcurl for streaming with proxy support.
 pub fn curlStreamAnthropic(
     allocator: std.mem.Allocator,
     url: []const u8,
@@ -844,167 +608,21 @@ pub fn curlStreamAnthropic(
     callback: root.StreamCallback,
     ctx: *anyopaque,
 ) !root.StreamChatResult {
-    // Check for proxy — native client does not support proxies.
-    const proxy = http_util.getProxyFromEnv(allocator) catch null;
-    defer if (proxy) |p| allocator.free(p);
-
-    // When the user explicitly chose a backend, always honour it.
-    // Otherwise fall back to subprocess when a proxy is configured.
-    if (!http_util.useSubprocess()) {
-        if (http_util.isExplicitOverride() or proxy == null) {
-            return nativeStreamAnthropic(allocator, url, body, headers, callback, ctx);
-        }
-    }
-
-    // Build argv on stack (max 32 args)
-    var argv_buf: [32][]const u8 = undefined;
-    var argc: usize = 0;
-
-    argv_buf[argc] = "curl";
-    argc += 1;
-    argv_buf[argc] = "-sS";
-    argc += 1;
-    argv_buf[argc] = "--no-buffer";
-    argc += 1;
-    argv_buf[argc] = "-X";
-    argc += 1;
-    argv_buf[argc] = "POST";
-    argc += 1;
-    argv_buf[argc] = "-H";
-    argc += 1;
-    argv_buf[argc] = "Content-Type: application/json";
-    argc += 1;
-
-    if (proxy) |p| {
-        argv_buf[argc] = "--proxy";
-        argc += 1;
-        argv_buf[argc] = p;
-        argc += 1;
-    }
-
-    for (headers) |hdr| {
-        argv_buf[argc] = "-H";
-        argc += 1;
-        argv_buf[argc] = hdr;
-        argc += 1;
-    }
-
-    const log_enabled = verbose.isVerbose();
-    var prepared_body = try prepareCurlBodyArg(allocator, body, log_enabled);
-    defer prepared_body.deinit(allocator);
-
-    if (prepared_body.uses_temp_file) {
-        argv_buf[argc] = "--data-binary";
-    } else {
-        argv_buf[argc] = "-d";
-    }
-    argc += 1;
-    argv_buf[argc] = prepared_body.arg;
-    argc += 1;
-    argv_buf[argc] = url;
-    argc += 1;
-
-    var child = std.process.Child.init(argv_buf[0..argc], allocator);
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-
-    try child.spawn();
-
-    // Read stdout line by line, parse Anthropic SSE events
-    var accumulated: std.ArrayListUnmanaged(u8) = .empty;
-    defer accumulated.deinit(allocator);
-
-    var line_buf: std.ArrayListUnmanaged(u8) = .empty;
-    defer line_buf.deinit(allocator);
-
-    var current_event: []const u8 = "";
-    var output_tokens: u32 = 0;
-    var saw_done = false;
-
-    const file = child.stdout.?;
-    var read_buf: [4096]u8 = undefined;
-
-    outer: while (true) {
-        const n = file.read(&read_buf) catch break;
-        if (n == 0) break;
-
-        for (read_buf[0..n]) |byte| {
-            if (byte == '\n') {
-                const result = parseAnthropicSseLine(allocator, line_buf.items, current_event) catch {
-                    line_buf.clearRetainingCapacity();
-                    continue;
-                };
-                switch (result) {
-                    .event => |ev| {
-                        // Dupe event name — it points into line_buf which we're about to clear
-                        if (current_event.len > 0) allocator.free(@constCast(current_event));
-                        current_event = allocator.dupe(u8, ev) catch "";
-                    },
-                    .delta => |text| {
-                        defer allocator.free(text);
-                        try accumulated.appendSlice(allocator, text);
-                        callback(ctx, root.StreamChunk.textDelta(text));
-                    },
-                    .usage => |tokens| output_tokens = tokens,
-                    .done => {
-                        saw_done = true;
-                        line_buf.clearRetainingCapacity();
-                        break :outer;
-                    },
-                    .skip => {},
-                }
-                line_buf.clearRetainingCapacity();
-            } else {
-                try line_buf.append(allocator, byte);
-            }
-        }
-    }
-
-    // Free owned event string
-    if (current_event.len > 0) allocator.free(@constCast(current_event));
-
-    // Drain remaining stdout to prevent deadlock on wait()
-    while (true) {
-        const n = file.read(&read_buf) catch break;
-        if (n == 0) break;
-    }
-
-    // Drain stderr before wait() to avoid pipe deadlock
-    const stderr_content = drainStderr(allocator, child.stderr);
-    defer allocator.free(stderr_content);
-
-    const term = child.wait() catch |err| {
-        log.err("curlStreamAnthropic child.wait failed: {}", .{err});
-        if (saw_done) {
-            log.warn("curlStreamAnthropic proceeding despite wait failure after receiving stream data", .{});
-            callback(ctx, root.StreamChunk.finalChunk());
-            return finalizeStreamResult(allocator, accumulated.items, output_tokens);
-        }
-        return error.CurlWaitError;
+    // Use curlPostStream which uses libcurl (not curl subprocess)
+    const response = http_util.curlPostStream(
+        allocator,
+        url,
+        body,
+        headers,
+        "",
+    ) catch |err| {
+        log.err("curlStreamAnthropic failed: {}", .{err});
+        return error.CurlFailed;
     };
-    switch (term) {
-        .Exited => |code| if (code != 0) {
-            if (saw_done) {
-                log.warn("curlStreamAnthropic exit code {d} after stream data; returning accumulated output", .{code});
-                callback(ctx, root.StreamChunk.finalChunk());
-                return finalizeStreamResult(allocator, accumulated.items, output_tokens);
-            }
-            logCurlStderr(allocator, stderr_content, code);
-            return error.CurlFailed;
-        },
-        else => {
-            if (saw_done) {
-                log.warn("curlStreamAnthropic abnormal termination after stream data; returning accumulated output", .{});
-                callback(ctx, root.StreamChunk.finalChunk());
-                return finalizeStreamResult(allocator, accumulated.items, output_tokens);
-            }
-            logCurlStderr(allocator, stderr_content, null);
-            return error.CurlFailed;
-        },
-    }
+    defer allocator.free(response);
 
-    callback(ctx, root.StreamChunk.finalChunk());
-    return finalizeStreamResult(allocator, accumulated.items, output_tokens);
+    // Parse Anthropic SSE response
+    return parseAnthropicSseResponseBody(allocator, response, callback, ctx);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1233,14 +851,10 @@ test "parseAnthropicSseResponseBody handles empty body" {
     try std.testing.expect(result.content == null);
 }
 
-test "curlStream dispatches to native when useSubprocess is false" {
-    // Verify the dispatch logic compiles and the function signature is correct.
-    // We cannot actually call nativeStream without a real HTTP server, but we
-    // verify that the dispatch path compiles and that curlStream accepts the
-    // same parameters regardless of backend.
+test "curlStream compiles and is callable" {
     _ = curlStream;
 }
 
-test "curlStreamAnthropic dispatches to native when useSubprocess is false" {
+test "curlStreamAnthropic compiles and is callable" {
     _ = curlStreamAnthropic;
 }

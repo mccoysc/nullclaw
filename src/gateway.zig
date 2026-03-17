@@ -1594,9 +1594,9 @@ pub fn processIncomingMessage(allocator: std.mem.Allocator, message: []const u8)
     return try allocator.dupe(u8, "No response from agent");
 }
 
-/// Send a reply to a Telegram chat using the Bot API.
+/// Send a reply to a Telegram chat using the Bot API (via native HTTP).
 pub fn sendTelegramReply(allocator: std.mem.Allocator, bot_token: []const u8, chat_id: i64, text: []const u8) !void {
-    // Build the curl command to call the Telegram API
+    // Build the Telegram Bot API URL
     const url = try std.fmt.allocPrint(allocator, "https://api.telegram.org/bot{s}/sendMessage", .{bot_token});
     defer allocator.free(url);
 
@@ -1619,19 +1619,8 @@ pub fn sendTelegramReply(allocator: std.mem.Allocator, bot_token: []const u8, ch
 
     const body = body_buf.items;
 
-    var curl_child = std.process.Child.init(
-        &[_][]const u8{
-            "curl", "-s",                             "-X", "POST",
-            "-H",   "Content-Type: application/json", "-d", body,
-            url,
-        },
-        allocator,
-    );
-    curl_child.stdout_behavior = .Pipe;
-    curl_child.stderr_behavior = .Pipe;
-
-    curl_child.spawn() catch return;
-    _ = curl_child.wait() catch {};
+    // Use native HTTP via http_util (no curl subprocess)
+    _ = try http_util.curlPostWithProxy(allocator, url, body, &.{}, null, null);
 }
 
 fn userFacingAgentError(err: anyerror) []const u8 {

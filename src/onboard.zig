@@ -1949,26 +1949,22 @@ pub fn runModelsRefresh(allocator: std.mem.Allocator) !void {
         try out.print("  Fetching from {s}...\n", .{cp.name});
         try out.flush();
 
-        // Run curl to fetch models list
-        const result = std.process.Child.run(.{
-            .allocator = allocator,
-            .argv = &.{ "curl", "-sf", "--max-time", "10", cp.url },
-        }) catch {
+        // Use libcurl to fetch models list
+        const response = http_util.curlGet(allocator, cp.url, &.{}, "10") catch {
             try out.print("  [SKIP] {s}: curl failed\n", .{cp.name});
             try out.flush();
             continue;
         };
-        defer allocator.free(result.stdout);
-        defer allocator.free(result.stderr);
+        defer allocator.free(response);
 
-        if (result.stdout.len == 0) {
+        if (response.len == 0) {
             try out.print("  [SKIP] {s}: empty response\n", .{cp.name});
             try out.flush();
             continue;
         }
 
         // Parse JSON and extract model IDs
-        const parsed = std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{}) catch {
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, response, .{}) catch {
             try out.print("  [SKIP] {s}: invalid JSON\n", .{cp.name});
             try out.flush();
             continue;

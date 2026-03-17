@@ -358,7 +358,7 @@ fn codexRequest(
     return try allocator.dupe(u8, accumulated.items);
 }
 
-/// Streaming Codex request — spawns curl, parses Codex SSE events, invokes callback per delta.
+/// Streaming Codex request — uses libcurl for SSE, parses Codex SSE events, invokes callback per delta.
 fn codexStreamRequest(
     allocator: std.mem.Allocator,
     url: []const u8,
@@ -368,172 +368,121 @@ fn codexStreamRequest(
     callback: root.StreamCallback,
     ctx: *anyopaque,
 ) !StreamChatResult {
-    // Build argv on stack
-    var argv_buf: [32][]const u8 = undefined;
-    var argc: usize = 0;
-
-    argv_buf[argc] = "curl";
-    argc += 1;
-    argv_buf[argc] = "-s";
-    argc += 1;
-    argv_buf[argc] = "--no-buffer";
-    argc += 1;
-    argv_buf[argc] = "-X";
-    argc += 1;
-    argv_buf[argc] = "POST";
-    argc += 1;
-    argv_buf[argc] = "-H";
-    argc += 1;
-    argv_buf[argc] = "Content-Type: application/json";
-    argc += 1;
-    argv_buf[argc] = "-H";
-    argc += 1;
-    argv_buf[argc] = auth_header;
-    argc += 1;
-
-    // Add proxy from environment if set
+    // Use libcurl for SSE streaming
     const proxy = http_util.getProxyFromEnv(allocator) catch null;
     defer if (proxy) |p| allocator.free(p);
 
-    if (proxy) |p| {
-        argv_buf[argc] = "--proxy";
-        argc += 1;
-        argv_buf[argc] = p;
-        argc += 1;
-    }
-
-    for (extra_headers) |hdr| {
-        argv_buf[argc] = "-H";
-        argc += 1;
-        argv_buf[argc] = hdr;
-        argc += 1;
-    }
-
-    argv_buf[argc] = "--data-binary";
-    argc += 1;
-    argv_buf[argc] = "@-";
-    argc += 1;
-    argv_buf[argc] = url;
-    argc += 1;
-
-    var child = std.process.Child.init(argv_buf[0..argc], allocator);
-    child.stdin_behavior = .Pipe;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
-
-    try child.spawn();
-
-    if (child.stdin) |stdin_file| {
-        stdin_file.writeAll(body) catch {
-            stdin_file.close();
-            child.stdin = null;
-            _ = child.kill() catch {};
-            _ = child.wait() catch {};
-            return error.CurlWriteError;
-        };
-        stdin_file.close();
-        child.stdin = null;
-    } else {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
-        return error.CurlWriteError;
-    }
-
-    // Read stdout line by line, parse Codex SSE events
+    // Accumulate text for usage calculation
     var accumulated: std.ArrayListUnmanaged(u8) = .empty;
     defer accumulated.deinit(allocator);
 
-    var line_buf: std.ArrayListUnmanaged(u8) = .empty;
-    defer line_buf.deinit(allocator);
+    // Create a wrapper callback that both invokes the user's callback and accumulates text
+    const SseCtx = struct {
+        user_ctx: *anyopaque,
+        user_callback: root.StreamCallback,
+        accum: *std.ArrayListUnmanaged(u8),
+        alloc: std.mem.Allocator,
+        saw_text_delta: bool,
+        emitted_text_fallback: bool,
+        emitted_tool_payload: bool,
+    };
 
-    const file = child.stdout.?;
-    var read_buf: [4096]u8 = undefined;
-    var saw_text_delta = false;
-    var emitted_text_fallback = false;
-    var emitted_tool_payload = false;
+    var sse_ctx = SseCtx{
+        .user_ctx = ctx,
+        .user_callback = callback,
+        .accum = &accumulated,
+        .alloc = allocator,
+        .saw_text_delta = false,
+        .emitted_text_fallback = false,
+        .emitted_tool_payload = false,
+    };
 
-    outer: while (true) {
-        const n = file.read(&read_buf) catch break;
-        if (n == 0) break;
+    const SseWrapper = struct {
+        fn wrapper(callback_ctx: *anyopaque, data: [*]const u8, len: usize) callconv(.c) usize {
+            const self: *SseCtx = @ptrCast(@alignCast(callback_ctx));
+            const line = data[0..len];
 
-        for (read_buf[0..n]) |byte| {
-            if (byte == '\n') {
-                const result = parseCodexSseEvent(allocator, line_buf.items) catch {
-                    line_buf.clearRetainingCapacity();
-                    continue;
-                };
-                line_buf.clearRetainingCapacity();
-                switch (result) {
-                    .delta => |delta_evt| {
-                        defer allocator.free(delta_evt.text);
-                        const is_tool_payload = std.mem.indexOf(u8, delta_evt.text, "<tool_call>") != null;
-                        switch (delta_evt.source) {
-                            .output_text_delta, .refusal_delta => {
-                                saw_text_delta = true;
-                                try accumulated.appendSlice(allocator, delta_evt.text);
-                                callback(ctx, root.StreamChunk.textDelta(delta_evt.text));
-                            },
-                            .output_text_done, .content_part_done => {
-                                // Fallback text only when canonical deltas were absent.
-                                if (saw_text_delta or emitted_text_fallback) continue;
-                                emitted_text_fallback = true;
-                                try accumulated.appendSlice(allocator, delta_evt.text);
-                                callback(ctx, root.StreamChunk.textDelta(delta_evt.text));
-                            },
-                            .output_item_done => {
-                                if (is_tool_payload) {
-                                    emitted_tool_payload = true;
-                                    try accumulated.appendSlice(allocator, delta_evt.text);
-                                    callback(ctx, root.StreamChunk.textDelta(delta_evt.text));
-                                } else {
-                                    // Message snapshot text, fallback-only.
-                                    if (saw_text_delta or emitted_text_fallback) continue;
-                                    emitted_text_fallback = true;
-                                    try accumulated.appendSlice(allocator, delta_evt.text);
-                                    callback(ctx, root.StreamChunk.textDelta(delta_evt.text));
-                                }
-                            },
-                            .response_completed, .response_done => {
-                                if (is_tool_payload) {
-                                    // Completed may repeat tool payloads already emitted from output_item.done.
-                                    if (emitted_tool_payload) continue;
-                                    emitted_tool_payload = true;
-                                    try accumulated.appendSlice(allocator, delta_evt.text);
-                                    callback(ctx, root.StreamChunk.textDelta(delta_evt.text));
-                                } else {
-                                    // Completed text is fallback-only when no deltas were seen.
-                                    if (saw_text_delta or emitted_text_fallback) continue;
-                                    emitted_text_fallback = true;
-                                    try accumulated.appendSlice(allocator, delta_evt.text);
-                                    callback(ctx, root.StreamChunk.textDelta(delta_evt.text));
-                                }
-                            },
-                        }
-                    },
-                    .done => break :outer,
-                    .error_msg => break :outer,
-                    .skip => {},
-                }
-            } else {
-                try line_buf.append(allocator, byte);
+            // Parse the SSE event
+            const result = parseCodexSseEvent(self.alloc, line) catch {
+                return len; // Continue processing even on parse error
+            };
+
+            switch (result) {
+                .delta => |delta_evt| {
+                    defer self.alloc.free(delta_evt.text);
+                    const is_tool_payload = std.mem.indexOf(u8, delta_evt.text, "<tool_call>") != null;
+                    switch (delta_evt.source) {
+                        .output_text_delta, .refusal_delta => {
+                            self.saw_text_delta = true;
+                            self.accum.appendSlice(self.alloc, delta_evt.text) catch {};
+                            self.user_callback(self.user_ctx, root.StreamChunk.textDelta(delta_evt.text));
+                        },
+                        .output_text_done, .content_part_done => {
+                            if (self.saw_text_delta or self.emitted_text_fallback) return len;
+                            self.emitted_text_fallback = true;
+                            self.accum.appendSlice(self.alloc, delta_evt.text) catch {};
+                            self.user_callback(self.user_ctx, root.StreamChunk.textDelta(delta_evt.text));
+                        },
+                        .output_item_done => {
+                            if (is_tool_payload) {
+                                self.emitted_tool_payload = true;
+                                self.accum.appendSlice(self.alloc, delta_evt.text) catch {};
+                                self.user_callback(self.user_ctx, root.StreamChunk.textDelta(delta_evt.text));
+                            } else {
+                                if (self.saw_text_delta or self.emitted_text_fallback) return len;
+                                self.emitted_text_fallback = true;
+                                self.accum.appendSlice(self.alloc, delta_evt.text) catch {};
+                                self.user_callback(self.user_ctx, root.StreamChunk.textDelta(delta_evt.text));
+                            }
+                        },
+                        .response_completed, .response_done => {
+                            if (is_tool_payload) {
+                                if (self.emitted_tool_payload) return len;
+                                self.emitted_tool_payload = true;
+                                self.accum.appendSlice(self.alloc, delta_evt.text) catch {};
+                                self.user_callback(self.user_ctx, root.StreamChunk.textDelta(delta_evt.text));
+                            } else {
+                                if (self.saw_text_delta or self.emitted_text_fallback) return len;
+                                self.emitted_text_fallback = true;
+                                self.accum.appendSlice(self.alloc, delta_evt.text) catch {};
+                                self.user_callback(self.user_ctx, root.StreamChunk.textDelta(delta_evt.text));
+                            }
+                        },
+                    }
+                },
+                .done, .error_msg, .skip => {},
             }
+
+            return len;
         }
-    }
+    };
+
+    // Call libcurl SSE function
+    http_util.curlPostStreamSSEWithAuth(
+        allocator,
+        url,
+        body,
+        auth_header,
+        extra_headers,
+        300, // 5 minute timeout
+        proxy,
+        SseWrapper.wrapper,
+        @ptrCast(&sse_ctx),
+    ) catch |err| {
+        // Check if we got partial data before the error
+        if (accumulated.items.len > 0) {
+            // Return what we have
+            return .{
+                .content = try allocator.dupe(u8, accumulated.items),
+                .usage = .{ .completion_tokens = @intCast((accumulated.items.len + 3) / 4) },
+                .model = "",
+            };
+        }
+        return err;
+    };
 
     // Send final chunk
     callback(ctx, root.StreamChunk.finalChunk());
-
-    // Drain remaining stdout
-    while (true) {
-        const n = file.read(&read_buf) catch break;
-        if (n == 0) break;
-    }
-
-    const term = child.wait() catch return error.CurlWaitError;
-    switch (term) {
-        .Exited => |code| if (code != 0) return error.CurlFailed,
-        else => return error.CurlFailed,
-    }
 
     const content = if (accumulated.items.len > 0)
         try allocator.dupe(u8, accumulated.items)
