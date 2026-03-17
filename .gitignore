@@ -29,6 +29,3 @@ config.signal.json
 # Downloaded compiler toolchains
 tools/zig-*/
 actionlint_linux_amd64.tar.gz
-
-# Autotools-built curl install directories (per-target)
-vendor/curl/install-*/
